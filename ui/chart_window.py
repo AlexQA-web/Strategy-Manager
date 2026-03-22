@@ -1664,7 +1664,9 @@ class ChartWindow(QWidget):
 
             for col in df_strat.columns:
                 if col.startswith("_"):
-                    df[col] = df_strat[col].values
+                    # Используем выравнивание по индексу для избежания NaN при несовпадающих индексах
+                    # (например, после merge в daytrend.py)
+                    df.loc[df_strat.index, col] = df_strat[col].values
         except Exception as e:
             logger.warning(f"[Chart] on_precalc ошибка: {e}", exc_info=True)
         return df

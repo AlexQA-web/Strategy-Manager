@@ -42,6 +42,7 @@ class FinamConnector(BaseConnector):
         self._accounts: list[dict] = []
         self._last_server_status: Optional[str] = None
         self._processed_trades: dict = {}  # {tradeno: timestamp} для дедупликации
+        self._processed_trades_lock = threading.Lock()  # Lock для защиты _processed_trades
         self._last_cleanup = time.time()  # Время последней очистки старых записей
         # Для get_history — ожидание свечей из callback
         self._candles_event = threading.Event()
@@ -362,11 +363,14 @@ class FinamConnector(BaseConnector):
 
         for trade in root.findall("trade"):
             tradeno = trade.findtext("tradeno", "")
-            if not tradeno or tradeno in self._processed_trades:
+            if not tradeno:
                 continue
             
-            # Сохраняем с timestamp
-            self._processed_trades[tradeno] = time.time()
+            # Проверяем и добавляем в _processed_trades под lock для избежания race condition
+            with self._processed_trades_lock:
+                if tradeno in self._processed_trades:
+                    continue
+                self._processed_trades[tradeno] = time.time()
             
             # Периодическая очистка (раз в час)
             if time.time() - self._last_cleanup > 3600:
@@ -426,9 +430,10 @@ class FinamConnector(BaseConnector):
     def _cleanup_old_trades(self):
         """Удаляет записи старше 24 часов"""
         cutoff = time.time() - 86400  # 24 часа
-        to_remove = [tradeno for tradeno, ts in self._processed_trades.items() if ts < cutoff]
-        for tradeno in to_remove:
-            del self._processed_trades[tradeno]
+        with self._processed_trades_lock:
+            to_remove = [tradeno for tradeno, ts in self._processed_trades.items() if ts < cutoff]
+            for tradeno in to_remove:
+                del self._processed_trades[tradeno]
         self._last_cleanup = time.time()
         logger.debug(f"[Finam] Очищено {len(to_remove)} старых записей сделок")
 

@@ -7,8 +7,11 @@ from loguru import logger
 def autoconnect_connectors():
     """Автоподключение коннекторов по расписанию."""
     from core.storage import get_bool_setting, get_all_schedules
-    from core.connector_manager import connector_manager
+    from core.connector_manager import connector_manager, register_connectors
     from datetime import datetime, time as dtime
+    
+    # Регистрируем коннекторы (отложенная инициализация)
+    register_connectors()
 
     if not get_bool_setting("autoconnect"):
         return

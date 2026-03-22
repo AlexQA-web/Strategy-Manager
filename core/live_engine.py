@@ -548,16 +548,55 @@ class LiveEngine:
                              f"{traceback.format_exc()}")
 
     def _load_and_update(self):
-        """Загружает историю, ищет новые бары, вызывает on_bar при необходимости."""
+        """Загружает историю, ищет новые бары, вызывает on_bar при необходимости.
+        
+        NOTE: Добавлен timeout и проверка stop_event для избежания блокировки
+        потока при зависании get_history.
+        """
         lookback = self._get_lookback()
         days = max(lookback // 50, 5)
 
-        df = self._connector.get_history(
-            ticker=self._ticker,
-            board=self._board,
-            period=self._period_str,
-            days=days,
-        )
+        # Проверяем флаг остановки перед блокирующим вызовом
+        if self._stop_event.is_set():
+            return
+
+        # Используем thread для get_history с timeout, чтобы не блокировать poll_loop
+        result = {'df': None, 'error': None}
+        
+        def _fetch_history():
+            try:
+                result['df'] = self._connector.get_history(
+                    ticker=self._ticker,
+                    board=self._board,
+                    period=self._period_str,
+                    days=days,
+                )
+            except Exception as e:
+                result['error'] = e
+
+        fetch_thread = threading.Thread(target=_fetch_history, daemon=True)
+        fetch_thread.start()
+        
+        # Ждём с таймаутом (30 секунд для QUIK, 10 для Финам)
+        connector_id = getattr(self._connector, '_connector_id', 'finam')
+        timeout = 30 if connector_id == 'quik' else 10
+        fetch_thread.join(timeout=timeout)
+        
+        if fetch_thread.is_alive():
+            # Таймаут - не блокируем poll_loop, записываем в лог
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] get_history завис (>{timeout} сек), "
+                f"пропускаем тик"
+            )
+            return
+        
+        if result['error']:
+            logger.error(
+                f"[LiveEngine:{self._strategy_id}] Ошибка get_history: {result['error']}"
+            )
+            return
+            
+        df = result['df']
         if df is None or df.empty:
             return
 
@@ -693,7 +732,10 @@ class LiveEngine:
 
         instances = max(int(self._lot_sizing.get("instances", 1)), 1)
 
-        # Для АКЦИЙ (go=0): используем price * lot_size вместо ГО
+        # Для АКЦИЙ (go=0): используем price * lot_size
+        # NOTE: Исправлена формула. Для акций drawdown не имеет смысла как для фьючерсов,
+        # так как ГО=0. Используем упрощённую формулу: максимальное количество лотов
+        # которое можно купить на free_money.
         if go <= 0:
             price = self._last_price
             if price <= 0:
@@ -707,11 +749,9 @@ class LiveEngine:
             if position_cost <= 0:
                 return int(self._lot_sizing.get("lot", 1)) or 1
 
-            denom = effective_dd + position_cost
-            if denom <= 0:
-                return None
-
-            qty = math.floor((free_money / denom) / instances)
+            # Для акций: формула floor(free / (price * lot))
+            # Это максимальное количество лотов которое можно купить
+            qty = math.floor(free_money / position_cost / instances)
             # qty >= 1: можем купить хотя бы 1 лот → возвращаем qty
             # qty < 1: денег не хватает даже на 1 лот → возвращаем None
             return qty if qty >= 1 else None
@@ -767,7 +807,9 @@ class LiveEngine:
         try:
             if action in ("buy", "sell"):
                 # Атомарная проверка позиции и флага in-flight под одной блокировкой
-                # для предотвращения race condition при одновременных сигналах
+                # для предотвращения race condition при одновременных сигналах.
+                # Используем единую блокировку _position_lock для избежания deadlock
+                # (ранее использовались вложенные блокировки _position_lock + _order_in_flight_lock)
                 with self._position_lock:
                     if self._position != 0:
                         logger.warning(
@@ -779,15 +821,16 @@ class LiveEngine:
                     
                     # Для limit режима проверяем и устанавливаем флаг атомарно
                     if self._order_mode == "limit":
-                        with self._order_in_flight_lock:
-                            if self._order_in_flight:
-                                logger.warning(
-                                    f"[LiveEngine:{self._strategy_id}] Ордер уже в работе, "
-                                    f"игнорируем {action.upper()}"
-                                )
-                                return
-                            # Устанавливаем флаг внутри критической секции
-                            self._order_in_flight = True
+                        # Проверяем и устанавливаем флаг внутри той же критической секции
+                        # (ранее была вложенная блокировка _order_in_flight_lock, теперь - единая)
+                        if self._order_in_flight:
+                            logger.warning(
+                                f"[LiveEngine:{self._strategy_id}] Ордер уже в работе, "
+                                f"игнорируем {action.upper()}"
+                            )
+                            return
+                        # Устанавливаем флаг внутри критической секции
+                        self._order_in_flight = True
 
                 if self._order_mode == "limit":
                     self._execute_chase(action, qty, comment)
@@ -1354,9 +1397,9 @@ class LiveEngine:
 
                 self._on_chase_done(chase, side, qty, comment, is_close)
 
-                # Сбрасываем флаг только после обновления позиции
-                with self._order_in_flight_lock:
-                    self._order_in_flight = False
+                # Сбрасываем флаг только после обновления позиции.
+                # Теперь используем единую блокировку _position_lock для избежания deadlock
+                self._order_in_flight = False
 
         t = threading.Thread(
             target=_run,

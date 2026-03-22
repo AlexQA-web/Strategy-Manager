@@ -96,12 +96,34 @@ class QuikConnector(BaseConnector):
         self._fire(self._on_disconnect)
 
     def is_connected(self) -> bool:
-        """Проверяет состояние подключения к QUIK (без блокирующего вызова).
+        """Проверяет состояние подключения к QUIK.
         
-        Использует кэшированное состояние _connected. Реальная проверка соединения
-        выполняется в фоновом потоке reconnect_loop.
+        Использует кэшированное состояние _connected, но также проверяет что
+        _client существует и _stop_event не установлен (соединение не в процессе отключения).
+        Реальная проверка соединения (ping) выполняется в фоновом потоке reconnect_loop.
         """
-        return self._connected and self._client is not None
+        # Проверяем не только флаг, но и что клиент жив и не в процессе отключения
+        if not self._connected or self._client is None:
+            return False
+        # Дополнительная проверка: если идёт отключение - не считаем подключённым
+        if self._stop_reconnect.is_set():
+            return False
+        return True
+
+    def ping(self) -> bool:
+        """Реальная проверка соединения через легкий запрос.
+        
+        Используется reconnect_loop для определения реального состояния.
+        """
+        if not self._connected or self._client is None:
+            return False
+        try:
+            # Легкий запрос - получить серверное время
+            with self._lock:
+                self._client.get_server_time()
+            return True
+        except Exception:
+            return False
 
     # ── Ордера ──────────────────────────────────────────────────────────
 

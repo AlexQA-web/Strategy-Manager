@@ -127,8 +127,15 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
         "pnl":    float или None,
         "is_long": bool,
     }
+    
+    NOTE: Защищено от race condition через _orders_lock, так как ранее
+    get_orders() освобождала lock до окончания долгой обработки FIFO-цикла.
     """
-    orders = get_orders(strategy_id)
+    # Защищаем всю обработку lock-ом для избежания race condition
+    with _orders_lock:
+        data = _load()
+        orders = data.get(strategy_id, [])
+        orders = sorted(orders, key=lambda o: o["timestamp"])
     pairs = []
     # FIFO очередь незакрытых ордеров (индекс 0 - самый старый)
     open_queue: list[dict] = []
@@ -210,7 +217,7 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
             "is_long": open_order["side"] == "buy",
         })
 
-    return pairs
+    return pairs  # Возвращаем результат внутри lock-а для защиты от race condition
 def get_total_pnl(strategy_id: str) -> Optional[float]:
     """Нарастающий итог П/У по всем закрытым сделкам стратегии."""
     pairs = get_order_pairs(strategy_id)

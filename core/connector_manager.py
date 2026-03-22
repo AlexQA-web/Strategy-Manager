@@ -80,13 +80,18 @@ class ConnectorManager:
 
 connector_manager = ConnectorManager()
 
-# ── Регистрация встроенных коннекторов ────────────────────────────────────────
-from core.finam_connector import finam_connector
-from core.quik_connector import quik_connector
+# ── Отложенная регистрация встроенных коннекторов ───────────────────────────────
+# NOTE: Регистрация коннекторов перенесена в явный вызов register_connectors()
+# для возможности юнит-тестирования без реального окружения.
+# Вызывать после настройки приложения.
 
-connector_manager.register("finam", finam_connector)
-connector_manager.register("quik", quik_connector)
-
-# Автоматическая инициализация реконнекта при загрузке модуля
-# (настройки будут применены, цикл запустится после первого успешного connect())
-connector_manager.configure_all()
+def register_connectors():
+    """Регистрирует встроенные коннекторы. Вызывается после инициализации UI."""
+    from core.finam_connector import finam_connector
+    from core.quik_connector import quik_connector
+    
+    connector_manager.register("finam", finam_connector)
+    connector_manager.register("quik", quik_connector)
+    
+    # Автоматическая инициализация реконнекта при загрузке модуля
+    connector_manager.configure_all()

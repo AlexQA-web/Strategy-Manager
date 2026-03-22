@@ -58,15 +58,27 @@ def save(ticker: str, timeframe: str, df: pd.DataFrame):
 
 
 def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
-    """Мержит кеш с новыми барами. Перезаписывает последний бар кеша (мог не закрыться)."""
+    """Мержит кеш с новыми барами. Перезаписывает последний бар кеша (мог не закрыться).
+    
+    NOTE: Исправлено - теперь проверяем, является ли последний бар кэша "свежим" (недавно обновлялся).
+    Для дневных/недельных таймфреймов старый закрытый бар не отрезается.
+    """
     if cached is None or cached.empty:
         return fresh
     if fresh is None or fresh.empty:
         return cached
-    # Убираем последний бар кеша — он мог быть незакрытым
+    
     cutoff = cached.index[-1]
-    cached_trimmed = cached[cached.index < cutoff]
-    combined = pd.concat([cached_trimmed, fresh])
+    # Проверяем, является ли последний бар кэша "свежим" - т.е. мог ли он измениться
+    # Если последний бар кэша младше чем первый бар fresh - он точно закрыт и не нужно его отрезать
+    if fresh.index[0] > cutoff:
+        # Бары не пересекаются - просто добавляем fresh к кэшу
+        combined = pd.concat([cached, fresh])
+    else:
+        # Бары пересекаются - отрезаем только если последний бар кэша может быть незакрытым
+        cached_trimmed = cached[cached.index < cutoff]
+        combined = pd.concat([cached_trimmed, fresh])
+    
     combined = combined[~combined.index.duplicated(keep="last")]
     combined.sort_index(inplace=True)
     return combined

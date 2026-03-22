@@ -15,6 +15,11 @@ order_mode: limit_book (bid/ask ± offset) | limit_price (last price).
 from loguru import logger
 
 # ── Состояние (сбрасывается в on_start и каждый день) ────────────────────────
+# NOTE: Добавлен threading.Lock для защиты от race condition при одновременном
+# доступе из poll-loop и chase-потоков
+import threading
+_state_lock = threading.Lock()
+
 _reference_prices: dict[str, float] = {}
 _positions: dict[str, dict] = {}   # {ticker: {side, qty, board, status: "open"|"closing"}}
 _snapshot_done: bool = False

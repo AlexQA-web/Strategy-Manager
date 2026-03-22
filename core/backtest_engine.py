@@ -217,12 +217,16 @@ class BacktestEngine:
                 # В бэктесте предполагаем taker (рыночные ордера)
                 # Используем переданный connector_id
                 connector_id = getattr(self, "_connector_id", "finam")
+                # Получаем point_cost для фьючерсов (необходим для корректного расчёта)
+                # Используем trade.point_cost если есть, иначе 1.0
+                point_cost = getattr(trade, "point_cost", 1.0) or 1.0
                 commission_per_trade = commission_manager.calculate(
                     ticker=ticker,
                     board=board,
                     quantity=trade.qty,
                     price=avg_price,
                     order_role="taker",
+                    point_cost=point_cost,
                     connector_id=connector_id
                 )
                 # Комиссия за вход и выход

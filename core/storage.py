@@ -15,17 +15,25 @@ _cache: dict[str, tuple[Any, float, float]] = {}  # path → (data, monotonic_ts
 _CACHE_TTL = 2.0  # секунды
 
 
-def _read(filepath: Path) -> Any:
+def _read(filepath: Path, use_cache: bool = True) -> Any:
+    """Читает данные из файла или кэша.
+    
+    Args:
+        filepath: Путь к файлу
+        use_cache: Если False - игнорирует кэш и читает напрямую с диска.
+                   Используется внутри _write_lock для избежания race condition.
+    """
     key = str(filepath)
     current_mtime = filepath.stat().st_mtime if filepath.exists() else 0
 
-    with _cache_lock:
-        entry = _cache.get(key)
-        if entry:
-            data, cached_at, cached_mtime = entry
-            # Инвалидируем если TTL истёк ИЛИ файл изменился
-            if time.monotonic() - cached_at < _CACHE_TTL and current_mtime == cached_mtime:
-                return data
+    if use_cache:
+        with _cache_lock:
+            entry = _cache.get(key)
+            if entry:
+                data, cached_at, cached_mtime = entry
+                # Инвалидируем если TTL истёк ИЛИ файл изменился
+                if time.monotonic() - cached_at < _CACHE_TTL and current_mtime == cached_mtime:
+                    return data
 
     if not filepath.exists() or filepath.stat().st_size == 0:
         return {}
@@ -167,7 +175,9 @@ TRADES_FILE = DATA_DIR / "trades_history.json"
 def append_trade(trade: dict):
     """Атомарное добавление сделки через read-modify-write внутри lock."""
     with _write_lock:
-        trades = _read(TRADES_FILE)
+        # Используем use_cache=False для избежания race condition:
+        # читаем напрямую с диска, игнорируя кэш
+        trades = _read(TRADES_FILE, use_cache=False)
         if not isinstance(trades, list):
             trades = []
         trades.append(trade)

@@ -487,9 +487,11 @@ class InstrumentsParamWidget(BaseParamWidget):
                 parent=self
             )
             
-            # Заменяем виджет в layout
-            if self.layout():
-                self.layout().replaceWidget(old_widget, self.instruments_widget)
+            # Заменяем виджет в layout родителя
+            # NOTE: self.layout() может вернуть None, поэтому используем parent.layout()
+            parent_layout = self.parent().layout() if self.parent() else None
+            if parent_layout:
+                parent_layout.replaceWidget(old_widget, self.instruments_widget)
                 old_widget.deleteLater()
     
     def validate(self) -> Tuple[bool, str]:
