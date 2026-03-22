@@ -10,10 +10,17 @@ from typing import Optional
 import pandas as pd
 from loguru import logger
 
-from core.equity_tracker import flush_all as equity_flush_all
-from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK
+from core.equity_tracker import flush_all as equity_flush_all, record_equity, get_max_drawdown
+from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK, TRADING_END_TIME_MIN
 from core.commission_manager import commission_manager
 from core.connector_manager import connector_manager
+from core.instrument_classifier import instrument_classifier
+from core.order_history import get_total_pnl, get_order_pairs, make_order, save_order
+from core.storage import append_trade
+from core.telegram_bot import notifier, EventCode
+from core.chase_order import ChaseOrder
+from core.finam_connector import FinamConnector
+from core.quik_connector import QuikConnector
 
 # Маппинг timeframe → строка для get_history
 TIMEFRAME_TO_PERIOD = {
@@ -68,8 +75,6 @@ class LiveEngine:
         )
         if found_id is None:
             # Fallback: определяем по типу объекта
-            from core.finam_connector import FinamConnector
-            from core.quik_connector import QuikConnector
             if isinstance(connector, QuikConnector):
                 self._connector_id = "quik"
             elif isinstance(connector, FinamConnector):
@@ -149,32 +154,65 @@ class LiveEngine:
 
     def _is_futures(self, ticker: str = None) -> bool:
         """Определяет, является ли инструмент фьючерсом через instrument_classifier."""
-        from core.instrument_classifier import instrument_classifier
         t = ticker or self._ticker
         b = self._board if ticker is None else ""
         return instrument_classifier.is_futures(t, b)
 
+    def _calculate_commission_manual(self, ticker: str, abs_qty: int, price: float, sec_type: str) -> float:
+        """Рассчитывает комиссию вручную по константам или пользовательским параметрам.
+
+        Используется как основной путь в manual-режиме и как fallback в auto-режиме
+        при недоступности commission_manager.
+
+        Args:
+            ticker: Тикер инструмента (для логирования)
+            abs_qty: Количество лотов/контрактов (всегда положительное)
+            price: Цена исполнения
+            sec_type: Тип инструмента — 'futures' или 'stock'
+
+        Returns:
+            Комиссия в рублях (всегда положительная)
+        """
+        if sec_type == 'futures':
+            commission_per_lot = self._commission_rub if self._commission_rub > 0 else COMMISSION_FUTURES
+            commission = commission_per_lot * abs_qty
+            logger.debug(
+                f"[LiveEngine:{self._strategy_id}] Комиссия (фьючерс, ручная): "
+                f"{commission:.2f} руб ({commission_per_lot} руб/лот * {abs_qty} лот)"
+            )
+        else:
+            commission_pct = self._commission_pct if self._commission_pct > 0 else COMMISSION_STOCK
+            trade_value = price * abs_qty
+            commission = trade_value * (commission_pct / 100.0)
+            logger.debug(
+                f"[LiveEngine:{self._strategy_id}] Комиссия (акция, ручная): "
+                f"{commission:.2f} руб ({commission_pct}% от {trade_value:.2f} руб)"
+            )
+        return commission
+
     def _calculate_commission(self, ticker: str, qty: int, price: float, sec_type: str = None) -> float:
         """Рассчитывает комиссию за сделку.
-        
+
+        В auto-режиме делегирует commission_manager; при ошибке падает на ручной расчёт.
+        В manual-режиме использует параметры стратегии или константы из config.
+
         Args:
             ticker: Тикер инструмента
             qty: Количество лотов/контрактов (может быть отрицательным)
             price: Цена исполнения
             sec_type: Тип инструмента ('futures' или 'stock'), определяется автоматически если None
-            
+
         Returns:
             Комиссия в рублях (всегда положительная)
         """
         abs_qty = abs(qty)
-        
-        # Режим автоматического расчёта комиссии
+
+        if sec_type is None:
+            sec_type = 'futures' if self._is_futures(ticker) else 'stock'
+
         if self._commission_mode == "auto":
             try:
-                # Определяем роль ордера (по умолчанию taker для market, maker для limit)
                 order_role = "maker" if self._order_mode == "limit" else "taker"
-                
-                # Рассчитываем комиссию через commission_manager
                 commission = commission_manager.calculate(
                     ticker=ticker,
                     board=self._board,
@@ -184,7 +222,6 @@ class LiveEngine:
                     point_cost=self._point_cost,
                     connector_id=self._connector_id
                 )
-                
                 logger.debug(
                     f"[LiveEngine:{self._strategy_id}] Комиссия (авто): "
                     f"{commission:.2f} руб для {ticker} ({abs_qty} лот, {order_role})"
@@ -195,39 +232,8 @@ class LiveEngine:
                     f"[LiveEngine:{self._strategy_id}] Ошибка автоматического расчёта комиссии: {e}. "
                     f"Используется fallback."
                 )
-                # Fallback на старую логику
-                if sec_type is None:
-                    sec_type = 'futures' if self._is_futures(ticker) else 'stock'
-                commission_per_lot = COMMISSION_FUTURES if sec_type == 'futures' else 0
-                commission_pct = COMMISSION_STOCK if sec_type == 'stock' else 0
-                if sec_type == 'futures':
-                    return commission_per_lot * abs_qty
-                else:
-                    return price * abs_qty * (commission_pct / 100.0)
-        
-        # Ручной режим (обратная совместимость)
-        if sec_type is None:
-            sec_type = 'futures' if self._is_futures(ticker) else 'stock'
-        
-        if sec_type == 'futures':
-            # Для фьючерсов: фиксированная комиссия за каждый контракт
-            commission_per_lot = self._commission_rub if self._commission_rub > 0 else COMMISSION_FUTURES
-            commission = commission_per_lot * abs_qty
-            logger.debug(
-                f"[LiveEngine:{self._strategy_id}] Комиссия (фьючерс, ручная): "
-                f"{commission:.2f} руб ({commission_per_lot} руб/лот * {abs_qty} лот)"
-            )
-        else:
-            # Для акций: процент от суммы сделки
-            commission_pct = self._commission_pct if self._commission_pct > 0 else COMMISSION_STOCK
-            trade_value = price * abs_qty
-            commission = trade_value * (commission_pct / 100.0)
-            logger.debug(
-                f"[LiveEngine:{self._strategy_id}] Комиссия (акция, ручная): "
-                f"{commission:.2f} руб ({commission_pct}% от {trade_value:.2f} руб)"
-            )
-        
-        return commission
+
+        return self._calculate_commission_manual(ticker, abs_qty, price, sec_type)
 
     def _load_point_cost(self):
         """Загружает стоимость пункта из коннектора.
@@ -356,9 +362,6 @@ class LiveEngine:
         Учитывает комиссии при расчете unrealized PnL.
         """
         try:
-            from core.order_history import get_total_pnl
-            from core.equity_tracker import record_equity
-
             realized = get_total_pnl(self._strategy_id) or 0.0
             unrealized = 0.0
             
@@ -519,7 +522,6 @@ class LiveEngine:
     def _get_entry_price_from_history(self) -> float:
         """Берёт цену входа из последней незакрытой пары ордеров."""
         try:
-            from core.order_history import get_order_pairs
             pairs = get_order_pairs(self._strategy_id)
             # Ищем незакрытую позицию (close=None)
             for pair in reversed(pairs):
@@ -721,8 +723,6 @@ class LiveEngine:
 
         drawdown: max(ручная, по стратегии)
         """
-        from core.equity_tracker import get_max_drawdown
-
         free_money = self._connector.get_free_money(self._account_id)
         if free_money is None or free_money <= 0:
             return None
@@ -868,7 +868,6 @@ class LiveEngine:
             # ORDER_PLACED только для не-chase режимов — для chase уведомление после исполнения
             if self._order_mode != "limit":
                 try:
-                    from core.telegram_bot import notifier, EventCode
                     notifier.send(
                         EventCode.ORDER_PLACED,
                         agent=self._strategy_id,
@@ -900,7 +899,6 @@ class LiveEngine:
         )
         
         try:
-            from core.order_history import make_order, save_order
             order = make_order(
                 strategy_id=self._strategy_id,
                 ticker=self._ticker,
@@ -917,7 +915,6 @@ class LiveEngine:
             logger.warning(f"[LiveEngine:{self._strategy_id}] _record_trade (order_history) error: {e}")
 
         try:
-            from core.storage import append_trade
             trade = {
                 "strategy_id": self._strategy_id,
                 "agent_name": self._agent_name,
@@ -937,8 +934,6 @@ class LiveEngine:
 
         # Принудительный flush equity после каждой сделки
         try:
-            from core.order_history import get_total_pnl
-            from core.equity_tracker import record_equity
             realized = get_total_pnl(self._strategy_id) or 0.0
             unrealized = 0.0
             
@@ -1125,7 +1120,6 @@ class LiveEngine:
 
         Учитывает частичное исполнение: filled = qty - balance.
         """
-        from config.settings import TRADING_END_TIME_MIN
         _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
         CANCEL_TIME_MIN = TRADING_END_TIME_MIN
 
@@ -1216,7 +1210,6 @@ class LiveEngine:
 
                 # Уведомление об исполнении
                 try:
-                    from core.telegram_bot import notifier, EventCode
                     notifier.send(
                         EventCode.ORDER_FILLED,
                         agent=self._strategy_id,
@@ -1313,7 +1306,6 @@ class LiveEngine:
 
                 # Уведомление об исполнении
                 try:
-                    from core.telegram_bot import notifier, EventCode
                     notifier.send(
                         EventCode.ORDER_FILLED,
                         agent=self._strategy_id,
@@ -1358,8 +1350,6 @@ class LiveEngine:
         Позиция обновляется по завершению через _on_chase_done().
         Защита от двойного входа: _order_in_flight флаг (уже установлен в _execute_signal).
         """
-        from core.chase_order import ChaseOrder
-
         # Флаг _order_in_flight уже установлен в _execute_signal() под блокировкой
         # Здесь только запускаем chase-поток
 
@@ -1469,7 +1459,6 @@ class LiveEngine:
         )
 
         try:
-            from core.telegram_bot import notifier, EventCode
             notifier.send(
                 EventCode.ORDER_FILLED,
                 agent=self._strategy_id,
