@@ -511,6 +511,10 @@ class QuikConnector(BaseConnector):
         if not self._connected or not self._client:
             return None
         
+        # Фильтруем невалидные тикеры
+        if not ticker or ticker.strip() in ("", "—", "-"):
+            return None
+        
         try:
             result = {}
             

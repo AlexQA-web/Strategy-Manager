@@ -514,6 +514,7 @@ class StrategyWindow(QDialog):
                      f"strategy_name={self.data.get('name', 'unknown')}")
 
         self._param_widgets: dict = {}
+        self._commission_widget = None
 
         group = QGroupBox("Параметры стратегии")
         form = QFormLayout(group)
@@ -550,20 +551,23 @@ class StrategyWindow(QDialog):
             self._param_widgets[key] = widget
             form.addRow(f"{label}:", widget)
             
-            # Если это виджет комиссии, подключаем обработчик изменения борды
+            # Если это виджет комиссии, сохраняем ссылку
             if isinstance(widget, CommissionParamWidget):
                 self._commission_widget = widget
-                # Устанавливаем начальный тип борды
-                board = params.get("board", "TQBR")
-                is_futures = "FUT" in board.upper()
-                widget.set_board_type(is_futures)
-                
-                # Подключаем обработчик изменения борды от ticker_selector
-                ticker_widget = self._param_widgets.get("ticker")
-                if ticker_widget and hasattr(ticker_widget, "ticker_selector"):
-                    ticker_widget.ticker_selector.board_changed.connect(
-                        lambda b: self._on_board_changed_commission(b)
-                    )
+
+        # Подключаем сигнал изменения борды ПОСЛЕ создания всех виджетов
+        if self._commission_widget is not None:
+            # Устанавливаем начальный тип борды
+            board = params.get("board", "TQBR")
+            is_futures = "FUT" in board.upper()
+            self._commission_widget.set_board_type(is_futures)
+            
+            # Подключаем обработчик изменения борды от ticker_selector
+            ticker_widget = self._param_widgets.get("ticker")
+            if ticker_widget and hasattr(ticker_widget, "ticker_selector"):
+                ticker_widget.ticker_selector.board_changed.connect(
+                    lambda b: self._on_board_changed_commission(b)
+                )
 
         layout.addWidget(group)
         layout.addStretch()

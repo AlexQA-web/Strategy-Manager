@@ -626,6 +626,10 @@ class CommissionParamWidget(BaseParamWidget):
     
     def set_board_type(self, is_futures: bool):
         """Переключает виджет в зависимости от типа борды"""
+        # Избегаем избыточных обновлений
+        if self._is_futures == is_futures:
+            return
+        
         self._is_futures = is_futures
         self._update_visibility()
     
@@ -633,6 +637,7 @@ class CommissionParamWidget(BaseParamWidget):
         """Обновляет видимость виджетов"""
         self.spin_pct.setVisible(not self._is_futures)
         self.spin_rub.setVisible(self._is_futures)
+        self.updateGeometry()
     
     def get_value(self) -> float:
         """Возвращает текущее значение комиссии"""
