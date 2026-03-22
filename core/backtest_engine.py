@@ -64,8 +64,13 @@ class BacktestEngine:
     def __init__(self, loader: TXTLoader | None = None):
         self._loader = loader or TXTLoader()
 
-    def run(self, module, filepath: str, stop_flag=None) -> BacktestResult:
+    def run(self, module, filepath: str, connector_id: str = "finam", 
+            board: str = "TQBR", stop_flag=None) -> BacktestResult:
         self.stop_flag = stop_flag or (lambda: False)
+        
+        # Сохраняем для передачи в _close_trade
+        self._connector_id = connector_id
+        self._board = board
 
         raw_params = module.get_params() if hasattr(module, "get_params") else {}
         params = {k: v["default"] for k, v in raw_params.items()}
@@ -197,8 +202,7 @@ class BacktestEngine:
         logger.debug("Pre-calc: стратегия не реализует on_precalc, пропуск")
         return df
 
-    @staticmethod
-    def _close_trade(trade, exit_price, exit_dt, comment, commission_mode, commission_value, ticker, board="TQBR") -> Trade:
+    def _close_trade(self, trade, exit_price, exit_dt, comment, commission_mode, commission_value, ticker, board="TQBR") -> Trade:
         trade.exit_price   = exit_price
         trade.exit_dt      = exit_dt
         trade.exit_comment = comment
@@ -211,8 +215,8 @@ class BacktestEngine:
                 # Для бэктеста используем среднюю цену входа и выхода
                 avg_price = (trade.entry_price + exit_price) / 2
                 # В бэктесте предполагаем taker (рыночные ордера)
-                # Используем коннектор по умолчанию для бэктеста
-                connector_id = "transaq"
+                # Используем переданный connector_id
+                connector_id = getattr(self, "_connector_id", "finam")
                 commission_per_trade = commission_manager.calculate(
                     ticker=ticker,
                     board=board,

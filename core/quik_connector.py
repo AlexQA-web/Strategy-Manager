@@ -96,25 +96,12 @@ class QuikConnector(BaseConnector):
         self._fire(self._on_disconnect)
 
     def is_connected(self) -> bool:
-        """Проверяет реальное состояние подключения к QUIK."""
-        if not self._connected or not self._client:
-            return False
-        try:
-            # Реальная проверка соединения через QuikPy
-            result = self._client.is_connected()
-            connected = result.get("data") == 1
-            if not connected and self._connected:
-                # Соединение потеряно - обновляем флаг
-                logger.warning("[QUIK] Потеряно соединение с сервером брокера")
-                self._connected = False
-                self._fire(self._on_disconnect)
-            return connected
-        except Exception as e:
-            logger.warning(f"[QUIK] is_connected check error: {e}")
-            if self._connected:
-                self._connected = False
-                self._fire(self._on_disconnect)
-            return False
+        """Проверяет состояние подключения к QUIK (без блокирующего вызова).
+        
+        Использует кэшированное состояние _connected. Реальная проверка соединения
+        выполняется в фоновом потоке reconnect_loop.
+        """
+        return self._connected and self._client is not None
 
     # ── Ордера ──────────────────────────────────────────────────────────
 
@@ -175,19 +162,22 @@ class QuikConnector(BaseConnector):
         self,
         account_id: str,
         ticker: str,
+        quantity: int = 0,
         agent_name: str = "",
     ) -> bool:
         positions = self.get_positions(account_id)
         pos = next((p for p in positions if p.get("ticker") == ticker), None)
         if not pos:
             return False
-        qty  = int(pos.get("quantity", 0))
-        side = "sell" if qty > 0 else "buy"
+        pos_qty = int(pos.get("quantity", 0))
+        # Если quantity = 0, закрываем всю позицию, иначе - частично
+        close_qty = abs(quantity) if quantity != 0 else abs(pos_qty)
+        side = "sell" if pos_qty > 0 else "buy"
         result = self.place_order(
             account_id=account_id,
             ticker=ticker,
             side=side,
-            quantity=abs(qty),
+            quantity=close_qty,
             order_type="market",
             board=pos.get("board", "TQBR"),
             agent_name=agent_name,

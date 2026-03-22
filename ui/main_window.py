@@ -467,6 +467,10 @@ class MainWindow(QMainWindow):
         self._log_visible = True
         self._expanded: set = set()  # sid стратегий с развёрнутым списком инструментов
         self._row_order: list = []   # порядок sid агентов (in-memory, синхронизируется с QSettings)
+        
+        # Кэш для sec_info (чтобы не блокировать GUI при запросах к QUIK)
+        self._sec_info_cache: dict = {}  # {(connector_id, ticker, board): (sec_info, timestamp)}
+        self._SEC_INFO_TTL = 60  # обновлять раз в 60 секунд
 
         self._setup_core()
         self._build_ui()
@@ -829,6 +833,46 @@ class MainWindow(QMainWindow):
             self._expanded.add(sid)
         self._refresh_table()
 
+    # ─────────────────────────────────────────────
+    # Кэширование sec_info (защита от блокировки GUI)
+    # ─────────────────────────────────────────────
+
+    def _get_sec_info_cached(self, connector, connector_id: str, ticker: str, board: str):
+        """Возвращает sec_info из кэша или None, не блокируя GUI."""
+        import time
+        key = (connector_id, ticker, board)
+        cached = self._sec_info_cache.get(key)
+        
+        if cached:
+            sec_info, ts = cached
+            if time.monotonic() - ts < self._SEC_INFO_TTL:
+                return sec_info  # отдаём из кэша
+        
+        # Кэш устарел — обновляем в фоне, возвращаем старое значение если есть
+        if cached:
+            self._refresh_sec_info_background(connector, connector_id, ticker, board)
+            return cached[0]
+        
+        # Первый запрос — тоже в фоне
+        self._refresh_sec_info_background(connector, connector_id, ticker, board)
+        return None
+
+    def _refresh_sec_info_background(self, connector, connector_id: str, ticker: str, board: str):
+        """Обновляет sec_info в фоновом потоке."""
+        import threading
+        import time
+        key = (connector_id, ticker, board)
+        
+        def _fetch():
+            try:
+                sec_info = connector.get_sec_info(ticker, board)
+                if sec_info:
+                    self._sec_info_cache[key] = (sec_info, time.monotonic())
+            except Exception:
+                pass
+        
+        threading.Thread(target=_fetch, daemon=True).start()
+
     def _refresh_table(self):
         from core.autostart import get_live_engines
         from core.connector_manager import connector_manager
@@ -970,7 +1014,7 @@ class MainWindow(QMainWindow):
                     from core.equity_tracker import get_max_drawdown
                     import math
                     free_money = connector.get_free_money(account)
-                    sec_info = connector.get_sec_info(ticker, board) if hasattr(connector, "get_sec_info") else None
+                    sec_info = self._get_sec_info_cached(connector, connector_id, ticker, board) if hasattr(connector, "get_sec_info") else None
                     go = 0.0
                     if sec_info:
                         go = float(sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0)
@@ -992,7 +1036,7 @@ class MainWindow(QMainWindow):
                     can_afford = True
                     if connector and connector.is_connected():
                         free_money = connector.get_free_money(account)
-                        sec_info = connector.get_sec_info(ticker, data.get("board", "FUT"))
+                        sec_info = self._get_sec_info_cached(connector, connector_id, ticker, data.get("board", "FUT"))
                         if free_money is not None and sec_info:
                             from core.equity_tracker import get_max_drawdown
                             go = sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0
@@ -1286,6 +1330,10 @@ class MainWindow(QMainWindow):
             ui_signals.strategies_changed.emit()
 
     def _stop_agent(self, sid: str):
+        # Останавливаем LiveEngine если запущен
+        from core.autostart import stop_live_engine
+        stop_live_engine(sid)
+        
         data = get_strategy(sid)
         if data:
             data["status"] = "stopped"

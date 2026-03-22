@@ -61,6 +61,27 @@ def get_live_engines() -> dict:
         return dict(_live_engines)
 
 
+def stop_live_engine(strategy_id: str) -> bool:
+    """Останавливает LiveEngine стратегии и удаляет из реестра.
+    
+    Returns:
+        True если engine был найден и остановлен, False если не найден.
+    """
+    with _live_engines_lock:
+        engine = _live_engines.get(strategy_id)
+        if engine is None:
+            logger.warning(f"[autostart] LiveEngine для стратегии '{strategy_id}' не найден")
+            return False
+        
+        # Останавливаем engine
+        engine.stop()
+        
+        # Удаляем из реестра
+        del _live_engines[strategy_id]
+        logger.info(f"[autostart] LiveEngine стратегии '{strategy_id}' остановлен и удалён")
+        return True
+
+
 def autostart_strategies():
     """Автозапуск активных стратегий (вызывается в фоновом потоке)."""
     from core.storage import get_bool_setting, get_all_strategies

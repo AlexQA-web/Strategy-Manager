@@ -13,6 +13,7 @@ from loguru import logger
 from core.equity_tracker import flush_all as equity_flush_all
 from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK
 from core.commission_manager import commission_manager
+from core.connector_manager import connector_manager
 
 # Маппинг timeframe → строка для get_history
 TIMEFRAME_TO_PERIOD = {
@@ -58,6 +59,13 @@ class LiveEngine:
         self._module = loaded_strategy.module
         self._params = params
         self._connector = connector
+        
+        # Определяем ID коннектора по объекту
+        self._connector_id = next(
+            (cid for cid, c in connector_manager.all().items() if c is connector),
+            "finam"  # значение по умолчанию
+        )
+        
         self._account_id = account_id
         self._ticker = ticker
         self._board = board
@@ -826,11 +834,14 @@ class LiveEngine:
         Комиссия учитывается в order_history для расчёта net PnL через get_order_pairs().
         """
         # Рассчитываем комиссию через новый метод (автоопределение типа инструмента)
+        # CommissionManager.calculate возвращает комиссию за весь объём, 
+        # но make_order ожидает commission за 1 лот (одна сторона)
         commission_rub = self._calculate_commission(self._ticker, qty, price)
+        commission_per_lot = commission_rub / qty if qty > 0 else commission_rub
         
         logger.info(
             f"[LiveEngine:{self._strategy_id}] Запись сделки: {side.upper()} {self._ticker} "
-            f"x{qty} @ {price:.4f}, комиссия={commission_rub:.2f} руб"
+            f"x{qty} @ {price:.4f}, комиссия={commission_per_lot:.2f} руб/лот"
         )
         
         try:
@@ -843,7 +854,8 @@ class LiveEngine:
                 price=price,
                 board=self._board,
                 comment=comment,
-                commission=commission_rub,
+                commission=commission_per_lot,
+                point_cost=self._point_cost,
             )
             save_order(order)
         except Exception as e:

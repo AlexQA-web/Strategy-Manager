@@ -35,6 +35,7 @@ def make_order(
     board: str = "TQBR",
     comment: str = "",
     commission: float = 0.0,  # комиссия в руб. на 1 лот (одна сторона)
+    point_cost: float = 1.0,  # стоимость пункта в рублях
 ) -> dict:
     return {
         "id":           str(uuid.uuid4()),
@@ -48,6 +49,7 @@ def make_order(
         "status":       "filled",
         "comment":      comment,
         "commission":   commission,  # руб/лот, одна сторона
+        "point_cost":   point_cost,  # стоимость пункта в рублях
         "pnl":          None,   # Заполняется при закрытии
         "pair_id":      None,   # ID ордера-открытия (для закрывающих ордеров)
     }
@@ -149,11 +151,14 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
             is_long = open_order["side"] == "buy"
             open_price = open_order["price"]
             close_price = order["price"]
+            
+            # Учитываем point_cost для фьючерсов
+            point_cost = open_order.get("point_cost", 1.0)
 
             if is_long:
-                gross_pnl = (close_price - open_price) * close_qty
+                gross_pnl = (close_price - open_price) * close_qty * point_cost
             else:
-                gross_pnl = (open_price - close_price) * close_qty
+                gross_pnl = (open_price - close_price) * close_qty * point_cost
 
             # Комиссия: берём максимум из open/close ордера
             commission_per_lot = max(

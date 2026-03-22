@@ -20,6 +20,7 @@ class Bar:
     low: float
     close: float
     vol: int
+    board: str = "TQBR"   # режим торгов (по умолчанию TQBR для акций)
 
 
 class TXTLoader:

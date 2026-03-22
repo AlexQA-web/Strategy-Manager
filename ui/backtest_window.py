@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 
 from core.backtest_engine import BacktestEngine, BacktestResult
 from core.txt_loader import TXTLoader
+from config.settings import STRATEGIES_DIR
 
 
 
@@ -24,10 +25,12 @@ class BacktestWorker(QThread):
     finished = pyqtSignal(object)
     error    = pyqtSignal(str)
 
-    def __init__(self, module, filepath: str):
+    def __init__(self, module, filepath: str, connector_id: str = "finam", board: str = "TQBR"):
         super().__init__()
         self._module   = module
         self._filepath = filepath
+        self._connector_id = connector_id
+        self._board = board
         self._stopped  = False
 
     def stop(self):
@@ -36,7 +39,12 @@ class BacktestWorker(QThread):
     def run(self):
         try:
             engine = BacktestEngine(TXTLoader())
-            result = engine.run(self._module, self._filepath, stop_flag=lambda: self._stopped)
+            result = engine.run(
+                self._module, self._filepath, 
+                connector_id=self._connector_id,
+                board=self._board,
+                stop_flag=lambda: self._stopped
+            )
             if not self._stopped:
                 self.finished.emit(result)
         except InterruptedError:
@@ -128,10 +136,14 @@ class BacktestWindow(QDialog):
 
     def __init__(self, strategy_id: str | None = None,
                  strategy_file_path: str | None = None,
+                 connector_id: str = "finam",
+                 board: str = "TQBR",
                  parent=None):
         super().__init__(parent)
         self._strategy_id = strategy_id
         self._strategy_file_path = strategy_file_path
+        self._connector_id = connector_id
+        self._board = board
         self._data_filepath: str | None = None
         self._strategy_module = None
         self._param_widgets: dict = {}
@@ -320,8 +332,8 @@ class BacktestWindow(QDialog):
 
         # 2. По strategy_id в папке strategies/
         if strategy_id:
-            candidates.append(Path("strategies") / f"{strategy_id}.py")
-            candidates.append(Path("strategies") / f"{strategy_id.lower()}.py")
+            candidates.append(STRATEGIES_DIR / f"{strategy_id}.py")
+            candidates.append(STRATEGIES_DIR / f"{strategy_id.lower()}.py")
 
         for path in candidates:
             if path.exists():
@@ -426,7 +438,17 @@ class BacktestWindow(QDialog):
         self._progress.setVisible(True)
 
         module = self._build_strategy()
-        self._worker = BacktestWorker(module, self._data_filepath)
+        # Получаем board из параметров стратегии
+        board = self._board
+        # Пытаемся получить board из виджета параметров если есть
+        if "board" in self._param_widgets:
+            board = self._param_widgets["board"].currentText() or board
+        
+        self._worker = BacktestWorker(
+            module, self._data_filepath, 
+            connector_id=self._connector_id,
+            board=board
+        )
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
