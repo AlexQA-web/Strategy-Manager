@@ -222,27 +222,21 @@ class BacktestEngine:
         # Расчёт комиссии
         if commission_mode == "auto":
             try:
-                # Автоматический расчёт через commission_manager
-                # Для бэктеста используем среднюю цену входа и выхода
-                avg_price = (trade.entry_price + exit_price) / 2
-                # Определяем роль ордера на основе order_mode (как в live_engine)
                 order_role = "maker" if order_mode == "limit" else "taker"
-                # Используем переданный connector_id
                 connector_id = getattr(self, "_connector_id", "finam")
-                # Получаем point_cost для фьючерсов (необходим для корректного расчёта)
-                # Используем trade.point_cost если есть, иначе 1.0
                 point_cost = getattr(trade, "point_cost", 1.0) or 1.0
-                commission_per_trade = commission_manager.calculate(
-                    ticker=ticker,
-                    board=board,
-                    quantity=trade.qty,
-                    price=avg_price,
-                    order_role=order_role,
-                    point_cost=point_cost,
-                    connector_id=connector_id
+                # Считаем отдельно для входа и выхода — точнее, чем по средней цене
+                commission_entry = commission_manager.calculate(
+                    ticker=ticker, board=board, quantity=trade.qty,
+                    price=trade.entry_price, order_role=order_role,
+                    point_cost=point_cost, connector_id=connector_id,
                 )
-                # Комиссия за вход и выход
-                trade.commission = commission_per_trade * 2
+                commission_exit = commission_manager.calculate(
+                    ticker=ticker, board=board, quantity=trade.qty,
+                    price=exit_price, order_role=order_role,
+                    point_cost=point_cost, connector_id=connector_id,
+                )
+                trade.commission = commission_entry + commission_exit
             except Exception as e:
                 logger.warning(f"Ошибка автоматического расчёта комиссии в бэктесте: {e}. Используется 0.")
                 trade.commission = 0.0

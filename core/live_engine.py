@@ -148,14 +148,11 @@ class LiveEngine:
         self._consecutive_failures = 0
 
     def _is_futures(self, ticker: str = None) -> bool:
-        """Определяет, является ли инструмент фьючерсом.
-        
-        Фьючерсы обычно содержат дефис и цифры (например: Si-3.25, RTS-6.24).
-        Акции - обычные тикеры без дефисов (например: SBER, GAZP).
-        """
+        """Определяет, является ли инструмент фьючерсом через instrument_classifier."""
+        from core.instrument_classifier import instrument_classifier
         t = ticker or self._ticker
-        # Простая эвристика: если есть дефис и цифры - скорее всего фьючерс
-        return '-' in t and any(c.isdigit() for c in t)
+        b = self._board if ticker is None else ""
+        return instrument_classifier.is_futures(t, b)
 
     def _calculate_commission(self, ticker: str, qty: int, price: float, sec_type: str = None) -> float:
         """Рассчитывает комиссию за сделку.

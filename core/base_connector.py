@@ -140,8 +140,16 @@ class BaseConnector(ABC):
     # ── Авторекконект с экспоненциальным backoff ─────────────────────────
 
     def start_reconnect_loop(self):
-        """Запускает фоновый поток переподключения при обрыве."""
-        threading.Thread(target=self._reconnect_loop, daemon=True).start()
+        """Запускает фоновый поток переподключения при обрыве.
+
+        Идемпотентен: если поток уже запущен — повторный вызов игнорируется.
+        """
+        if hasattr(self, "_reconnect_thread") and self._reconnect_thread.is_alive():
+            return
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True, name="reconnect-loop"
+        )
+        self._reconnect_thread.start()
 
     def _reconnect_loop(self):
         from loguru import logger

@@ -91,41 +91,10 @@ def autostart_strategies():
     from core.strategy_loader import strategy_loader
     from core.connector_manager import connector_manager
     from core.live_engine import LiveEngine
+    from core.scheduler import is_in_schedule
 
     if not get_bool_setting("autostart_strategies"):
         return
-
-    def _is_connector_in_schedule(connector_id: str) -> bool:
-        """Проверяет, находится ли коннектор в окне работы по расписанию."""
-        from core.storage import get_all_schedules
-        from datetime import datetime
-        try:
-            from zoneinfo import ZoneInfo
-        except ImportError:
-            from backports.zoneinfo import ZoneInfo
-
-        schedules = get_all_schedules()
-        sched = schedules.get(connector_id)
-        if not sched or not isinstance(sched, dict):
-            return True  # нет расписания — не блокируем
-        if not sched.get("is_active", True):
-            return True
-
-        now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
-        today = now_msk.weekday()
-        if today not in sched.get("days", [0, 1, 2, 3, 4]):
-            return False
-
-        now_t = now_msk.time().replace(second=0, microsecond=0)
-        from datetime import time as dtime
-        ch, cm = map(int, sched.get("connect_time", "06:50").split(":"))
-        dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
-        connect_t = dtime(ch, cm)
-        disconnect_t = dtime(dh, dm)
-        if connect_t <= disconnect_t:
-            return connect_t <= now_t <= disconnect_t
-        else:
-            return now_t >= connect_t or now_t <= disconnect_t
 
     def _wait_for_connector(connector, timeout=120):
         """Ждёт подключения коннектора с таймаутом."""
@@ -170,7 +139,7 @@ def autostart_strategies():
                         # Ждём подключения коннектора перед запуском LiveEngine
                         if not connector.is_connected():
                             # Проверяем расписание коннектора — если вне окна, не ждём
-                            if not _is_connector_in_schedule(connector_id):
+                            if not is_in_schedule(connector_id):
                                 logger.info(f"Автозапуск [{sid}]: коннектор вне расписания, LiveEngine не запущен")
                                 continue
                             logger.info(f"Автозапуск [{sid}]: ожидаем подключения коннектора...")

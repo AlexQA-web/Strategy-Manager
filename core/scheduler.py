@@ -7,6 +7,46 @@ from core.storage import get_all_schedules
 DAYS_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
 
 
+def is_in_schedule(connector_id: str) -> bool:
+    """Возвращает True если коннектор сейчас находится в окне работы по расписанию.
+
+    Используется в autostart для проверки перед запуском LiveEngine.
+    Если расписание не найдено или неактивно — возвращает True (не блокируем).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    from datetime import datetime, time as dtime
+
+    schedules = get_all_schedules()
+    sched = schedules.get(connector_id)
+    if not sched or not isinstance(sched, dict):
+        return True  # нет расписания — не блокируем
+    if not sched.get("is_active", True):
+        return True
+
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    today = now_msk.weekday()
+    if today not in sched.get("days", [0, 1, 2, 3, 4]):
+        return False
+
+    now_t = now_msk.time().replace(second=0, microsecond=0)
+    try:
+        ch, cm = map(int, sched.get("connect_time",    "06:50").split(":"))
+        dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
+    except Exception as e:
+        logger.warning(f"[Scheduler] is_in_schedule({connector_id}): ошибка парсинга времени: {e}")
+        return True
+
+    connect_t    = dtime(ch, cm)
+    disconnect_t = dtime(dh, dm)
+    if connect_t <= disconnect_t:
+        return connect_t <= now_t <= disconnect_t
+    else:
+        return now_t >= connect_t or now_t <= disconnect_t
+
+
 class StrategyScheduler:
 
     def __init__(self):

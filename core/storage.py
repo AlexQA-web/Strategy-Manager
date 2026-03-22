@@ -12,7 +12,8 @@ from config.settings import DATA_DIR
 _write_lock = threading.Lock()   # защита от конкурентных записей
 _cache_lock = threading.Lock()   # защита кэша
 _cache: dict[str, tuple[Any, float, float]] = {}  # path → (data, monotonic_ts, mtime)
-_CACHE_TTL = 2.0  # секунды
+_CACHE_TTL = 2.0          # секунды — время жизни записи в кэше
+_MAX_TRADES_HISTORY = 10_000  # максимальное количество сделок в trades_history.json
 
 
 def _read(filepath: Path, use_cache: bool = True) -> Any:
@@ -93,6 +94,18 @@ def _write(filepath: Path, data: Any):
     """
     with _write_lock:
         _write_unsafe(filepath, data)
+
+
+# ── Публичный низкоуровневый API для других модулей core/ ────────────────────
+
+def read_json(filepath: Path) -> Any:
+    """Публичное чтение произвольного JSON-файла через кэш."""
+    return _read(filepath)
+
+
+def write_json(filepath: Path, data: Any):
+    """Публичная атомарная запись произвольного JSON-файла."""
+    _write(filepath, data)
 
 
 # ── Настройки приложения ──────────────────────────────────────────────────────
@@ -193,8 +206,8 @@ def append_trade(trade: dict):
         if not isinstance(trades, list):
             trades = []
         trades.append(trade)
-        if len(trades) > 10_000:
-            trades = trades[-10_000:]
+        if len(trades) > _MAX_TRADES_HISTORY:
+            trades = trades[-_MAX_TRADES_HISTORY:]
         # Вызываем _write_unsafe (без lock) — lock уже захвачен
         _write_unsafe(TRADES_FILE, trades)
 

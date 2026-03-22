@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Optional
 from loguru import logger
 
-from core.storage import _read, _write, DATA_DIR
+from core.storage import read_json, write_json, DATA_DIR
 
 # Lock для защиты race condition при одновременной записи ордеров от разных стратегий
 _orders_lock = threading.Lock()
@@ -60,12 +60,12 @@ def make_order(
 # ─────────────────────────────────────────────
 
 def _load() -> dict:
-    data = _read(ORDERS_FILE)
+    data = read_json(ORDERS_FILE)
     return data if isinstance(data, dict) else {}
 
 
 def _save(data: dict):
-    _write(ORDERS_FILE, data)
+    write_json(ORDERS_FILE, data)
 
 
 def save_order(order: dict):

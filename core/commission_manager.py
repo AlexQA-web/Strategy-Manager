@@ -6,14 +6,13 @@
 """
 
 import json
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from core.instrument_classifier import instrument_classifier
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from core.instrument_classifier import instrument_classifier
 
 
 class CommissionManager:
@@ -138,18 +137,15 @@ class CommissionManager:
         Returns:
             Комиссия в рублях за одну сторону
         """
-        # Определяем тип инструмента
+        # Определяем тип инструмента и группу за один вызов
         instrument_type = instrument_classifier.classify(ticker, board)
-        is_futures = instrument_classifier.is_futures(ticker, board)
-        
+        is_futures = instrument_type in instrument_classifier.FUTURES_TYPES
+
         # Получаем ставки
         moex_pct = self._get_moex_rate(instrument_type, order_role)
-        
+
         # Определяем конфигурацию брокера в зависимости от коннектора
-        if connector_id.lower() == "quik":
-            broker_config = self.config.get("broker_quik", {})
-        else:
-            broker_config = self.config.get("broker_transaq", {})
+        broker_config = self._get_broker_config(connector_id)
         
         if is_futures:
             # Для фьючерсов
@@ -210,18 +206,15 @@ class CommissionManager:
         Returns:
             Словарь с детализацией расчёта
         """
-        # Определяем тип инструмента
+        # Определяем тип инструмента и группу за один вызов
         instrument_type = instrument_classifier.classify(ticker, board)
-        is_futures = instrument_classifier.is_futures(ticker, board)
-        
+        is_futures = instrument_type in instrument_classifier.FUTURES_TYPES
+
         # Получаем ставки
         moex_pct = self._get_moex_rate(instrument_type, order_role)
-        
+
         # Определяем конфигурацию брокера в зависимости от коннектора
-        if connector_id.lower() == "quik":
-            broker_config = self.config.get("broker_quik", {})
-        else:
-            broker_config = self.config.get("broker_transaq", {})
+        broker_config = self._get_broker_config(connector_id)
         
         if is_futures:
             # Для фьючерсов
@@ -299,36 +292,41 @@ class CommissionManager:
             Эффективная ставка в процентах
         """
         instrument_type = instrument_classifier.classify(ticker, board)
-        is_futures = instrument_classifier.is_futures(ticker, board)
-        
+        is_futures = instrument_type in instrument_classifier.FUTURES_TYPES
+
         moex_pct = self._get_moex_rate(instrument_type, order_role)
-        
+
         if is_futures:
             # Для фьючерсов возвращаем только MOEX%
             return moex_pct
         else:
-            # Для акций возвращаем сумму
-            # Определяем конфигурацию брокера в зависимости от коннектора
-            if connector_id.lower() == "quik":
-                broker_config = self.config.get("broker_quik", {})
-            else:
-                broker_config = self.config.get("broker_transaq", {})
-            
-            if instrument_type == "stock":
-                broker_pct = broker_config.get("stock_pct", 0.04)
-            elif instrument_type == "bond":
-                broker_pct = broker_config.get("bond_pct", 0.015)
-            elif instrument_type == "etf":
-                broker_pct = broker_config.get("etf_pct", 0.04)
-            else:
-                broker_pct = 0.04  # Дефолт
-            
+            # Для акций возвращаем сумму MOEX + брокер
+            broker_config = self._get_broker_config(connector_id)
+            broker_pct = broker_config.get(f"{instrument_type}_pct", 0.04)
             return moex_pct + broker_pct
     
     def _get_moex_rate(self, instrument_type: str, order_role: str) -> float:
         """Получает ставку MOEX для типа инструмента и роли ордера."""
         role_key = "maker_pct" if order_role == "maker" else "taker_pct"
         return self.config.get("moex", {}).get(role_key, {}).get(instrument_type, 0.0)
+
+    def _get_broker_config(self, connector_id: str) -> dict:
+        """Возвращает конфиг брокера по ID коннектора.
+
+        Известные ID: "quik" → broker_quik, всё остальное → broker_transaq.
+        При неизвестном ID выводит предупреждение — это помогает обнаружить
+        проблему при добавлении нового брокера.
+        """
+        cid = connector_id.lower()
+        if cid == "quik":
+            return self.config.get("broker_quik", {})
+        if cid in ("transaq", "finam"):
+            return self.config.get("broker_transaq", {})
+        logger.warning(
+            f"[CommissionManager] Неизвестный connector_id='{connector_id}', "
+            f"используется конфиг broker_transaq по умолчанию"
+        )
+        return self.config.get("broker_transaq", {})
     
     def load_config(self):
         """Перезагружает конфигурацию из файла."""
