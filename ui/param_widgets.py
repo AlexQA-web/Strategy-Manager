@@ -577,10 +577,15 @@ class TimeframeParamWidget(BaseParamWidget):
 
 
 class CommissionParamWidget(BaseParamWidget):
-    """Виджет для параметра commission с динамическим переключением между % и рублями"""
+    """Виджет для параметра commission с поддержкой режимов: Авто / Ручной (% / ₽)"""
     
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
+        
+        # Чекбокс "Авто"
+        self.chk_auto = QCheckBox("Авто", self)
+        self.chk_auto.setToolTip("Использовать автоматический расчёт комиссий из настроек")
+        self.chk_auto.toggled.connect(self._on_auto_toggled)
         
         # Создаём два спинбокса - для процентов и для рублей
         self.spin_pct = QDoubleSpinBox(self)
@@ -602,11 +607,18 @@ class CommissionParamWidget(BaseParamWidget):
         # Layout для переключения виджетов
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.chk_auto)
         layout.addWidget(self.spin_pct)
         layout.addWidget(self.spin_rub)
         
         # Устанавливаем начальное значение
-        if current_value is not None:
+        # Если значение == "auto", включаем режим Авто
+        if current_value == "auto":
+            self.chk_auto.setChecked(True)
+            self.spin_pct.setValue(0.0)
+            self.spin_rub.setValue(0.0)
+        elif current_value is not None:
+            self.chk_auto.setChecked(False)
             try:
                 val = float(current_value)
                 self.spin_pct.setValue(val)
@@ -616,12 +628,17 @@ class CommissionParamWidget(BaseParamWidget):
                 self.spin_pct.setValue(float(default))
                 self.spin_rub.setValue(float(default))
         else:
+            self.chk_auto.setChecked(False)
             default = meta.get("default", 0.0)
             self.spin_pct.setValue(float(default))
             self.spin_rub.setValue(float(default))
         
         # По умолчанию показываем процентный виджет
         self._is_futures = False
+        self._update_visibility()
+    
+    def _on_auto_toggled(self, checked: bool):
+        """Обработчик переключения режима Авто"""
         self._update_visibility()
     
     def set_board_type(self, is_futures: bool):
@@ -634,13 +651,30 @@ class CommissionParamWidget(BaseParamWidget):
         self._update_visibility()
     
     def _update_visibility(self):
-        """Обновляет видимость виджетов"""
-        self.spin_pct.setVisible(not self._is_futures)
-        self.spin_rub.setVisible(self._is_futures)
+        """Обновляет видимость виджетов и форсирует перерисовку родителя"""
+        auto_mode = self.chk_auto.isChecked()
+        
+        # В режиме Авто скрываем спинбоксы
+        if auto_mode:
+            self.spin_pct.setVisible(False)
+            self.spin_rub.setVisible(False)
+        else:
+            # В ручном режиме показываем нужный спинбокс
+            self.spin_pct.setVisible(not self._is_futures)
+            self.spin_rub.setVisible(self._is_futures)
+        
         self.updateGeometry()
+        # Уведомляем родительский QFormLayout о смене размера
+        parent = self.parentWidget()
+        if parent is not None:
+            parent.updateGeometry()
+            parent.update()
     
-    def get_value(self) -> float:
-        """Возвращает текущее значение комиссии"""
+    def get_value(self):
+        """Возвращает текущее значение комиссии: "auto" или float"""
+        if self.chk_auto.isChecked():
+            return "auto"
+        
         if self._is_futures:
             return self.spin_rub.value()
         else:
@@ -648,21 +682,33 @@ class CommissionParamWidget(BaseParamWidget):
     
     def set_value(self, value: Any):
         """Устанавливает значение комиссии"""
-        try:
-            val = float(value)
-            if self._is_futures:
-                self.spin_rub.setValue(val)
-            else:
-                self.spin_pct.setValue(val)
-        except (ValueError, TypeError):
-            pass
+        if value == "auto":
+            self.chk_auto.setChecked(True)
+        else:
+            self.chk_auto.setChecked(False)
+            try:
+                val = float(value)
+                if self._is_futures:
+                    self.spin_rub.setValue(val)
+                else:
+                    self.spin_pct.setValue(val)
+            except (ValueError, TypeError):
+                pass
     
     def validate(self) -> Tuple[bool, str]:
         """Валидация значения комиссии"""
+        # В режиме Авто валидация не требуется
+        if self.chk_auto.isChecked():
+            return True, ""
+        
         value = self.get_value()
         
-        if value < 0:
-            return False, "Комиссия не может быть отрицательной"
+        try:
+            val = float(value)
+            if val < 0:
+                return False, "Комиссия не может быть отрицательной"
+        except (ValueError, TypeError):
+            return False, "Некорректное значение комиссии"
         
         return True, ""
 

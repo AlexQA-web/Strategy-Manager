@@ -1,0 +1,63 @@
+{
+  "moex": {
+    "taker_pct": {
+      "currency_futures": 0.001,
+      "equity_futures": 0.003,
+      "index_futures": 0.001,
+      "commodity_futures": 0.005,
+      "stock": 0.003,
+      "bond": 0.003,
+      "etf": 0.003
+    },
+    "maker_pct": {
+      "currency_futures": 0.0,
+      "equity_futures": 0.0,
+      "index_futures": 0.0,
+      "commodity_futures": 0.0,
+      "stock": 0.0,
+      "bond": 0.0,
+      "etf": 0.0
+    }
+  },
+  "broker_transaq": {
+    "futures_rub": {
+      "currency_futures": 1.00,
+      "equity_futures": 0.45,
+      "index_futures": 0.87,
+      "commodity_futures": 2.10
+    },
+    "stock_pct": 0.04,
+    "bond_pct": 0.015,
+    "etf_pct": 0.04
+  },
+  "broker_quik": {
+    "futures_rub": {
+      "currency_futures": 1.00,
+      "equity_futures": 0.45,
+      "index_futures": 0.87,
+      "commodity_futures": 2.10
+    },
+    "stock_pct": 0.04,
+    "bond_pct": 0.015,
+    "etf_pct": 0.04
+  },
+  "default_order_role": "taker",
+  "manual_mapping": {
+    "Si": "currency_futures",
+    "BR": "commodity_futures",
+    "SBER": "stock"
+  },
+  "prefix_rules": {
+    "Si": "currency_futures",
+    "CR": "currency_futures",
+    "RI": "index_futures",
+    "MX": "index_futures",
+    "MM": "index_futures",
+    "BR": "commodity_futures",
+    "NG": "commodity_futures",
+    "GD": "commodity_futures",
+    "GLD": "commodity_futures",
+    "SIL": "commodity_futures"
+  },
+  "last_moex_update": "2026-03-22"
+}

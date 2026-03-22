@@ -8,6 +8,7 @@ import pandas as pd
 from loguru import logger
 
 from core.txt_loader import Bar, TXTLoader
+from core.commission_manager import commission_manager
 
 
 @dataclass
@@ -68,7 +69,11 @@ class BacktestEngine:
 
         raw_params = module.get_params() if hasattr(module, "get_params") else {}
         params = {k: v["default"] for k, v in raw_params.items()}
-        commission = float(params.get("commission", 0.0))
+        
+        # Поддержка режима "auto" для комиссии
+        commission_param = params.get("commission", 0.0)
+        commission_mode = "auto" if commission_param == "auto" else "manual"
+        commission_value = 0.0 if commission_mode == "auto" else float(commission_param)
 
         bars = self._loader.load(filepath)
         if len(bars) < 2:
@@ -126,7 +131,7 @@ class BacktestEngine:
                 if action == "close" and open_trade is not None:
                     trade = self._close_trade(
                         open_trade, exec_price, exec_dt,
-                        signal.get("comment", ""), commission,
+                        signal.get("comment", ""), commission_mode, commission_value, bars[0].ticker, bars[0].board
                     )
                     trades.append(trade)
                     cumulative_pnl += trade.net_pnl
@@ -158,7 +163,7 @@ class BacktestEngine:
             last  = bars[-1]
             trade = self._close_trade(
                 open_trade, last.close, last.dt,
-                "Force close (end of data)", commission,
+                "Force close (end of data)", commission_mode, commission_value, bars[0].ticker, bars[0].board
             )
             trades.append(trade)
             cumulative_pnl += trade.net_pnl
@@ -193,13 +198,39 @@ class BacktestEngine:
         return df
 
     @staticmethod
-    def _close_trade(trade, exit_price, exit_dt, comment, commission) -> Trade:
+    def _close_trade(trade, exit_price, exit_dt, comment, commission_mode, commission_value, ticker, board="TQBR") -> Trade:
         trade.exit_price   = exit_price
         trade.exit_dt      = exit_dt
         trade.exit_comment = comment
         trade.gross_pnl    = trade.direction * (exit_price - trade.entry_price) * trade.qty
-        trade.commission   = commission * trade.qty * 2
-        trade.net_pnl      = trade.gross_pnl - trade.commission
+        
+        # Расчёт комиссии
+        if commission_mode == "auto":
+            try:
+                # Автоматический расчёт через commission_manager
+                # Для бэктеста используем среднюю цену входа и выхода
+                avg_price = (trade.entry_price + exit_price) / 2
+                # В бэктесте предполагаем taker (рыночные ордера)
+                # Используем коннектор по умолчанию для бэктеста
+                connector_id = "transaq"
+                commission_per_trade = commission_manager.calculate(
+                    ticker=ticker,
+                    board=board,
+                    quantity=trade.qty,
+                    price=avg_price,
+                    order_role="taker",
+                    connector_id=connector_id
+                )
+                # Комиссия за вход и выход
+                trade.commission = commission_per_trade * 2
+            except Exception as e:
+                logger.warning(f"Ошибка автоматического расчёта комиссии в бэктесте: {e}. Используется 0.")
+                trade.commission = 0.0
+        else:
+            # Ручной режим (обратная совместимость)
+            trade.commission = commission_value * trade.qty * 2
+        
+        trade.net_pnl = trade.gross_pnl - trade.commission
         return trade
 
     @staticmethod

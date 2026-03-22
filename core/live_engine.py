@@ -12,6 +12,7 @@ from loguru import logger
 
 from core.equity_tracker import flush_all as equity_flush_all
 from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK
+from core.commission_manager import commission_manager
 
 # Маппинг timeframe → строка для get_history
 TIMEFRAME_TO_PERIOD = {
@@ -64,9 +65,18 @@ class LiveEngine:
         self._agent_name = agent_name or strategy_id
         self._order_mode = order_mode  # "market" | "limit"
         self._lot_sizing = lot_sizing or {}  # {dynamic, lot, instances, drawdown}
-        # Комиссия: либо % от суммы (акции), либо фиксированная в рублях за контракт (фьючерсы)
-        self._commission_pct: float = float(params.get("commission_pct", 0.0))
-        self._commission_rub: float = float(params.get("commission_rub", 0.0))
+        
+        # Комиссия: поддержка режима "auto" или ручных значений
+        commission_param = params.get("commission", "auto")
+        if commission_param == "auto":
+            self._commission_mode = "auto"
+            self._commission_pct = 0.0
+            self._commission_rub = 0.0
+        else:
+            self._commission_mode = "manual"
+            # Для обратной совместимости: если есть старые параметры commission_pct/commission_rub
+            self._commission_pct = float(params.get("commission_pct", commission_param if isinstance(commission_param, (int, float)) else 0.0))
+            self._commission_rub = float(params.get("commission_rub", commission_param if isinstance(commission_param, (int, float)) else 0.0))
 
         self._period_str = TIMEFRAME_TO_PERIOD.get(timeframe, "5m")
         self._poll_interval = TIMEFRAME_TO_POLL_SEC.get(timeframe, 30)
@@ -139,28 +149,63 @@ class LiveEngine:
         Returns:
             Комиссия в рублях (всегда положительная)
         """
+        abs_qty = abs(qty)
+        
+        # Режим автоматического расчёта комиссии
+        if self._commission_mode == "auto":
+            try:
+                # Определяем роль ордера (по умолчанию taker для market, maker для limit)
+                order_role = "maker" if self._order_mode == "limit" else "taker"
+                
+                # Рассчитываем комиссию через commission_manager
+                commission = commission_manager.calculate(
+                    ticker=ticker,
+                    board=self._board,
+                    quantity=abs_qty,
+                    price=price,
+                    order_role=order_role,
+                    connector_id=self._connector_id
+                )
+                
+                logger.debug(
+                    f"[LiveEngine:{self._strategy_id}] Комиссия (авто): "
+                    f"{commission:.2f} руб для {ticker} ({abs_qty} лот, {order_role})"
+                )
+                return commission
+            except Exception as e:
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] Ошибка автоматического расчёта комиссии: {e}. "
+                    f"Используется fallback."
+                )
+                # Fallback на старую логику
+                if sec_type is None:
+                    sec_type = 'futures' if self._is_futures(ticker) else 'stock'
+                commission_per_lot = COMMISSION_FUTURES if sec_type == 'futures' else 0
+                commission_pct = COMMISSION_STOCK if sec_type == 'stock' else 0
+                if sec_type == 'futures':
+                    return commission_per_lot * abs_qty
+                else:
+                    return price * abs_qty * (commission_pct / 100.0)
+        
+        # Ручной режим (обратная совместимость)
         if sec_type is None:
             sec_type = 'futures' if self._is_futures(ticker) else 'stock'
         
-        abs_qty = abs(qty)
-        
         if sec_type == 'futures':
             # Для фьючерсов: фиксированная комиссия за каждый контракт
-            # Используем значение из параметров стратегии, если задано, иначе глобальную константу
             commission_per_lot = self._commission_rub if self._commission_rub > 0 else COMMISSION_FUTURES
             commission = commission_per_lot * abs_qty
             logger.debug(
-                f"[LiveEngine:{self._strategy_id}] Комиссия (фьючерс): "
+                f"[LiveEngine:{self._strategy_id}] Комиссия (фьючерс, ручная): "
                 f"{commission:.2f} руб ({commission_per_lot} руб/лот * {abs_qty} лот)"
             )
         else:
             # Для акций: процент от суммы сделки
-            # Используем значение из параметров стратегии, если задано, иначе глобальную константу
             commission_pct = self._commission_pct if self._commission_pct > 0 else COMMISSION_STOCK
             trade_value = price * abs_qty
             commission = trade_value * (commission_pct / 100.0)
             logger.debug(
-                f"[LiveEngine:{self._strategy_id}] Комиссия (акция): "
+                f"[LiveEngine:{self._strategy_id}] Комиссия (акция, ручная): "
                 f"{commission:.2f} руб ({commission_pct}% от {trade_value:.2f} руб)"
             )
         

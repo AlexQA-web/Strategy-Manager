@@ -11,6 +11,7 @@ from core.storage import get_setting, set_setting as save_setting, get_all_sched
 from config.settings import APP_PROFILE_DIR
 from core.telegram_bot import notifier
 from core.scheduler import DAYS_RU
+from ui.commission_settings_widget import CommissionSettingsWidget
 
 STYLE = """
 QDialog {
@@ -137,6 +138,7 @@ class _SettingsMixin:
         self.tabs.addTab(self._tab_telegram(),      "✈  Telegram")
         self.tabs.addTab(self._tab_notifications(), "🔔  Уведомления")
         self.tabs.addTab(self._tab_general(),       "⚙  Общие")
+        self.tabs.addTab(self._tab_commissions(),   "💰  Комиссии")
         layout.addWidget(self.tabs, stretch=1)
 
         # Подключаем сигналы изменений всех виджетов для подсветки кнопки Сохранить
@@ -694,6 +696,10 @@ class _SettingsMixin:
         layout.addWidget(rc_group)
         layout.addStretch()
         return tab
+
+    def _tab_commissions(self) -> QWidget:
+        """Вкладка настроек комиссий."""
+        return CommissionSettingsWidget()
 
     # ─────────────────────────────────────────────
     # Сохранение — всё в одном месте
