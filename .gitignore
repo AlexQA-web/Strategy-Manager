@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Build / dist
+build/
+dist/
+*.spec
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs
+logs/
+
+# Data — чувствительные и генерируемые файлы
+data/settings.json
+data/settings.json.bak
+data/strategies.json.bak
+data/schedules.json.bak
+data/order_history.json.bak
+data/equity/
+data/chart_cache/
+
+# DLL брокера (не распространяется)
+txmlconnector.dll
+txmlconnector64.dll
+
+# Временные и рабочие файлы
+all_code.txt
+connector.txt
+build.bat
+raw_strategies/
+scripts/
+*.txt
+trading_manager.spec
+
+# Бэкапы
+*.bak
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini

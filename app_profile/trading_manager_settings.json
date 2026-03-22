@@ -1,0 +1,76 @@
+{
+  "settings": {
+    "telegram_token": "8540684031:AAEF3E4PaLgS1gbj8wt0tIRfgpvsmiCrkuE",
+    "telegram_chat_id": "231009417",
+    "telegram_level": "all",
+    "finam_login": "FZTC27075A",
+    "finam_password": "Tyhgbn8800",
+    "finam_host": "tr1.finam.ru",
+    "finam_port": "3900",
+    "notify_connect": "false",
+    "notify_order": "false",
+    "notify_position": "false",
+    "notify_pnl": "false",
+    "notify_schedule": "false",
+    "notify_error": "true",
+    "notify_reconnect": "true",
+    "autoconnect": "true",
+    "minimize_to_tray": "false",
+    "autostart_strategies": "true",
+    "reconnect_attempts": "5",
+    "reconnect_delay": "5",
+    "connector_connect_time": "06:50",
+    "connector_disconnect_time": "23:45",
+    "connector_days": "0,1,2,3,4",
+    "quik_host": "localhost",
+    "quik_port": "34130",
+    "notify_POSITION_OPENED": "true",
+    "notify_POSITION_CLOSED": "true",
+    "notify_MISSED_ENTRY": "true",
+    "notify_MISSED_EXIT": "true",
+    "notify_STOP_LOSS_HIT": "true",
+    "notify_TAKE_PROFIT_HIT": "true",
+    "notify_ORDER_REJECTED": "true",
+    "notify_ORDER_TIMEOUT": "true",
+    "notify_ORDER_PARTIAL_FILL": "true",
+    "notify_CONNECTOR_CONNECTED": "true",
+    "notify_CONNECTOR_DISCONNECTED": "true",
+    "notify_CONNECTOR_ERROR": "true",
+    "notify_CONNECTOR_RECONNECTING": "true",
+    "notify_STRATEGY_STARTED": "false",
+    "notify_STRATEGY_STOPPED": "false",
+    "notify_STRATEGY_ERROR": "true",
+    "notify_STRATEGY_CRASHED": "true",
+    "notify_SCHEDULE_CONNECT": "false",
+    "notify_SCHEDULE_DISCONNECT": "false",
+    "notify_APP_STARTED": "false",
+    "notify_APP_STOPPED": "false",
+    "account_aliases": {
+      "802690RIIT6": "Тестовый"
+    },
+    "known_accounts": {
+      "finam": [
+        "802690RIIT6"
+      ]
+    }
+  },
+  "schedules": {
+    "finam": {
+      "connect_time": "06:50",
+      "disconnect_time": "00:01",
+      "days": [
+        3,
+        4
+      ],
+      "is_active": true
+    },
+    "quik": {
+      "connect_time": "06:55",
+      "disconnect_time": "00:01",
+      "days": [
+        3
+      ],
+      "is_active": true
+    }
+  }
+}

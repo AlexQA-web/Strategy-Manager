@@ -1,0 +1,24 @@
+{
+  "finam": {
+    "connect_time": "06:50",
+    "disconnect_time": "00:01",
+    "days": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "is_active": true
+  },
+  "quik": {
+    "connect_time": "06:55",
+    "disconnect_time": "00:01",
+    "days": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "is_active": true
+  }
+}
