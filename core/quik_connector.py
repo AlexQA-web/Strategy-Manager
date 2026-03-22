@@ -118,10 +118,10 @@ class QuikConnector(BaseConnector):
         if not self._connected or self._client is None:
             return False
         try:
-            # Легкий запрос - получить серверное время
+            # Используем is_connected() — легкий запрос без параметров
             with self._lock:
-                self._client.get_server_time()
-            return True
+                result = self._client.is_connected()
+            return result.get("data") == 1
         except Exception:
             return False
 

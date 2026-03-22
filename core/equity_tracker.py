@@ -96,10 +96,11 @@ def record_equity(strategy_id: str, equity: float, position_qty: int = 1, force_
 
         dd = peak - equity
         # Нормализуем dd к 1 лоту/контракту
-        qty = max(abs(position_qty), 1)
-        dd_per_lot = dd / qty
-        if dd_per_lot > state.get("max_drawdown", 0.0):
-            state["max_drawdown"] = round(dd_per_lot, 2)
+        if position_qty != 0:
+            qty = abs(position_qty)
+            dd_per_lot = dd / qty
+            if dd_per_lot > state.get("max_drawdown", 0.0):
+                state["max_drawdown"] = round(dd_per_lot, 2)
 
         entry["dirty"] = True
 

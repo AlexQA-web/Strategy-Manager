@@ -29,7 +29,7 @@ def autoconnect_connectors():
     for cid, sched in schedules.items():
         if not isinstance(sched, dict) or not sched.get("is_active", True):
             continue
-        if today not in sched.get("days", [0, 1, 2, 3, 4]):
+        if today not in sched.get("days", [0, 1, 2, 3, 4, 5, 6]):
             logger.info(f"Автозапуск [{cid}]: не торговый день — пропуск")
             continue
 
@@ -122,7 +122,10 @@ def autostart_strategies():
         dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
         connect_t = dtime(ch, cm)
         disconnect_t = dtime(dh, dm)
-        return connect_t <= now_t <= disconnect_t
+        if connect_t <= disconnect_t:
+            return connect_t <= now_t <= disconnect_t
+        else:
+            return now_t >= connect_t or now_t <= disconnect_t
 
     def _wait_for_connector(connector, timeout=120):
         """Ждёт подключения коннектора с таймаутом."""

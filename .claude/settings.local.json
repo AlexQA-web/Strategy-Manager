@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l core/*.py ui/*.py strategies/*.py config/*.py main.py)",
+      "Bash(python -m py_compile core/order_history.py)",
+      "Bash(python -m py_compile core/autostart.py)",
+      "Bash(python -m py_compile core/backtest_engine.py)",
+      "Bash(python -m py_compile core/equity_tracker.py)",
+      "Bash(python -m py_compile core/storage.py)",
+      "Bash(python -m py_compile core/live_engine.py)",
+      "Bash(python -m py_compile core/position_manager.py)",
+      "Bash(python -m py_compile strategies/achilles.py)",
+      "Bash(python -m py_compile core/moex_api.py)",
+      "Bash(python -m py_compile core/finam_connector.py)",
+      "mcp__ide__getDiagnostics",
+      "Bash(python -m py_compile ui/commission_settings_widget.py)",
+      "Bash(python -m py_compile ui/commission_preview_dialog.py)",
+      "WebFetch(domain:iss.moex.com)",
+      "Bash(python -m py_compile core/commission_manager.py)"
+    ]
+  }
+}

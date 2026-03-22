@@ -1325,13 +1325,12 @@ class ChartWindow(QWidget):
             if close_ord:
                 close_dt = _parse_trade_time(close_ord)
                 close_px = close_ord["price"]
-                commission = float(self.params.get("commission", 0))
-                qty_pair   = min(open_ord["quantity"], close_ord["quantity"])
-                comm_total = commission * qty_pair * 2
-                pnl_net    = (pnl - comm_total) if pnl is not None else None
+                # pair["pnl"] уже net (gross_pnl − комиссия), рассчитано в order_history
+                pnl_net  = pnl
                 # Цвет линии/маркера — по сырому PnL (прибыльная/убыточная по цене),
                 # метка показывает net PnL уже с учётом комиссии
-                lc = CANDLE_UP if (pnl is not None and pnl >= 0) else CANDLE_DOWN
+                gross = pair.get("gross_pnl")
+                lc = CANDLE_UP if (gross is not None and gross >= 0) else CANDLE_DOWN
 
                 ci = _find_bar_idx(close_dt)
                 if ci is not None:

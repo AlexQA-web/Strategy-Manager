@@ -136,88 +136,91 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
         data = _load()
         orders = data.get(strategy_id, [])
         orders = sorted(orders, key=lambda o: o["timestamp"])
-    pairs = []
-    # FIFO очередь незакрытых ордеров (индекс 0 - самый старый)
-    open_queue: list[dict] = []
 
-    for order in orders:
-        side = order["side"]
-        qty  = order["quantity"]
-        remaining_qty = qty
+        pairs = []
+        # FIFO очередь незакрытых ордеров (индекс 0 - самый старый)
+        open_queue: list[dict] = []
 
-        while remaining_qty > 0 and open_queue:
-            open_order = open_queue[0]  # Берём самый старый ордер (FIFO)
-            open_qty = open_order["quantity"]
+        for order in orders:
+            side = order["side"]
+            qty  = order["quantity"]
+            remaining_qty = qty
 
-            if side == open_order["side"]:
-                # Та же сторона — пирамидинг/усреднение
-                break  # Выходим, новый ордер становится в очередь
+            while remaining_qty > 0 and open_queue:
+                open_order = open_queue[0]  # Берём самый старый ордер (FIFO)
+                open_qty = open_order["quantity"]
 
-            # Противоположная сторона — закрытие позиции
-            close_qty = min(open_qty, remaining_qty)
-            is_long = open_order["side"] == "buy"
-            open_price = open_order["price"]
-            close_price = order["price"]
-            
-            # Учитываем point_cost для фьючерсов
-            point_cost = open_order.get("point_cost", 1.0)
+                if side == open_order["side"]:
+                    # Та же сторона — пирамидинг/усреднение
+                    break  # Выходим, новый ордер становится в очередь
 
-            if is_long:
-                gross_pnl = (close_price - open_price) * close_qty * point_cost
-            else:
-                gross_pnl = (open_price - close_price) * close_qty * point_cost
+                # Противоположная сторона — закрытие позиции
+                close_qty = min(open_qty, remaining_qty)
+                is_long = open_order["side"] == "buy"
+                open_price = open_order["price"]
+                close_price = order["price"]
 
-            # Комиссия: берём максимум из open/close ордера
-            commission_per_lot = max(
-                float(open_order.get("commission", 0.0)),
-                float(order.get("commission", 0.0)),
-            )
-            total_commission = commission_per_lot * close_qty * 2  # вход + выход
-            net_pnl = gross_pnl - total_commission
+                # Учитываем point_cost для фьючерсов
+                point_cost = open_order.get("point_cost", 1.0)
 
+                if is_long:
+                    gross_pnl = (close_price - open_price) * close_qty * point_cost
+                else:
+                    gross_pnl = (open_price - close_price) * close_qty * point_cost
+
+                # Комиссия: берём максимум из open/close ордера
+                commission_per_lot = max(
+                    float(open_order.get("commission", 0.0)),
+                    float(order.get("commission", 0.0)),
+                )
+                total_commission = commission_per_lot * close_qty * 2  # вход + выход
+                net_pnl = gross_pnl - total_commission
+
+                pairs.append({
+                    "open": open_order,
+                    "close": order,
+                    "gross_pnl": round(gross_pnl, 4),
+                    "commission": round(total_commission, 4),
+                    "pnl": round(net_pnl, 4),
+                    "is_long": is_long,
+                })
+
+                # Обновляем остатки
+                remaining_qty -= close_qty
+                if close_qty >= open_qty:
+                    # Открывающий ордер полностью закрыт
+                    open_queue.pop(0)
+                else:
+                    # Частичное закрытие — обновляем количество
+                    open_queue[0] = {
+                        **open_order,
+                        "quantity": open_qty - close_qty,
+                    }
+
+            # Если остаток не закрыт — добавляем в очередь
+            if remaining_qty > 0:
+                if remaining_qty < qty:
+                    # Частично закрыт другими ордерами — создаём новую запись с остатком
+                    open_queue.append({
+                        **order,
+                        "quantity": remaining_qty,
+                    })
+                else:
+                    # Не был закрыт вообще — добавляем как есть
+                    open_queue.append(order)
+
+        # Незакрытые позиции
+        for open_order in open_queue:
             pairs.append({
                 "open": open_order,
-                "close": order,
-                "gross_pnl": round(gross_pnl, 4),
-                "commission": round(total_commission, 4),
-                "pnl": round(net_pnl, 4),
-                "is_long": is_long,
+                "close": None,
+                "pnl": None,
+                "is_long": open_order["side"] == "buy",
             })
 
-            # Обновляем остатки
-            remaining_qty -= close_qty
-            if close_qty >= open_qty:
-                # Открывающий ордер полностью закрыт
-                open_queue.pop(0)
-            else:
-                # Частичное закрытие — обновляем количество
-                open_queue[0] = {
-                    **open_order,
-                    "quantity": open_qty - close_qty,
-                }
+        return pairs
 
-        # Если остаток не закрыт — добавляем в очередь
-        if remaining_qty > 0:
-            if remaining_qty < qty:
-                # Частично закрыт другими ордерами — создаём новую запись с остатком
-                open_queue.append({
-                    **order,
-                    "quantity": remaining_qty,
-                })
-            else:
-                # Не был закрыт вообще — добавляем как есть
-                open_queue.append(order)
 
-    # Незакрытые позиции
-    for open_order in open_queue:
-        pairs.append({
-            "open": open_order,
-            "close": None,
-            "pnl": None,
-            "is_long": open_order["side"] == "buy",
-        })
-
-    return pairs  # Возвращаем результат внутри lock-а для защиты от race condition
 def get_total_pnl(strategy_id: str) -> Optional[float]:
     """Нарастающий итог П/У по всем закрытым сделкам стратегии."""
     pairs = get_order_pairs(strategy_id)

@@ -508,38 +508,101 @@ class FinamConnector(BaseConnector):
             self._sec_info[seccode] = info
 
     def get_sec_info(self, ticker: str, board: str = "TQBR") -> Optional[dict]:
-        """Возвращает кэшированную информацию по инструменту.
-        Если нет в кэше — запрашивает через get_securities_info и ждёт callback."""
+        """Возвращает информацию по инструменту с MOEX-валидацией.
+
+        Приоритет: MOEX API > TRANSAQ DLL для point_cost, minstep, lotsize.
+        TRANSAQ DLL часто возвращает некорректные данные (особенно point_cost и lotsize),
+        поэтому MOEX данные используются как основной источник.
+        """
+        # 1. Получаем данные из TRANSAQ (существующая логика)
         with self._sec_info_lock:
             cached = self._sec_info.get(ticker)
             if cached:
-                return dict(cached)
+                result = dict(cached)
+            else:
+                result = None
 
-        if not self._connected:
+        if result is None:
+            if not self._connected:
+                return None
+
+            # Запрашиваем у DLL
+            market = self._BOARD_TO_MARKET.get(board, "1")
+            cmd = (
+                f'<command id="get_securities_info">'
+                f'<security><market>{market}</market><seccode>{ticker}</seccode></security>'
+                f'</command>'
+            )
+            self._sec_info_event.clear()
+            response = self._send_command(cmd)
+            err = self._parse_error(response)
+            if err:
+                logger.warning(f"[Finam] get_sec_info error: {err}")
+                return None
+
+            # Ждём callback sec_info
+            if not self._sec_info_event.wait(timeout=5):
+                logger.warning(f"[Finam] get_sec_info: таймаут {ticker}")
+                return None
+
+            with self._sec_info_lock:
+                cached = self._sec_info.get(ticker)
+                result = dict(cached) if cached else None
+
+        if result is None:
             return None
 
-        # Запрашиваем у DLL
-        market = self._BOARD_TO_MARKET.get(board, "1")
-        cmd = (
-            f'<command id="get_securities_info">'
-            f'<security><market>{market}</market><seccode>{ticker}</seccode></security>'
-            f'</command>'
-        )
-        self._sec_info_event.clear()
-        response = self._send_command(cmd)
-        err = self._parse_error(response)
-        if err:
-            logger.warning(f"[Finam] get_sec_info error: {err}")
-            return None
+        # 2. MOEX-валидация — предпочитаем MOEX для point_cost, minstep, lotsize
+        try:
+            # Определяем тип инструмента по board
+            _FUT_BOARDS = {"FUT", "SPBFUT", "OPT"}
+            sec_type = "futures" if board in _FUT_BOARDS else "stock"
+            moex_info = self.moex_client.get_instrument_info(ticker, sec_type)
 
-        # Ждём callback sec_info
-        if not self._sec_info_event.wait(timeout=5):
-            logger.warning(f"[Finam] get_sec_info: таймаут {ticker}")
-            return None
+            if moex_info:
+                # Для фьючерсов: валидируем и перезаписываем point_cost, minstep, lotsize
+                # Для акций: валидируем и перезаписываем только minstep и lotsize
+                # (у акций point_cost из MOEX = minstep, что не то же самое
+                #  что point_cost из TRANSAQ = 1.0 — "1 рубль стоит 1 рубль")
+                if sec_type == "futures":
+                    _FIELD_MAP = [
+                        ("point_cost", "point_cost"),
+                        ("minstep", "minstep"),
+                        ("lotsize", "lot_size"),
+                    ]
+                else:
+                    _FIELD_MAP = [
+                        ("minstep", "minstep"),
+                        ("lotsize", "lot_size"),
+                    ]
 
-        with self._sec_info_lock:
-            cached = self._sec_info.get(ticker)
-            return dict(cached) if cached else None
+                for transaq_field, moex_field in _FIELD_MAP:
+                    transaq_val = result.get(transaq_field)
+                    moex_val = moex_info.get(moex_field)
+                    if transaq_val and moex_val:
+                        try:
+                            t_val = float(transaq_val)
+                            m_val = float(moex_val)
+                            if t_val > 0 and abs(t_val - m_val) / max(t_val, 0.001) > 0.05:
+                                logger.warning(
+                                    f"[Finam] РАСХОЖДЕНИЕ {ticker}.{transaq_field}: "
+                                    f"TRANSAQ={t_val}, MOEX={m_val} — используем MOEX"
+                                )
+                        except (ValueError, TypeError):
+                            pass
+
+                # Перезаписываем значениями от MOEX (если есть)
+                if sec_type == "futures" and moex_info.get("point_cost"):
+                    result["point_cost"] = moex_info["point_cost"]
+                if moex_info.get("minstep"):
+                    result["minstep"] = moex_info["minstep"]
+                if moex_info.get("lot_size"):
+                    result["lotsize"] = moex_info["lot_size"]
+
+        except Exception as e:
+            logger.debug(f"[Finam] MOEX-валидация {ticker} недоступна: {e}, используем TRANSAQ")
+
+        return result
 
     def get_moex_info(self, ticker: str, sec_type: str = 'futures') -> Optional[dict]:
         """

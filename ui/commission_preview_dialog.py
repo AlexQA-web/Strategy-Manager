@@ -12,6 +12,34 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
 
+
+class _NoScrollSpinBox(QSpinBox):
+    """QSpinBox, который не реагирует на скролл без фокуса."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+
+class _NoScrollDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox, который не реагирует на скролл без фокуса."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
 from core.commission_manager import commission_manager
 from core.instrument_classifier import instrument_classifier
 
@@ -78,14 +106,14 @@ class CommissionPreviewDialog(QDialog):
         params_layout.addRow("Роль ордера:", self.role_input)
         
         # Количество
-        self.quantity_input = QSpinBox()
+        self.quantity_input = _NoScrollSpinBox()
         self.quantity_input.setRange(1, 1000000)
         self.quantity_input.setValue(1)
         self.quantity_input.setSuffix(" шт.")
         params_layout.addRow("Количество:", self.quantity_input)
         
         # Цена
-        self.price_input = QDoubleSpinBox()
+        self.price_input = _NoScrollDoubleSpinBox()
         self.price_input.setRange(0.01, 1000000.0)
         self.price_input.setValue(100.0)
         self.price_input.setDecimals(2)
@@ -93,7 +121,7 @@ class CommissionPreviewDialog(QDialog):
         params_layout.addRow("Цена:", self.price_input)
         
         # Стоимость пункта (для фьючерсов)
-        self.point_cost_input = QDoubleSpinBox()
+        self.point_cost_input = _NoScrollDoubleSpinBox()
         self.point_cost_input.setRange(0.01, 10000.0)
         self.point_cost_input.setValue(1.0)
         self.point_cost_input.setDecimals(2)

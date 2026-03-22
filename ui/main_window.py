@@ -470,6 +470,7 @@ class MainWindow(QMainWindow):
         
         # Кэш для sec_info (чтобы не блокировать GUI при запросах к QUIK)
         self._sec_info_cache: dict = {}  # {(connector_id, ticker, board): (sec_info, timestamp)}
+        self._refreshing_sec_info: set = set()  # множество ключей, которые уже загружаются
         self._SEC_INFO_TTL = 60  # обновлять раз в 60 секунд
 
         self._setup_core()
@@ -858,10 +859,19 @@ class MainWindow(QMainWindow):
         return None
 
     def _refresh_sec_info_background(self, connector, connector_id: str, ticker: str, board: str):
-        """Обновляет sec_info в фоновом потоке."""
+        """Обновляет sec_info в фоновом потоке.
+        
+        Использует _refreshing_sec_info для предотвращения дублирующих потоков.
+        """
         import threading
         import time
         key = (connector_id, ticker, board)
+        
+        # Проверяем, не запущен ли уже поток для этого ключа
+        if key in self._refreshing_sec_info:
+            return  # уже в процессе
+        
+        self._refreshing_sec_info.add(key)
         
         def _fetch():
             try:
@@ -870,6 +880,8 @@ class MainWindow(QMainWindow):
                     self._sec_info_cache[key] = (sec_info, time.monotonic())
             except Exception:
                 pass
+            finally:
+                self._refreshing_sec_info.discard(key)
         
         threading.Thread(target=_fetch, daemon=True).start()
 

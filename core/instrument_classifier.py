@@ -102,10 +102,15 @@ class InstrumentClassifier:
         board_upper = board.upper()
         
         # Уровень 1: Ручной маппинг (высший приоритет)
+        # НО: если борд явно фьючерсный (FUT) — игнорируем маппинг на stock/bond/etf
         if ticker_upper in self.manual_mapping:
             result = self.manual_mapping[ticker_upper]
-            logger.debug(f"[InstrumentClassifier] {ticker} -> {result} (manual)")
-            return result
+            # Если борд фьючерсный и результат — тип акции/облигации, проваливаемся дальше
+            if "FUT" in board_upper and result in self.STOCK_TYPES:
+                pass  # игнорируем manual_mapping, используем prefix_rules
+            else:
+                logger.debug(f"[InstrumentClassifier] {ticker} -> {result} (manual)")
+                return result
         
         # Уровень 2: Правила по префиксу
         for prefix, instrument_type in self.prefix_rules.items():

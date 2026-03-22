@@ -66,14 +66,18 @@ def main():
     autoconnect_connectors()
     autostart_strategies()
 
-    exit_code = app.exec()
-
-    # Сброс equity на диск перед выходом
     try:
-        from core.equity_tracker import flush_all
-        flush_all()
-    except Exception:
-        pass
+         exit_code = app.exec()
+    except Exception as e:
+         logger.exception(f"Ошибка во время выполнения приложения: {e}")
+         exit_code = 1
+    finally:
+         # Сброс equity на диск перед выходом
+         try:
+             from core.equity_tracker import flush_all
+             flush_all()
+         except Exception:
+             pass
 
     logger.info(f"{APP_NAME} — завершение работы")
     sys.exit(exit_code)

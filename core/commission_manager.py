@@ -110,9 +110,6 @@ class CommissionManager:
                 "bond_pct": 0.015,
                 "etf_pct": 0.04
             },
-            "default_order_role": "taker",
-            "manual_mapping": {},
-            "prefix_rules": {},
             "last_moex_update": datetime.now().strftime("%Y-%m-%d")
         }
     
@@ -332,19 +329,6 @@ class CommissionManager:
         """Получает ставку MOEX для типа инструмента и роли ордера."""
         role_key = "maker_pct" if order_role == "maker" else "taker_pct"
         return self.config.get("moex", {}).get(role_key, {}).get(instrument_type, 0.0)
-    
-    def _get_broker_stock_rate(self, instrument_type: str) -> float:
-        """Получает процентную ставку брокера для акций/облигаций/ETF."""
-        broker_config = self.config.get("broker_transaq", {})
-        
-        if instrument_type == "stock":
-            return broker_config.get("stock_pct", 0.04)
-        elif instrument_type == "bond":
-            return broker_config.get("bond_pct", 0.015)
-        elif instrument_type == "etf":
-            return broker_config.get("etf_pct", 0.04)
-        else:
-            return 0.04  # Дефолт
     
     def load_config(self):
         """Перезагружает конфигурацию из файла."""

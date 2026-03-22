@@ -6,6 +6,7 @@
 """
 
 import logging
+import time as _time
 import requests
 from typing import Optional, Dict, Any
 from threading import Lock
@@ -25,9 +26,13 @@ class MOEXClient:
     Использует кэширование для минимизации запросов к API.
     """
     
-    # Кэш для хранения данных инструментов
-    _cache: Dict[str, Dict[str, Any]] = {}
+    # Кэш для хранения данных инструментов: key → (data, monotonic_timestamp)
+    _cache: Dict[str, tuple[Dict[str, Any], float]] = {}
     _cache_lock = Lock()
+
+    # TTL для разных типов инструментов (секунды)
+    _CACHE_TTL_FUTURES = 4 * 3600   # 4 часа (STEPPRICE меняется при клиринге)
+    _CACHE_TTL_STOCKS = 24 * 3600   # 24 часа (minstep/lotsize стабильны)
     
     # Таймаут для HTTP запросов (секунды)
     REQUEST_TIMEOUT = 10
@@ -57,8 +62,12 @@ class MOEXClient:
         cache_key = f"futures:{ticker.upper()}"
         with cls._cache_lock:
             if cache_key in cls._cache:
-                logger.debug(f"[MOEX] Returning cached data for {ticker}")
-                return cls._cache[cache_key]
+                data, cached_at = cls._cache[cache_key]
+                if _time.monotonic() - cached_at < cls._CACHE_TTL_FUTURES:
+                    logger.debug(f"[MOEX] Returning cached data for {ticker}")
+                    return data
+                else:
+                    del cls._cache[cache_key]  # TTL истёк
         
         try:
             # Формируем URL для запроса
@@ -105,14 +114,14 @@ class MOEXClient:
                         'sec_type': 'futures'
                     }
                     
-                    # Сохраняем в кэш
+                    # Сохраняем в кэш с timestamp
                     with cls._cache_lock:
-                        cls._cache[cache_key] = result
-                    
+                        cls._cache[cache_key] = (result, _time.monotonic())
+
                     logger.info(f"[MOEX] Futures {ticker}: MINSTEP={minstep}, STEPPRICE={stepprice}, "
                                f"point_cost={point_cost}, lot_size={lot_size}")
                     return result
-            
+
             logger.warning(f"[MOEX] Ticker {ticker} not found in futures data")
             return None
             
@@ -154,63 +163,82 @@ class MOEXClient:
         cache_key = f"stock:{ticker.upper()}"
         with cls._cache_lock:
             if cache_key in cls._cache:
-                logger.debug(f"[MOEX] Returning cached data for {ticker}")
-                return cls._cache[cache_key]
+                data, cached_at = cls._cache[cache_key]
+                if _time.monotonic() - cached_at < cls._CACHE_TTL_STOCKS:
+                    logger.debug(f"[MOEX] Returning cached data for {ticker}")
+                    return data
+                else:
+                    del cls._cache[cache_key]  # TTL истёк
         
         try:
-            # Формируем URL для запроса
+            # Формируем URL для запроса — добавляем BOARDID для фильтрации
             url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}.json"
             params = {
                 'iss.meta': 'off',
                 'iss.only': 'securities',
-                'securities.columns': 'SECID,MINSTEP,LOTSIZE'
+                'securities.columns': 'SECID,BOARDID,MINSTEP,LOTSIZE'
             }
-            
+
             # Выполняем запрос
             headers = {'User-Agent': cls.USER_AGENT}
             response = requests.get(url, params=params, headers=headers, timeout=cls.REQUEST_TIMEOUT)
             response.raise_for_status()
-            
+
             # Парсим JSON
             data = response.json()
             securities = data.get('securities', {}).get('data', [])
-            
+
             if not securities:
                 logger.warning(f"[MOEX] No data found for stock {ticker}")
                 return None
-            
-            # Ищем нужный тикер в данных
+
+            # Ищем нужный тикер — предпочитаем основные борды (TQBR, TQTF, TQOB)
+            # MOEX может вернуть несколько строк для разных борд (TQBR, SPEQ и т.д.)
+            _PREFERRED_BOARDS = ("TQBR", "TQTF", "TQOB", "TQIF")
+            best_row = None
+            fallback_row = None
+
             for row in securities:
-                if len(row) >= 3 and row[0].upper() == ticker.upper():
-                    minstep = row[1]    # MINSTEP
-                    lotsize = row[2]    # LOTSIZE
-                    
-                    # Проверяем наличие необходимых данных
-                    if minstep is None:
-                        logger.warning(f"[MOEX] Incomplete data for stock {ticker}: MINSTEP={minstep}")
-                        return None
-                    
-                    # Для акций point_cost = minstep (стоимость минимального шага)
-                    minstep_float = float(minstep)
-                    lot_size = int(lotsize) if lotsize else 1
-                    
-                    result = {
-                        'minstep': minstep_float,
-                        'point_cost': minstep_float,
-                        'lot_size': lot_size,
-                        'sec_type': 'stock'
-                    }
-                    
-                    # Сохраняем в кэш
-                    with cls._cache_lock:
-                        cls._cache[cache_key] = result
-                    
-                    logger.info(f"[MOEX] Stock {ticker}: MINSTEP={minstep}, "
-                               f"point_cost={minstep_float}, lot_size={lot_size}")
-                    return result
-            
-            logger.warning(f"[MOEX] Ticker {ticker} not found in stock data")
-            return None
+                if len(row) >= 4 and row[0].upper() == ticker.upper():
+                    board_id = row[1]  # BOARDID
+                    if board_id in _PREFERRED_BOARDS:
+                        best_row = row
+                        break  # нашли основную борду — берём сразу
+                    elif fallback_row is None:
+                        fallback_row = row
+
+            chosen_row = best_row or fallback_row
+            if chosen_row is None:
+                logger.warning(f"[MOEX] Ticker {ticker} not found in stock data")
+                return None
+
+            board_id = chosen_row[1]
+            minstep = chosen_row[2]    # MINSTEP
+            lotsize = chosen_row[3]    # LOTSIZE
+
+            # Проверяем наличие необходимых данных
+            if minstep is None:
+                logger.warning(f"[MOEX] Incomplete data for stock {ticker}: MINSTEP={minstep}")
+                return None
+
+            # Для акций point_cost = minstep (стоимость минимального шага)
+            minstep_float = float(minstep)
+            lot_size = int(lotsize) if lotsize else 1
+
+            result = {
+                'minstep': minstep_float,
+                'point_cost': minstep_float,
+                'lot_size': lot_size,
+                'sec_type': 'stock'
+            }
+
+            # Сохраняем в кэш с timestamp
+            with cls._cache_lock:
+                cls._cache[cache_key] = (result, _time.monotonic())
+
+            logger.info(f"[MOEX] Stock {ticker} (board={board_id}): MINSTEP={minstep}, "
+                       f"point_cost={minstep_float}, lot_size={lot_size}")
+            return result
             
         except requests.exceptions.HTTPError as e:
             logger.warning(f"[MOEX] HTTP error for stock {ticker}: {e.response.status_code} {e.response.reason}")
@@ -266,3 +294,10 @@ class MOEXClient:
                 if cache_key and cache_key in cls._cache:
                     del cls._cache[cache_key]
                     logger.info(f"[MOEX] Cache cleared for {cache_key}")
+                else:
+                    # Очищаем все ключи по тикеру если sec_type не указан
+                    to_remove = [k for k in cls._cache if f":{ticker.upper()}" in k]
+                    for k in to_remove:
+                        del cls._cache[k]
+                    if to_remove:
+                        logger.info(f"[MOEX] Cache cleared for {ticker}: {to_remove}")

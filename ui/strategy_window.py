@@ -418,6 +418,24 @@ class StrategyWindow(QDialog):
         trade_form.addRow("Счёт:", self.cmb_account)
 
         layout.addWidget(trade_group)
+
+        # ── Инструменты (если стратегия использует корзину) ──────────────────────
+        if self._has_instruments:
+            instruments_group = QGroupBox("Инструменты")
+            instruments_layout = QHBoxLayout(instruments_group)
+            # Get the effective instruments
+            default_instruments = []
+            if self.loaded:
+                schema = self.loaded.params_schema
+                if "instruments" in schema:
+                    default_instruments = schema["instruments"].get("default", [])
+            instruments = self.data.get("params", {}).get("instruments", default_instruments)
+            # Use the _InstrumentsWidget to display
+            connector_id = self.data.get("connector_id", self.data.get("connector", "finam"))
+            instruments_widget = _InstrumentsWidget(connector_id, instruments, self)
+            instruments_layout.addWidget(instruments_widget)
+            layout.addWidget(instruments_group)
+
         layout.addStretch()
 
         btn_save = QPushButton("💾  Сохранить")
@@ -540,8 +558,7 @@ class StrategyWindow(QDialog):
                 widget = ParamWidgetFactory.create(key, meta_with_board, current, connector_id)
                 
                 self._param_widgets[key] = widget
-                # Сохраняем ссылку на виджет и для board
-                self._param_widgets["board"] = widget
+                # НЕ добавляем в _param_widgets["board"] — это семантически неверно
                 form.addRow(f"{label}:", widget)
                 
                 # Подключаем сигнал смены борды к CommissionParamWidget.
@@ -1029,6 +1046,14 @@ class StrategyWindow(QDialog):
                     params[key] = widget.text()
 
         self.data["params"] = params
+
+        # Синхронизируем верхнеуровневые ticker/board с params,
+        # чтобы главная таблица, LiveEngine и графики видели актуальные значения
+        if "ticker" in params:
+            self.data["ticker"] = params["ticker"]
+        if "board" in params:
+            self.data["board"] = params["board"]
+
         save_strategy(self.sid, self.data)
         logger.info(f"{self.sid}: параметры сохранены")
         self.strategy_updated.emit(self.sid)

@@ -61,10 +61,23 @@ class LiveEngine:
         self._connector = connector
         
         # Определяем ID коннектора по объекту
-        self._connector_id = next(
+        # Сначала ищем в зарегистрированных коннекторах
+        found_id = next(
             (cid for cid, c in connector_manager.all().items() if c is connector),
-            "finam"  # значение по умолчанию
+            None
         )
+        if found_id is None:
+            # Fallback: определяем по типу объекта
+            from core.finam_connector import FinamConnector
+            from core.quik_connector import QuikConnector
+            if isinstance(connector, QuikConnector):
+                self._connector_id = "quik"
+            elif isinstance(connector, FinamConnector):
+                self._connector_id = "finam"
+            else:
+                self._connector_id = "finam"  # значение по умолчанию
+        else:
+            self._connector_id = found_id
         
         self._account_id = account_id
         self._ticker = ticker
@@ -107,7 +120,6 @@ class LiveEngine:
 
         # Флаг for chase/limit-ордеров — не блокирует poll_loop
         self._order_in_flight: bool = False
-        self._order_in_flight_lock = threading.Lock()
 
         # Circuit breaker для ошибок коннектора
         self._consecutive_failures: int = 0   # счётчик подряд идущих ошибок
@@ -172,6 +184,7 @@ class LiveEngine:
                     quantity=abs_qty,
                     price=price,
                     order_role=order_role,
+                    point_cost=self._point_cost,
                     connector_id=self._connector_id
                 )
                 
@@ -690,6 +703,8 @@ class LiveEngine:
             # Если стратегия реализует execute_signal — делегируем ей (мультиинструментальные)
             if hasattr(self._module, "execute_signal"):
                 try:
+                    self._params["_strategy_id"] = self._strategy_id      # для записи сделок в стратегии
+                    self._params["_connector_id"] = self._connector_id     # для расчёта комиссии
                     self._module.execute_signal(
                         signal, self._connector, self._params, self._account_id
                     )
@@ -1397,10 +1412,6 @@ class LiveEngine:
 
                 self._on_chase_done(chase, side, qty, comment, is_close)
 
-                # Сбрасываем флаг только после обновления позиции.
-                # Теперь используем единую блокировку _position_lock для избежания deadlock
-                self._order_in_flight = False
-
         t = threading.Thread(
             target=_run,
             daemon=True,
@@ -1424,6 +1435,9 @@ class LiveEngine:
                 f"вид=limit(стакан) — ничего не исполнено за 60 сек | {comment}"
             )
             self._record_failure()
+            # Сбрасываем флаг чтобы не блокировать будущие ордера
+            with self._position_lock:
+                self._order_in_flight = False
             return
 
         with self._position_lock:
@@ -1444,6 +1458,9 @@ class LiveEngine:
                 self._position = 1 if side == "buy" else -1
                 self._position_qty = filled if side == "buy" else -filled
                 self._entry_price = avg_px
+
+            # Сбрасываем флаг под той же блокировкой, под которой он устанавливался
+            self._order_in_flight = False
 
         self._record_trade(side, filled, avg_px, comment, order_type="chase")
         self._record_success()

@@ -12,6 +12,20 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+
+class _NoScrollSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox, который не реагирует на скролл пока не получит фокус кликом."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
 from core.commission_manager import commission_manager
 from core.instrument_classifier import instrument_classifier
 from core.moex_commission_fetcher import moex_commission_fetcher
@@ -23,11 +37,10 @@ logger = logging.getLogger(__name__)
 class CommissionSettingsWidget(QWidget):
     """
     Виджет для настройки ставок комиссий.
-    
+
     Позволяет редактировать:
     - Ставки MOEX (тейкер) для всех типов инструментов
     - Ставки брокера (фьючерсы в рублях, акции в процентах)
-    - Роль ордера по умолчанию
     - Правила классификации инструментов
     """
     
@@ -65,10 +78,6 @@ class CommissionSettingsWidget(QWidget):
         # Секция: Ставки брокера КВИК
         broker_quik_group = self._create_broker_quik_section()
         layout.addWidget(broker_quik_group)
-        
-        # Секция: Роль ордера по умолчанию
-        role_group = self._create_role_section()
-        layout.addWidget(role_group)
         
         # Секция: Классификация инструментов
         classifier_group = self._create_classifier_section()
@@ -117,10 +126,10 @@ class CommissionSettingsWidget(QWidget):
         }
         
         for inst_type, label in types_labels.items():
-            spinbox = QDoubleSpinBox()
+            spinbox = _NoScrollSpinBox()
             spinbox.setRange(0.0, 1.0)
-            spinbox.setDecimals(4)
-            spinbox.setSingleStep(0.0001)
+            spinbox.setDecimals(5)
+            spinbox.setSingleStep(0.00001)
             spinbox.setSuffix(" %")
             self.moex_spinboxes[inst_type] = spinbox
             form.addRow(label, spinbox)
@@ -163,7 +172,7 @@ class CommissionSettingsWidget(QWidget):
         }
         
         for inst_type, label in futures_labels.items():
-            spinbox = QDoubleSpinBox()
+            spinbox = _NoScrollSpinBox()
             spinbox.setRange(0.0, 100.0)
             spinbox.setDecimals(2)
             spinbox.setSingleStep(0.01)
@@ -191,7 +200,7 @@ class CommissionSettingsWidget(QWidget):
         }
         
         for key, label in stock_labels.items():
-            spinbox = QDoubleSpinBox()
+            spinbox = _NoScrollSpinBox()
             spinbox.setRange(0.0, 1.0)
             spinbox.setDecimals(4)
             spinbox.setSingleStep(0.0001)
@@ -228,7 +237,7 @@ class CommissionSettingsWidget(QWidget):
         }
         
         for inst_type, label in futures_labels.items():
-            spinbox = QDoubleSpinBox()
+            spinbox = _NoScrollSpinBox()
             spinbox.setRange(0.0, 100.0)
             spinbox.setDecimals(2)
             spinbox.setSingleStep(0.01)
@@ -256,7 +265,7 @@ class CommissionSettingsWidget(QWidget):
         }
         
         for key, label in stock_labels.items():
-            spinbox = QDoubleSpinBox()
+            spinbox = _NoScrollSpinBox()
             spinbox.setRange(0.0, 1.0)
             spinbox.setDecimals(4)
             spinbox.setSingleStep(0.0001)
@@ -269,24 +278,6 @@ class CommissionSettingsWidget(QWidget):
         stock_form.addRow("", note)
         
         layout.addWidget(stock_group)
-        
-        return group
-    
-    def _create_role_section(self) -> QGroupBox:
-        """Создаёт секцию выбора роли ордера по умолчанию."""
-        group = QGroupBox("Роль ордера по умолчанию")
-        form = QFormLayout(group)
-        form.setSpacing(12)
-        
-        self.role_combo = QComboBox()
-        self.role_combo.addItem("Тейкер (рыночные и лимитные в стакан)", "taker")
-        self.role_combo.addItem("Мейкер (лимитные в очередь)", "maker")
-        form.addRow("Роль:", self.role_combo)
-        
-        note = QLabel("Влияет на расчёт во всём приложении. Мейкер MOEX = 0%, итого = только брокерская часть")
-        note.setStyleSheet("color: gray; font-size: 11px;")
-        note.setWordWrap(True)
-        form.addRow("", note)
         
         return group
     
@@ -401,12 +392,6 @@ class CommissionSettingsWidget(QWidget):
         for key, spinbox in self.broker_quik_stock_spinboxes.items():
             spinbox.setValue(broker_quik_config.get(key, 0.0))
         
-        # Загружаем роль ордера
-        default_role = config.get("default_order_role", "taker")
-        index = self.role_combo.findData(default_role)
-        if index >= 0:
-            self.role_combo.setCurrentIndex(index)
-        
         # Загружаем правила по префиксам
         prefix_rules = instrument_classifier.prefix_rules
         self.prefix_table.setRowCount(len(prefix_rules))
@@ -474,9 +459,6 @@ class CommissionSettingsWidget(QWidget):
             # Сохраняем ставки брокера КВИК для акций
             for key, spinbox in self.broker_quik_stock_spinboxes.items():
                 config["broker_quik"][key] = spinbox.value()
-            
-            # Сохраняем роль ордера
-            config["default_order_role"] = self.role_combo.currentData()
             
             # Сохраняем правила по префиксам
             prefix_rules = {}

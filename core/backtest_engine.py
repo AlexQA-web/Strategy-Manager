@@ -24,6 +24,7 @@ class Trade:
     gross_pnl: float = 0.0
     commission: float = 0.0
     net_pnl: float = 0.0
+    point_cost: float = 1.0  # для расчёта комиссии фьючерсов
 
     @property
     def is_closed(self) -> bool:
@@ -79,6 +80,8 @@ class BacktestEngine:
         commission_param = params.get("commission", 0.0)
         commission_mode = "auto" if commission_param == "auto" else "manual"
         commission_value = 0.0 if commission_mode == "auto" else float(commission_param)
+        # Получаем order_mode для определения роли ордера (maker/taker)
+        order_mode = params.get("order_mode", "market")
 
         bars = self._loader.load(filepath)
         if len(bars) < 2:
@@ -136,7 +139,8 @@ class BacktestEngine:
                 if action == "close" and open_trade is not None:
                     trade = self._close_trade(
                         open_trade, exec_price, exec_dt,
-                        signal.get("comment", ""), commission_mode, commission_value, bars[0].ticker, bars[0].board
+                        signal.get("comment", ""), commission_mode, commission_value,
+                        bars[0].ticker, bars[0].board, order_mode
                     )
                     trades.append(trade)
                     cumulative_pnl += trade.net_pnl
@@ -145,19 +149,25 @@ class BacktestEngine:
                     logger.debug(f" CLOSE {exec_dt} @ {exec_price:.4f} | net: {trade.net_pnl:+.2f}")
 
                 elif action == "buy" and position == 0:
+                    # Получаем point_cost из модуля стратегии, если доступно
+                    point_cost = getattr(module, "point_cost", 1.0) or 1.0
                     open_trade = Trade(
                         direction=+1, qty=signal.get("qty", 1),
                         entry_dt=exec_dt, entry_price=exec_price,
                         entry_comment=signal.get("comment", ""),
+                        point_cost=point_cost,
                     )
                     position = +1
                     logger.debug(f" BUY  {exec_dt} @ {exec_price:.4f}")
 
                 elif action == "sell" and position == 0:
+                    # Получаем point_cost из модуля стратегии, если доступно
+                    point_cost = getattr(module, "point_cost", 1.0) or 1.0
                     open_trade = Trade(
                         direction=-1, qty=signal.get("qty", 1),
                         entry_dt=exec_dt, entry_price=exec_price,
                         entry_comment=signal.get("comment", ""),
+                        point_cost=point_cost,
                     )
                     position = -1
                     logger.debug(f" SELL {exec_dt} @ {exec_price:.4f}")
@@ -168,7 +178,8 @@ class BacktestEngine:
             last  = bars[-1]
             trade = self._close_trade(
                 open_trade, last.close, last.dt,
-                "Force close (end of data)", commission_mode, commission_value, bars[0].ticker, bars[0].board
+                "Force close (end of data)", commission_mode, commission_value,
+                bars[0].ticker, bars[0].board, order_mode
             )
             trades.append(trade)
             cumulative_pnl += trade.net_pnl
@@ -202,11 +213,11 @@ class BacktestEngine:
         logger.debug("Pre-calc: стратегия не реализует on_precalc, пропуск")
         return df
 
-    def _close_trade(self, trade, exit_price, exit_dt, comment, commission_mode, commission_value, ticker, board="TQBR") -> Trade:
+    def _close_trade(self, trade, exit_price, exit_dt, comment, commission_mode, commission_value, ticker, board="TQBR", order_mode="market") -> Trade:
         trade.exit_price   = exit_price
         trade.exit_dt      = exit_dt
         trade.exit_comment = comment
-        trade.gross_pnl    = trade.direction * (exit_price - trade.entry_price) * trade.qty
+        trade.gross_pnl    = trade.direction * (exit_price - trade.entry_price) * trade.qty * (trade.point_cost or 1.0)
         
         # Расчёт комиссии
         if commission_mode == "auto":
@@ -214,7 +225,8 @@ class BacktestEngine:
                 # Автоматический расчёт через commission_manager
                 # Для бэктеста используем среднюю цену входа и выхода
                 avg_price = (trade.entry_price + exit_price) / 2
-                # В бэктесте предполагаем taker (рыночные ордера)
+                # Определяем роль ордера на основе order_mode (как в live_engine)
+                order_role = "maker" if order_mode == "limit" else "taker"
                 # Используем переданный connector_id
                 connector_id = getattr(self, "_connector_id", "finam")
                 # Получаем point_cost для фьючерсов (необходим для корректного расчёта)
@@ -225,7 +237,7 @@ class BacktestEngine:
                     board=board,
                     quantity=trade.qty,
                     price=avg_price,
-                    order_role="taker",
+                    order_role=order_role,
                     point_cost=point_cost,
                     connector_id=connector_id
                 )

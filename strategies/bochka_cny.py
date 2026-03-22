@@ -84,12 +84,12 @@ def get_params() -> dict:
             "description": "Количество контрактов",
         },
         "commission": {
-            "type":        "float",
+            "type":        "commission",
             "default":     0.002,
             "min":         0.0,
             "max":         100.0,
             "label":       "Комиссия",
-            "description": "Руб. на контракт за сделку (только для бэктеста)",
+            "description": "Комиссия брокера (автоматически переключается между % и ₽ в зависимости от типа инструмента)",
         },
         "order_mode": {
             "type":        "select",

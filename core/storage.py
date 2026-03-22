@@ -60,28 +60,39 @@ def _read(filepath: Path, use_cache: bool = True) -> Any:
         return {}
 
 
+def _write_unsafe(filepath: Path, data: Any):
+    """Запись без захвата lock — вызывать только внутри with _write_lock.
+    
+    Выполняет атомарную запись через .tmp с бэкапом предыдущей версии.
+    """
+    try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        # Бэкап текущего файла перед перезаписью
+        if filepath.exists() and filepath.stat().st_size > 0:
+            bak = filepath.with_suffix(filepath.suffix + ".bak")
+            try:
+                shutil.copy2(filepath, bak)
+            except OSError as e:
+                logger.warning(f"Не удалось создать бэкап {filepath.name}: {e}")
+        tmp = filepath.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        tmp.replace(filepath)
+    except OSError as e:
+        logger.error(f"Ошибка записи {filepath.name}: {e}")
+        raise
+    # Инвалидируем кэш
+    with _cache_lock:
+        _cache.pop(str(filepath), None)
+
+
 def _write(filepath: Path, data: Any):
-    """Атомарная запись через .tmp с бэкапом предыдущей версии."""
+    """Атомарная запись через .tmp с бэкапом предыдущей версии.
+    
+    Захватывает _write_lock перед записью.
+    """
     with _write_lock:
-        try:
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            # Бэкап текущего файла перед перезаписью
-            if filepath.exists() and filepath.stat().st_size > 0:
-                bak = filepath.with_suffix(filepath.suffix + ".bak")
-                try:
-                    shutil.copy2(filepath, bak)
-                except OSError as e:
-                    logger.warning(f"Не удалось создать бэкап {filepath.name}: {e}")
-            tmp = filepath.with_suffix(".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            tmp.replace(filepath)
-        except OSError as e:
-            logger.error(f"Ошибка записи {filepath.name}: {e}")
-            raise
-        # Инвалидируем кэш внутри write_lock
-        with _cache_lock:
-            _cache.pop(str(filepath), None)
+        _write_unsafe(filepath, data)
 
 
 # ── Настройки приложения ──────────────────────────────────────────────────────
@@ -98,10 +109,11 @@ def get_setting(key: str, default=None) -> Any:
     return get_settings().get(key, default)
 
 def save_setting(key: str, value: Any):
-    """Сохранить одну настройку."""
-    settings = get_settings()
-    settings[key] = value
-    save_settings(settings)
+    """Сохранить одну настройку. Потокобезопасно (read-modify-write внутри lock)."""
+    with _write_lock:
+        settings = _read(SETTINGS_FILE, use_cache=False)
+        settings[key] = value
+        _write_unsafe(SETTINGS_FILE, settings)
 
 def get_bool_setting(key: str, default: bool = False) -> bool:
     """Безопасное чтение булевой настройки."""
@@ -112,10 +124,7 @@ def get_bool_setting(key: str, default: bool = False) -> bool:
         return val
     return str(val).lower() == "true"
 
-def set_setting(key: str, value: Any):
-    settings = get_settings()
-    settings[key] = value
-    save_settings(settings)
+set_setting = save_setting  # alias для обратной совместимости
 
 # ── Стратегии ────────────────────────────────────────────────────────────────
 
@@ -173,7 +182,10 @@ def get_all_schedules() -> dict:
 TRADES_FILE = DATA_DIR / "trades_history.json"
 
 def append_trade(trade: dict):
-    """Атомарное добавление сделки через read-modify-write внутри lock."""
+    """Атомарное добавление сделки через read-modify-write внутри lock.
+    
+    Использует _write_unsafe для избежания deadlock (lock уже захвачен).
+    """
     with _write_lock:
         # Используем use_cache=False для избежания race condition:
         # читаем напрямую с диска, игнорируя кэш
@@ -183,7 +195,8 @@ def append_trade(trade: dict):
         trades.append(trade)
         if len(trades) > 10_000:
             trades = trades[-10_000:]
-        _write(TRADES_FILE, trades)
+        # Вызываем _write_unsafe (без lock) — lock уже захвачен
+        _write_unsafe(TRADES_FILE, trades)
 
 def get_trades(strategy_id: str = None, limit: int = 200) -> list:
     trades = _read(TRADES_FILE)

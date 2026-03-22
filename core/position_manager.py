@@ -17,7 +17,7 @@ class PositionManager:
         self._connector_id = "finam"
         self._positions: dict[str, list[dict]] = {}  # account_id → [position, ...]
         self._on_update_callbacks: list[Callable] = []
-        self._subscribe()
+        self._subscribed = False  # lazy subscription — коннекторы ещё не зарегистрированы при импорте
 
     # ── Привязка к коннектору ─────────────────────────────────────────────
 
@@ -28,8 +28,18 @@ class PositionManager:
         self._connector_id = connector_id
         with self._lock:
             self._positions.clear()
+        self._subscribed = False  # сброс для нового коннектора
         self._subscribe()
+        if self._connector():
+            self._subscribed = True
         logger.info(f"PositionManager: переключён на [{connector_id}]")
+
+    def _ensure_subscribed(self):
+        """Lazy subscription — вызывается при первом реальном использовании."""
+        if not self._subscribed:
+            self._subscribe()
+            if self._connector():
+                self._subscribed = True
 
     def _unsubscribe(self):
         """Отписывается от старого коннектора перед переключением."""
@@ -49,6 +59,7 @@ class PositionManager:
     # ── Обновление позиций ────────────────────────────────────────────────
 
     def _on_positions_update(self):
+        self._ensure_subscribed()
         connector = self._connector()
         if not connector:
             return
@@ -65,6 +76,7 @@ class PositionManager:
 
     def refresh(self, account_id: str):
         """Принудительный опрос позиций по счёту."""
+        self._ensure_subscribed()
         connector = self._connector()
         if not connector or not connector.is_connected():
             logger.warning("PositionManager.refresh: коннектор не подключён")
