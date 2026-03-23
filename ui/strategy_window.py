@@ -419,23 +419,6 @@ class StrategyWindow(QDialog):
 
         layout.addWidget(trade_group)
 
-        # ── Инструменты (если стратегия использует корзину) ──────────────────────
-        if self._has_instruments:
-            instruments_group = QGroupBox("Инструменты")
-            instruments_layout = QHBoxLayout(instruments_group)
-            # Get the effective instruments
-            default_instruments = []
-            if self.loaded:
-                schema = self.loaded.params_schema
-                if "instruments" in schema:
-                    default_instruments = schema["instruments"].get("default", [])
-            instruments = self.data.get("params", {}).get("instruments", default_instruments)
-            # Use the _InstrumentsWidget to display
-            connector_id = self.data.get("connector_id", self.data.get("connector", "finam"))
-            instruments_widget = _InstrumentsWidget(connector_id, instruments, self)
-            instruments_layout.addWidget(instruments_widget)
-            layout.addWidget(instruments_group)
-
         layout.addStretch()
 
         btn_save = QPushButton("💾  Сохранить")

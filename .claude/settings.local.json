@@ -34,7 +34,9 @@
       "Bash(python -m json.tool)",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/strategy_window.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/param_widgets.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(curl -s \"https://iss.moex.com/iss/engines/stock/markets/shares/securities/SBER.json?iss.meta=off&iss.only=securities&securities.columns=SECID,BOARDID,MINSTEP,LOTSIZE\")",
+      "Bash(curl -s \"https://iss.moex.com/iss/engines/stock/markets/shares/securities/LKOH.json?iss.meta=off&iss.only=securities&securities.columns=SECID,BOARDID,MINSTEP,LOTSIZE\")"
     ]
   }
 }

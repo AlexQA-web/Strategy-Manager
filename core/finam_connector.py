@@ -584,7 +584,7 @@ class FinamConnector(BaseConnector):
                             t_val = float(transaq_val)
                             m_val = float(moex_val)
                             if t_val > 0 and abs(t_val - m_val) / max(t_val, 0.001) > 0.05:
-                                logger.warning(
+                                logger.debug(
                                     f"[Finam] РАСХОЖДЕНИЕ {ticker}.{transaq_field}: "
                                     f"TRANSAQ={t_val}, MOEX={m_val} — используем MOEX"
                                 )
