@@ -14,7 +14,7 @@
       "time_open": 708,
       "time_close": 693,
       "qty": 1,
-      "commission": 2.2,
+      "commission": "auto",
       "order_mode": "market"
     },
     "connector": "finam",

@@ -523,6 +523,7 @@ class StrategyWindow(QDialog):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
+        layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
 
         schema = self.loaded.params_schema
         params = self.data.get("params", {})
@@ -591,7 +592,6 @@ class StrategyWindow(QDialog):
             self._commission_widget.set_board_type("FUT" in board.upper())
 
         layout.addWidget(group)
-        layout.addStretch()
 
         btn = QPushButton("💾  Сохранить параметры")
         btn.setObjectName("btn_save")
@@ -709,9 +709,9 @@ class StrategyWindow(QDialog):
         btn_refresh.clicked.connect(self._refresh_lot_preview)
         btn_row.addWidget(btn_refresh)
 
-        btn_save = QPushButton("💾  Сохранить")
+        btn_save = QPushButton("💾  Сохранить параметры")
         btn_save.setObjectName("btn_save")
-        btn_save.setFixedWidth(140)
+        btn_save.setFixedWidth(180)
         btn_save.clicked.connect(self._save_lot_sizing)
         btn_row.addWidget(btn_save)
 
@@ -818,11 +818,12 @@ class StrategyWindow(QDialog):
             "instances": self.spin_instances.value(),
             "drawdown": self.spin_drawdown.value(),
         }
-        
+
         self.data["lot_sizing"] = lot_data
         save_strategy(self.sid, self.data)
         logger.info(f"{self.sid}: лотность сохранена")
         self.strategy_updated.emit(self.sid)
+        QMessageBox.information(self, "Сохранено", "Параметры лотности сохранены ✓")
 
     # ─────────────────────────────────────────────
     # Вкладка: Позиции

@@ -699,7 +699,8 @@ class _SettingsMixin:
 
     def _tab_commissions(self) -> QWidget:
         """Вкладка настроек комиссий."""
-        return CommissionSettingsWidget()
+        self._commission_widget = CommissionSettingsWidget()
+        return self._commission_widget
 
     # ─────────────────────────────────────────────
     # Сохранение — всё в одном месте
@@ -870,24 +871,94 @@ class _SettingsMixin:
             widget.timeChanged.connect(self._mark_dirty)
 
     # ─────────────────────────────────────────────
-    # Экспорт настроек в файл
+    # Обновление виджетов UI из файлов на диске
     # ─────────────────────────────────────────────
+
+    def _reload_ui_from_disk(self):
+        """Перечитывает все настройки с диска и обновляет виджеты.
+
+        Вызывается после импорта настроек из файла.
+        Обновляет все вкладки без пересоздания UI.
+        """
+        from core.storage import get_setting, get_all_schedules
+
+        # --- Финам ---
+        self.finam_login.setText(get_setting("finam_login") or "")
+        self.finam_password.setText(get_setting("finam_password") or "")
+        self.finam_host.setText(get_setting("finam_host") or "tr1.finam.ru")
+        self.finam_port.setValue(int(get_setting("finam_port") or 3900))
+
+        # --- QUIK ---
+        self.quik_host.setText(get_setting("quik_host") or "localhost")
+        self.quik_port.setValue(int(get_setting("quik_port") or 34130))
+
+        # --- Расписания ---
+        all_sched = get_all_schedules()
+        for cid in ("finam", "quik"):
+            sched = all_sched.get(cid, {})
+            conn_time = getattr(self, f"_{cid}_conn_time", None)
+            disc_time = getattr(self, f"_{cid}_disc_time", None)
+            day_checks = getattr(self, f"_{cid}_day_checks", {})
+            if conn_time is not None:
+                t = sched.get("connect_time", "06:50")
+                h, m = map(int, t.split(":"))
+                conn_time.setTime(QTime(h, m))
+            if disc_time is not None:
+                t = sched.get("disconnect_time", "23:45")
+                h, m = map(int, t.split(":"))
+                disc_time.setTime(QTime(h, m))
+            active_days = set(sched.get("days", [0, 1, 2, 3, 4]))
+            for i, cb in day_checks.items():
+                cb.setChecked(i in active_days)
+
+        # --- Telegram ---
+        self.tg_token.setText(get_setting("telegram_token") or "")
+        self.tg_chat_id.setText(str(get_setting("telegram_chat_id") or ""))
+
+        # --- Уведомления ---
+        for key, cb in self._notify_checks.items():
+            default = "false"
+            cb.setChecked(str(get_setting(key) or default).lower() == "true")
+
+        # --- Счета ---
+        if hasattr(self, "_populate_accounts_groups"):
+            self._populate_accounts_groups()
+
+        # --- Общие ---
+        self.chk_autoconnect.setChecked(
+            str(get_setting("autoconnect") or "false").lower() == "true"
+        )
+        self.chk_minimize_tray.setChecked(
+            str(get_setting("minimize_to_tray") or "false").lower() == "true"
+        )
+        self.chk_start_strategies.setChecked(
+            str(get_setting("autostart_strategies") or "false").lower() == "true"
+        )
+        self.spin_reconnect.setValue(int(get_setting("reconnect_attempts") or 5))
+        self.spin_reconnect_delay.setValue(int(get_setting("reconnect_delay") or 5))
+
+        # --- Комиссии ---
+        if hasattr(self, "_commission_widget"):
+            self._commission_widget._load_settings()
+
+        # Сбрасываем dirty-флаг (данные теперь совпадают с диском)
+        self._mark_clean()
 
     def _import_settings(self):
         """Загружает настройки из выбранного пользователем JSON-файла и применяет их.
 
         Бизнес-логика:
           - Открывает QFileDialog с начальной папкой app_profile/.
-          - Ожидает формат {"settings": {...}, "schedules": {...}} — тот же, что пишет _export_settings.
+          - Ожидает формат {"settings": {...}, "schedules": {...}, "commissions": {...}}.
           - Записывает settings через save_settings, schedules через _write(SCHEDULES_FILE).
-          - После загрузки перестраивает UI (вызывает _build_ui заново через close/reopen
-            невозможно — поэтому просто закрывает диалог с подсказкой переоткрыть настройки).
-          - Применяет notifier и connector_manager без перезапуска.
+          - Если присутствует ключ commissions — обновляет commission_config.json,
+            перегружает commission_manager и instrument_classifier.
+          - Обновляет все виджеты UI динамически (без перезагрузки окна).
 
         Вызывается: кнопкой "Загрузить из файла" в панели кнопок _build_ui.
         """
         import json as _json
-        from core.storage import save_settings, SCHEDULES_FILE, _write
+        from core.storage import save_settings, get_setting, SCHEDULES_FILE, _write
 
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -929,6 +1000,22 @@ class _SettingsMixin:
             save_settings(data["settings"])
             if "schedules" in data and isinstance(data["schedules"], dict):
                 _write(SCHEDULES_FILE, data["schedules"])
+
+            # Восстанавливаем настройки комиссий
+            if "commissions" in data and isinstance(data["commissions"], dict):
+                from core.commission_manager import commission_manager
+                from core.instrument_classifier import instrument_classifier
+
+                comm_data = data["commissions"]
+                commission_manager.config = comm_data
+                commission_manager.save_config()
+
+                if "prefix_rules" in comm_data:
+                    instrument_classifier.prefix_rules = comm_data["prefix_rules"]
+                if "manual_mapping" in comm_data:
+                    instrument_classifier.manual_mapping = comm_data["manual_mapping"]
+                instrument_classifier.save_config()
+
             logger.info(f"Настройки импортированы из {path}")
         except OSError as e:
             logger.error(f"Ошибка записи настроек при импорте: {e}")
@@ -942,17 +1029,19 @@ class _SettingsMixin:
         connector_manager.configure_all()
         strategy_scheduler.setup_connector_schedule()
 
+        # Обновляем все виджеты UI
+        self._reload_ui_from_disk()
+
         QMessageBox.information(
             self, "Настройки загружены",
-            "Настройки успешно загружены из файла.\n"
-            "Закройте и откройте настройки заново, чтобы увидеть обновлённые значения."
+            "Настройки успешно загружены из файла и применены."
         )
 
     def _export_settings(self):
         """Сохраняет все настройки приложения в выбранный пользователем JSON-файл.
 
         Бизнес-логика:
-          - Собирает settings.json + schedules.json в единый словарь.
+          - Собирает settings.json + schedules.json + commission_config.json в единый словарь.
           - Открывает QFileDialog для выбора пути сохранения.
           - Записывает файл с отступами (indent=2) в UTF-8.
           - Не перезаписывает рабочие файлы data/ — только экспорт.
@@ -961,11 +1050,18 @@ class _SettingsMixin:
         """
         import json as _json
         from core.storage import get_settings, get_all_schedules
+        from core.commission_manager import commission_manager
+        from core.instrument_classifier import instrument_classifier
 
         # Собираем полный снимок настроек
+        commission_data = dict(commission_manager.config)
+        commission_data["prefix_rules"] = dict(instrument_classifier.prefix_rules)
+        commission_data["manual_mapping"] = dict(instrument_classifier.manual_mapping)
+
         export_data = {
             "settings":  get_settings(),
             "schedules": get_all_schedules(),
+            "commissions": commission_data,
         }
 
         default_path = str(APP_PROFILE_DIR / "trading_manager_settings.json")

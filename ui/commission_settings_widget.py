@@ -26,6 +26,20 @@ class _NoScrollSpinBox(QDoubleSpinBox):
             return
         super().wheelEvent(event)
 
+
+class _NoScrollComboBox(QComboBox):
+    """QComboBox, который не реагирует на скролл пока не получит фокус кликом."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event):
+        if not self.hasFocus():
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
 from core.commission_manager import commission_manager
 from core.instrument_classifier import instrument_classifier
 from core.moex_commission_fetcher import moex_commission_fetcher
@@ -297,6 +311,7 @@ class CommissionSettingsWidget(QWidget):
         self.prefix_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.prefix_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.prefix_table.setAlternatingRowColors(True)
+        self.prefix_table.setMinimumHeight(120)
         prefix_layout.addWidget(self.prefix_table)
         
         prefix_buttons = QHBoxLayout()
@@ -322,6 +337,7 @@ class CommissionSettingsWidget(QWidget):
         self.manual_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.manual_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.manual_table.setAlternatingRowColors(True)
+        self.manual_table.setMinimumHeight(120)
         manual_layout.addWidget(self.manual_table)
         
         manual_buttons = QHBoxLayout()
@@ -345,7 +361,7 @@ class CommissionSettingsWidget(QWidget):
         table.insertRow(row)
         
         # Добавляем комбобокс с типами инструментов во вторую колонку
-        combo = QComboBox()
+        combo = _NoScrollComboBox()
         combo.addItems([
             "currency_futures",
             "equity_futures",
@@ -397,20 +413,20 @@ class CommissionSettingsWidget(QWidget):
         self.prefix_table.setRowCount(len(prefix_rules))
         for i, (prefix, inst_type) in enumerate(prefix_rules.items()):
             self.prefix_table.setItem(i, 0, QTableWidgetItem(prefix))
-            combo = QComboBox()
+            combo = _NoScrollComboBox()
             combo.addItems([
                 "currency_futures", "equity_futures", "index_futures", "commodity_futures",
                 "stock", "bond", "etf"
             ])
             combo.setCurrentText(inst_type)
             self.prefix_table.setCellWidget(i, 1, combo)
-        
+
         # Загружаем ручной маппинг
         manual_mapping = instrument_classifier.manual_mapping
         self.manual_table.setRowCount(len(manual_mapping))
         for i, (ticker, inst_type) in enumerate(manual_mapping.items()):
             self.manual_table.setItem(i, 0, QTableWidgetItem(ticker))
-            combo = QComboBox()
+            combo = _NoScrollComboBox()
             combo.addItems([
                 "currency_futures", "equity_futures", "index_futures", "commodity_futures",
                 "stock", "bond", "etf"

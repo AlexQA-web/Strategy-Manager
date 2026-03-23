@@ -18,7 +18,10 @@ class QABCMeta(type(QWidget), ABCMeta):
 
 class BaseParamWidget(QWidget, metaclass=QABCMeta):
     """Базовый абстрактный класс для виджета параметра стратегии"""
-    
+
+    # Минимальная высота строки параметра (px) — обеспечивает читаемость
+    _MIN_ROW_HEIGHT = 32
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         """
         Args:
@@ -32,7 +35,8 @@ class BaseParamWidget(QWidget, metaclass=QABCMeta):
         self.key = key
         self.meta = meta
         self.connector_id = connector_id
-        
+        self.setMinimumHeight(self._MIN_ROW_HEIGHT)
+
         # Устанавливаем tooltip из описания
         description = meta.get("description", "")
         if description:
@@ -60,20 +64,24 @@ class BaseParamWidget(QWidget, metaclass=QABCMeta):
 
 class StrParamWidget(BaseParamWidget):
     """Виджет для строковых параметров (QLineEdit)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.line_edit = QLineEdit(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.line_edit = QLineEdit()
         self.line_edit.setFixedWidth(200)
-        
+        lay.addWidget(self.line_edit)
+
         # Устанавливаем текущее значение
         if current_value is not None:
             self.line_edit.setText(str(current_value))
         else:
             default = meta.get("default", "")
             self.line_edit.setText(str(default))
-        
+
         # Применяем tooltip к самому виджету ввода
         if self.toolTip():
             self.line_edit.setToolTip(self.toolTip())
@@ -109,22 +117,26 @@ class StrParamWidget(BaseParamWidget):
 
 class IntParamWidget(BaseParamWidget):
     """Виджет для целочисленных параметров (QSpinBox)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.spin_box = QSpinBox(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_box = QSpinBox()
         self.spin_box.setFixedWidth(120)
-        
+        lay.addWidget(self.spin_box)
+
         # Устанавливаем диапазон из метаданных
         min_val = meta.get("min", 0)
         max_val = meta.get("max", 1_000_000)
         self.spin_box.setRange(min_val, max_val)
-        
+
         # Устанавливаем шаг
         step = meta.get("step", 1)
         self.spin_box.setSingleStep(step)
-        
+
         # Устанавливаем текущее значение
         if current_value is not None:
             try:
@@ -135,7 +147,7 @@ class IntParamWidget(BaseParamWidget):
         else:
             default = meta.get("default", min_val)
             self.spin_box.setValue(int(default))
-        
+
         # Применяем tooltip
         if self.toolTip():
             self.spin_box.setToolTip(self.toolTip())
@@ -168,26 +180,30 @@ class IntParamWidget(BaseParamWidget):
 
 class FloatParamWidget(BaseParamWidget):
     """Виджет для параметров с плавающей точкой (QDoubleSpinBox)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.spin_box = QDoubleSpinBox(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.spin_box = QDoubleSpinBox()
         self.spin_box.setFixedWidth(120)
-        
+        lay.addWidget(self.spin_box)
+
         # Устанавливаем количество знаков после запятой
         decimals = meta.get("decimals", 2)
         self.spin_box.setDecimals(decimals)
-        
+
         # Устанавливаем диапазон из метаданных
         min_val = meta.get("min", 0.0)
         max_val = meta.get("max", 1_000_000.0)
         self.spin_box.setRange(min_val, max_val)
-        
+
         # Устанавливаем шаг
         step = meta.get("step", 0.1)
         self.spin_box.setSingleStep(step)
-        
+
         # Устанавливаем текущее значение
         if current_value is not None:
             try:
@@ -198,7 +214,7 @@ class FloatParamWidget(BaseParamWidget):
         else:
             default = meta.get("default", min_val)
             self.spin_box.setValue(float(default))
-        
+
         # Применяем tooltip
         if self.toolTip():
             self.spin_box.setToolTip(self.toolTip())
@@ -231,12 +247,16 @@ class FloatParamWidget(BaseParamWidget):
 
 class BoolParamWidget(BaseParamWidget):
     """Виджет для булевых параметров (QCheckBox)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.checkbox = QCheckBox(self)
-        
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.checkbox = QCheckBox()
+        lay.addWidget(self.checkbox)
+
         # Устанавливаем текущее значение
         if current_value is not None:
             if isinstance(current_value, bool):
@@ -247,7 +267,7 @@ class BoolParamWidget(BaseParamWidget):
         else:
             default = meta.get("default", False)
             self.checkbox.setChecked(bool(default))
-        
+
         # Применяем tooltip
         if self.toolTip():
             self.checkbox.setToolTip(self.toolTip())
@@ -267,14 +287,18 @@ class BoolParamWidget(BaseParamWidget):
 
 class TimeParamWidget(BaseParamWidget):
     """Виджет для параметров типа time (минуты от полуночи)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.time_edit = QTimeEdit(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("HH:mm")
         self.time_edit.setFixedWidth(120)
-        
+        lay.addWidget(self.time_edit)
+
         # Конвертируем минуты от полуночи в QTime
         if current_value is not None:
             try:
@@ -294,7 +318,7 @@ class TimeParamWidget(BaseParamWidget):
             hours = minutes // 60
             mins = minutes % 60
             self.time_edit.setTime(QTime(hours, mins))
-        
+
         # Применяем tooltip
         if self.toolTip():
             self.time_edit.setToolTip(self.toolTip())
@@ -331,12 +355,16 @@ class TimeParamWidget(BaseParamWidget):
 
 class SelectParamWidget(BaseParamWidget):
     """Виджет для параметров типа select/choice (выпадающий список)"""
-    
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.combo_box = QComboBox(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.combo_box = QComboBox()
         self.combo_box.setFixedWidth(200)
+        lay.addWidget(self.combo_box)
         
         # Загружаем опции из метаданных
         options = meta.get("options", [])
@@ -531,10 +559,14 @@ class TimeframeParamWidget(BaseParamWidget):
     
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        self.combo_box = QComboBox(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self.combo_box = QComboBox()
         self.combo_box.setFixedWidth(200)
-        
+        lay.addWidget(self.combo_box)
+
         # Получаем список таймфреймов из метаданных или используем стандартный
         timeframes = meta.get("options", self.TIMEFRAMES)
         
