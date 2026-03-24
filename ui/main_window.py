@@ -1334,11 +1334,19 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────
 
     def _start_agent(self, sid: str):
+        from core.autostart import start_live_engine
+
         data = get_strategy(sid)
         if data:
             data["status"] = "active"
             save_strategy(sid, data)
-            self._log(f"Агент [{data['name']}] запущен", "info")
+            if start_live_engine(sid, wait_for_connection=False):
+                self._log(f"Агент [{data['name']}] запущен", "info")
+            else:
+                self._log(
+                    f"Агент [{data['name']}] помечен active, но LiveEngine не запущен",
+                    "warning"
+                )
             ui_signals.strategies_changed.emit()
 
     def _stop_agent(self, sid: str):
@@ -1381,32 +1389,49 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки", str(e))
 
     def _start_all(self):
+        from core.autostart import start_live_engine
+
         for sid, data in get_all_strategies().items():
             data["status"] = "active"
             save_strategy(sid, data)
+            start_live_engine(sid, wait_for_connection=False)
         self._log("Все агенты запущены", "info")
         ui_signals.strategies_changed.emit()
 
     def _stop_all(self):
+        from core.autostart import stop_live_engine
+
         for sid, data in get_all_strategies().items():
+            stop_live_engine(sid)
             data["status"] = "stopped"
             save_strategy(sid, data)
         self._log("Все агенты остановлены", "info")
         ui_signals.strategies_changed.emit()
 
     def _start_selected(self):
+        from core.autostart import start_live_engine
+
         for sid in self._get_selected_ids():
             data = get_strategy(sid)
             if data:
                 data["status"] = "active"
                 save_strategy(sid, data)
-                self._log(f"Агент [{data['name']}] запущен", "info")
+                if start_live_engine(sid, wait_for_connection=False):
+                    self._log(f"Агент [{data['name']}] запущен", "info")
+                else:
+                    self._log(
+                        f"Агент [{data['name']}] помечен active, но LiveEngine не запущен",
+                        "warning"
+                    )
         ui_signals.strategies_changed.emit()
 
     def _stop_selected(self):
+        from core.autostart import stop_live_engine
+
         for sid in self._get_selected_ids():
             data = get_strategy(sid)
             if data:
+                stop_live_engine(sid)
                 data["status"] = "stopped"
                 save_strategy(sid, data)
                 self._log(f"Агент [{data['name']}] остановлен", "info")

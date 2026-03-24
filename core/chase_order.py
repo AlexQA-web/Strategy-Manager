@@ -140,15 +140,40 @@ class ChaseOrder:
         return "unknown"
 
     def _get_target_price(self) -> Optional[float]:
-        """Лучшая цена: bid для buy, offer для sell."""
+        """Лучшая цена: bid для buy, offer для sell.
+
+        Пассивная лимитка (maker): BUY по bid, SELL по offer.
+        Fallback: если bid/offer отсутствуют — используем last из котировок
+        или last_price через get_last_price (если коннектор поддерживает).
+        """
         try:
             quote = self._connector.get_best_quote(self._board, self._ticker)
-            if not quote:
-                return None
-            if self._side == "buy":
-                return quote.get("bid")
-            else:
-                return quote.get("offer")
+            if quote:
+                if self._side == "buy":
+                    price = quote.get("bid")
+                else:
+                    price = quote.get("offer")
+                if price:
+                    return price
+                # bid/offer = 0 или None — пробуем last
+                last = quote.get("last")
+                if last:
+                    logger.debug(
+                        f"[Chase] {self._ticker} bid/offer недоступны, "
+                        f"fallback last={last}"
+                    )
+                    return last
+            # Нет котировок вообще — пробуем get_last_price
+            if hasattr(self._connector, "get_last_price"):
+                price = self._connector.get_last_price(self._ticker, self._board)
+                if price:
+                    logger.debug(
+                        f"[Chase] {self._ticker} get_best_quote вернул None, "
+                        f"fallback get_last_price={price}"
+                    )
+                    return price
+            logger.warning(f"[Chase] {self._ticker} нет цены (bid/offer/last недоступны)")
+            return None
         except Exception as e:
             logger.warning(f"[Chase] get_best_quote error: {e}")
             return None

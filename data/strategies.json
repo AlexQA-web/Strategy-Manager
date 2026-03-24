@@ -66,6 +66,8 @@
       "time_close": 960,
       "time_emergency": 1110,
       "spread_offset": 2.0,
+      "long_percent": 1.0,
+      "short_percent": -3.0,
       "order_mode": "limit_book",
       "qty": 1,
       "instruments": [
@@ -107,6 +109,8 @@
       ]
     },
     "connector": "quik",
+    "ticker": "SBER",
+    "board": "TQBR",
     "timeframe": "1",
     "order_mode": "limit_price",
     "lot_sizing": {
@@ -148,7 +152,7 @@
     "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/valera_trend.py",
     "description": "Вход в направлении тренда по SMA в заданное время. Фильтр: N баров подряд полностью по одну сторону от SMA (без касания). Выход по времени или при пересечении SMA.",
     "status": "stopped",
-    "finam_account": "802690RIIT6",
+    "finam_account": "",
     "is_enabled": true,
     "params": {
       "ticker": "T",
@@ -160,7 +164,7 @@
       "qty": 1,
       "commission": "auto"
     },
-    "connector": "finam",
+    "connector": "quik",
     "timeframe": "1",
     "order_mode": "market",
     "ticker": "T",

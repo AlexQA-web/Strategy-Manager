@@ -84,6 +84,22 @@ def get_params() -> dict:
             "label":       "Отступ от стакана",
             "description": "Отступ от bid/ask при лимитных заявках (Лимитка Стакан)",
         },
+        "long_percent": {
+            "type":        "float",
+            "default":     1.0,
+            "min":         0.0,
+            "max":         100.0,
+            "label":       "Процент_Лонг",
+            "description": "Минимальный рост лидера корзины для входа в лонг, в %",
+        },
+        "short_percent": {
+            "type":        "float",
+            "default":     -1.0,
+            "min":         -100.0,
+            "max":         0.0,
+            "label":       "Процент_Шорт",
+            "description": "Максимальное падение лидера снижения для входа в шорт, в %",
+        },
         "order_mode": {
             "type":        "select",
             "default":     "limit_book",
@@ -544,12 +560,14 @@ def _do_signal(connector, params: dict, account_id: str):
             return
         ref_copy = dict(_reference_prices)
 
-    instruments   = _get_instruments(params)
-    qty           = int(params.get("qty", 1))
-    order_mode    = params.get("order_mode", "limit_book")
-    spread_offset = float(params.get("spread_offset", 2.0))
-    strategy_id   = params.get("_strategy_id", "")
-    connector_id  = params.get("_connector_id", "")
+    instruments    = _get_instruments(params)
+    qty            = int(params.get("qty", 1))
+    order_mode     = params.get("order_mode", "limit_book")
+    spread_offset  = float(params.get("spread_offset", 2.0))
+    long_percent   = float(params.get("long_percent", 1.0))
+    short_percent  = float(params.get("short_percent", -1.0))
+    strategy_id    = params.get("_strategy_id", "")
+    connector_id   = params.get("_connector_id", "")
 
     # Считаем % изменение
     changes: dict[str, float] = {}
@@ -568,41 +586,67 @@ def _do_signal(connector, params: dict, account_id: str):
 
     logger.info(f"[Achilles] Изменения: { {k: f'{v:.2f}%' for k, v in changes.items()} }")
 
-    # Топ роста — покупаем (если allow_buy)
+    # Топ роста / падения берём по всей корзине, вход — только если выполнен порог
     instr_map = {i["ticker"]: i for i in instruments}
     sorted_changes = sorted(changes.items(), key=lambda x: x[1], reverse=True)
 
-    # Ищем топ для покупки
-    for ticker, pct in sorted_changes:
-        instr = instr_map.get(ticker, {})
-        if not instr.get("allow_buy", True):
-            continue
-        board = instr.get("board", "TQBR")
-        actual_qty = _calc_qty(connector, account_id, board, ticker, "buy", params)
-        ok = _place(connector, account_id, board, ticker, "buy", actual_qty,
-                    order_mode, spread_offset,
-                    strategy_id=strategy_id, connector_id=connector_id)
-        if ok:
-            with _state_lock:
-                _positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board}
-            logger.info(f"[Achilles] BUY {ticker} (+{pct:.2f}%) qty={actual_qty}")
-        break
+    top_long = next(
+        ((ticker, pct, instr_map.get(ticker, {}))
+         for ticker, pct in sorted_changes
+         if instr_map.get(ticker, {}).get("allow_buy", True)),
+        None,
+    )
+    if top_long is not None:
+        ticker, pct, instr = top_long
+        if pct > long_percent:
+            board = instr.get("board", "TQBR")
+            actual_qty = _calc_qty(connector, account_id, board, ticker, "buy", params)
+            ok = _place(connector, account_id, board, ticker, "buy", actual_qty,
+                        order_mode, spread_offset,
+                        strategy_id=strategy_id, connector_id=connector_id)
+            if ok:
+                with _state_lock:
+                    _positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board}
+                logger.info(
+                    f"[Achilles] BUY {ticker} (+{pct:.2f}%) qty={actual_qty} "
+                    f"порог={long_percent:.2f}%"
+                )
+        else:
+            logger.info(
+                f"[Achilles] Лонг пропущен: лидер {ticker} (+{pct:.2f}%) "
+                f"не превысил порог {long_percent:.2f}%"
+            )
+    else:
+        logger.info("[Achilles] Лонг пропущен: нет инструментов с allow_buy=true")
 
-    # Ищем топ для продажи
-    for ticker, pct in reversed(sorted_changes):
-        instr = instr_map.get(ticker, {})
-        if not instr.get("allow_sell", True):
-            continue
-        board = instr.get("board", "TQBR")
-        actual_qty = _calc_qty(connector, account_id, board, ticker, "sell", params)
-        ok = _place(connector, account_id, board, ticker, "sell", actual_qty,
-                    order_mode, spread_offset,
-                    strategy_id=strategy_id, connector_id=connector_id)
-        if ok:
-            with _state_lock:
-                _positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board}
-            logger.info(f"[Achilles] SELL {ticker} ({pct:.2f}%) qty={actual_qty}")
-        break
+    top_short = next(
+        ((ticker, pct, instr_map.get(ticker, {}))
+         for ticker, pct in reversed(sorted_changes)
+         if instr_map.get(ticker, {}).get("allow_sell", True)),
+        None,
+    )
+    if top_short is not None:
+        ticker, pct, instr = top_short
+        if pct < short_percent:
+            board = instr.get("board", "TQBR")
+            actual_qty = _calc_qty(connector, account_id, board, ticker, "sell", params)
+            ok = _place(connector, account_id, board, ticker, "sell", actual_qty,
+                        order_mode, spread_offset,
+                        strategy_id=strategy_id, connector_id=connector_id)
+            if ok:
+                with _state_lock:
+                    _positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board}
+                logger.info(
+                    f"[Achilles] SELL {ticker} ({pct:.2f}%) qty={actual_qty} "
+                    f"порог={short_percent:.2f}%"
+                )
+        else:
+            logger.info(
+                f"[Achilles] Шорт пропущен: лидер {ticker} ({pct:.2f}%) "
+                f"не достиг порога {short_percent:.2f}%"
+            )
+    else:
+        logger.info("[Achilles] Шорт пропущен: нет инструментов с allow_sell=true")
 
 
 def _do_close_limit(connector, params: dict, account_id: str):

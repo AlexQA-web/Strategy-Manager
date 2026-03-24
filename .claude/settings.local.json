@@ -1,42 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(wc -l core/*.py ui/*.py strategies/*.py config/*.py main.py)",
-      "Bash(python -m py_compile core/order_history.py)",
-      "Bash(python -m py_compile core/autostart.py)",
-      "Bash(python -m py_compile core/backtest_engine.py)",
-      "Bash(python -m py_compile core/equity_tracker.py)",
-      "Bash(python -m py_compile core/storage.py)",
-      "Bash(python -m py_compile core/live_engine.py)",
-      "Bash(python -m py_compile core/position_manager.py)",
-      "Bash(python -m py_compile strategies/achilles.py)",
-      "Bash(python -m py_compile core/moex_api.py)",
-      "Bash(python -m py_compile core/finam_connector.py)",
-      "mcp__ide__getDiagnostics",
-      "Bash(python -m py_compile ui/commission_settings_widget.py)",
-      "Bash(python -m py_compile ui/commission_preview_dialog.py)",
-      "WebFetch(domain:iss.moex.com)",
-      "Bash(python -m py_compile core/commission_manager.py)",
-      "Bash(ls C:/Users/Alex_qA/PycharmProjects/trading_manager/*.spec)",
-      "Bash(cmd.exe /c build.bat)",
-      "Bash(.venv/Scripts/python.exe -m PyInstaller -y trading_manager.spec)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/base_connector.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/commission_manager.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/instrument_classifier.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/live_engine.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/storage.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/order_history.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/backtest_engine.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile core/scheduler.py)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/settings_window.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/commission_settings_widget.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(curl -s \"https://iss.moex.com/iss/engines/futures/markets/forts/securities/CRM6.json?iss.meta=off&iss.only=securities&securities.columns=SECID,MINSTEP,STEPPRICE,LOTVOLUME\")",
-      "Bash(python -m json.tool)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/strategy_window.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\(''ui/param_widgets.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")",
-      "Bash(python -c \":*)",
-      "Bash(curl -s \"https://iss.moex.com/iss/engines/stock/markets/shares/securities/SBER.json?iss.meta=off&iss.only=securities&securities.columns=SECID,BOARDID,MINSTEP,LOTSIZE\")",
-      "Bash(curl -s \"https://iss.moex.com/iss/engines/stock/markets/shares/securities/LKOH.json?iss.meta=off&iss.only=securities&securities.columns=SECID,BOARDID,MINSTEP,LOTSIZE\")"
-    ]
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Glob",
+    "Grep"
+  ]
   }
 }

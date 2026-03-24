@@ -70,19 +70,128 @@ def stop_live_engine(strategy_id: str) -> bool:
     Returns:
         True если engine был найден и остановлен, False если не найден.
     """
+    from core.storage import get_strategy
+    from core.strategy_loader import strategy_loader
+    from core.connector_manager import connector_manager
+
     with _live_engines_lock:
         engine = _live_engines.get(strategy_id)
         if engine is None:
             logger.warning(f"[autostart] LiveEngine для стратегии '{strategy_id}' не найден")
             return False
-        
-        # Останавливаем engine
-        engine.stop()
-        
-        # Удаляем из реестра
         del _live_engines[strategy_id]
-        logger.info(f"[autostart] LiveEngine стратегии '{strategy_id}' остановлен и удалён")
+
+    try:
+        engine.stop()
+    finally:
+        data = get_strategy(strategy_id) or {}
+        loaded = strategy_loader.get(strategy_id)
+        connector_id = data.get('connector_id') or data.get('connector') or 'finam'
+        connector = connector_manager.get(connector_id)
+        if loaded is not None:
+            params = {k: v['default'] for k, v in loaded.params_schema.items()}
+            params.update(data.get('params', {}))
+            loaded.call_on_stop(params, connector)
+
+    logger.info(f"[autostart] LiveEngine стратегии '{strategy_id}' остановлен и удалён")
+    return True
+
+
+
+def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> bool:
+    """Запускает стратегию и её LiveEngine по конфигу из хранилища."""
+    from core.storage import get_strategy
+    from core.strategy_loader import strategy_loader
+    from core.connector_manager import connector_manager
+    from core.live_engine import LiveEngine
+    from core.scheduler import is_in_schedule
+
+    data = get_strategy(strategy_id)
+    if not data:
+        logger.warning(f"[autostart] Стратегия '{strategy_id}' не найдена")
+        return False
+
+    file_path = data.get('file_path') or data.get('file', '')
+    if not file_path:
+        logger.warning(f"[autostart] [{strategy_id}] не указан путь к файлу")
+        return False
+
+    connector_id = data.get('connector_id') or data.get('connector') or 'finam'
+    connector = connector_manager.get(connector_id)
+    if connector is None:
+        logger.warning(f"[autostart] [{strategy_id}] коннектор '{connector_id}' не найден")
+        return False
+
+    loaded = strategy_loader.get(strategy_id)
+    if loaded is None:
+        loaded = strategy_loader.load(strategy_id, file_path)
+
+    params = {k: v['default'] for k, v in loaded.params_schema.items()}
+    params.update(data.get('params', {}))
+
+    with _live_engines_lock:
+        existing = _live_engines.get(strategy_id)
+    if existing is not None:
+        logger.info(f"[autostart] [{strategy_id}] LiveEngine уже запущен")
         return True
+
+    def _wait_for_connector(conn, timeout=120):
+        """Ждёт подключения коннектора с таймаутом."""
+        import time
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if conn.is_connected():
+                return True
+            time.sleep(1)
+        return False
+
+    if not loaded.call_on_start(params, connector):
+        return False
+
+    logger.info(f"Автозапуск: [{strategy_id}] запущена")
+
+    if hasattr(loaded.module, 'on_bar') and connector:
+        if not connector.is_connected():
+            if wait_for_connection:
+                if not is_in_schedule(connector_id):
+                    logger.info(
+                        f"Автозапуск [{strategy_id}]: коннектор вне расписания, LiveEngine не запущен"
+                    )
+                    return False
+                logger.info(f"Автозапуск [{strategy_id}]: ожидаем подключения коннектора...")
+                if not _wait_for_connector(connector, timeout=30):
+                    logger.warning(
+                        f"Автозапуск [{strategy_id}]: коннектор не подключился за 30с, LiveEngine не запущен"
+                    )
+                    return False
+            else:
+                logger.warning(
+                    f"[autostart] [{strategy_id}] коннектор '{connector_id}' не подключён, LiveEngine не запущен"
+                )
+                return False
+        try:
+            engine = LiveEngine(
+                strategy_id=strategy_id,
+                loaded_strategy=loaded,
+                params=params,
+                connector=connector,
+                account_id=data.get('finam_account', ''),
+                ticker=data.get('ticker', params.get('ticker', '')),
+                board=data.get('board', 'FUT'),
+                timeframe=data.get('timeframe', '5'),
+                agent_name=strategy_id,
+                order_mode=data.get('order_mode', 'market'),
+                lot_sizing=data.get('lot_sizing', {}),
+            )
+            engine.start()
+            with _live_engines_lock:
+                _live_engines[strategy_id] = engine
+            logger.info(f"Автозапуск: [{strategy_id}] LiveEngine запущен")
+        except Exception as e:
+            logger.error(f"Автозапуск [{strategy_id}]: ошибка LiveEngine — {e}")
+            return False
+
+    return True
 
 
 def autostart_strategies():
@@ -95,16 +204,6 @@ def autostart_strategies():
 
     if not get_bool_setting("autostart_strategies"):
         return
-
-    def _wait_for_connector(connector, timeout=120):
-        """Ждёт подключения коннектора с таймаутом."""
-        import time
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if connector.is_connected():
-                return True
-            time.sleep(1)
-        return False
 
     def _run():
         import time
@@ -123,50 +222,8 @@ def autostart_strategies():
                 continue
 
             try:
-                loaded = strategy_loader.load(sid, file_path)
-                params = {k: v["default"] for k, v in loaded.params_schema.items()}
-                params.update(data.get("params", {}))
-
-                connector_id = data.get("connector_id", "finam")
-                connector = connector_manager.get(connector_id)
-
-                if loaded.call_on_start(params, connector):
+                if start_live_engine(sid, wait_for_connection=True):
                     started += 1
-                    logger.info(f"Автозапуск: [{sid}] запущена")
-
-                    # Запускаем LiveEngine если стратегия поддерживает on_bar
-                    if hasattr(loaded.module, "on_bar") and connector:
-                        # Ждём подключения коннектора перед запуском LiveEngine
-                        if not connector.is_connected():
-                            # Проверяем расписание коннектора — если вне окна, не ждём
-                            if not is_in_schedule(connector_id):
-                                logger.info(f"Автозапуск [{sid}]: коннектор вне расписания, LiveEngine не запущен")
-                                continue
-                            logger.info(f"Автозапуск [{sid}]: ожидаем подключения коннектора...")
-                            if not _wait_for_connector(connector, timeout=30):
-                                logger.warning(f"Автозапуск [{sid}]: коннектор не подключился за 30с, "
-                                               f"LiveEngine не запущен")
-                                continue
-                        try:
-                            engine = LiveEngine(
-                                strategy_id=sid,
-                                loaded_strategy=loaded,
-                                params=params,
-                                connector=connector,
-                                account_id=data.get("finam_account", ""),
-                                ticker=data.get("ticker", params.get("ticker", "")),
-                                board=data.get("board", "FUT"),
-                                timeframe=data.get("timeframe", "5"),
-                                agent_name=sid,
-                                order_mode=data.get("order_mode", "market"),
-                                lot_sizing=data.get("lot_sizing", {}),
-                            )
-                            engine.start()
-                            with _live_engines_lock:
-                                _live_engines[sid] = engine
-                            logger.info(f"Автозапуск: [{sid}] LiveEngine запущен")
-                        except Exception as e:
-                            logger.error(f"Автозапуск [{sid}]: ошибка LiveEngine — {e}")
             except Exception as e:
                 logger.error(f"Автозапуск [{sid}]: ошибка — {e}")
 

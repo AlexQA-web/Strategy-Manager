@@ -657,15 +657,24 @@ class LiveEngine:
         self._process_bar()
 
     def _process_bar(self):
-        """Пересчитывает индикаторы, вызывает on_bar(), исполняет сигнал."""
+        """Пересчитывает индикаторы, вызывает on_bar(), исполняет сигнал.
+
+        Важно: bars[-1] в списке, который приходит из get_history, — это текущий
+        НЕЗАКРЫТЫЙ бар (TransAQ всегда включает его в ответ). Стратегия должна
+        получать только закрытые бары, поэтому передаём bars[:-1].
+        Именно этот подход соответствует логике TsLab: сигнал формируется на
+        последнем ЗАКРЫТОМ баре, а исполнение происходит на открытии следующего.
+        """
         with self._bars_lock:
             bars = list(self._bars)
 
-        if not bars:
+        # Отбрасываем последний незакрытый бар: on_bar должен видеть только закрытые бары
+        if len(bars) < 2:
             return
+        closed_bars = bars[:-1]
 
         try:
-            df = pd.DataFrame(bars)
+            df = pd.DataFrame(closed_bars)
             if hasattr(self._module, "on_precalc"):
                 df = self._module.on_precalc(df, self._params)
 

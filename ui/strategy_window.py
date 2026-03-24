@@ -1047,15 +1047,26 @@ class StrategyWindow(QDialog):
     # ─────────────────────────────────────────────
 
     def _start_strategy(self):
+        from core.autostart import start_live_engine
+
         self.data["status"] = "active"
         save_strategy(self.sid, self.data)
-        self.lbl_status.setText("🟢 Активен")
-        self.lbl_status.setObjectName("lbl_status_active")
-        self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
-        logger.info(f"[{self.sid}] Запущен из окна агента")
+
+        started = start_live_engine(self.sid, wait_for_connection=False)
+        if started:
+            self.lbl_status.setText("🟢 Активен")
+            self.lbl_status.setObjectName("lbl_status_active")
+            self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+            logger.info(f"[{self.sid}] Запущен из окна агента")
+        else:
+            logger.warning(f"[{self.sid}] Статус сохранён как active, но LiveEngine не запущен")
+
         self.strategy_updated.emit(self.sid)
 
     def _stop_strategy(self):
+        from core.autostart import stop_live_engine
+
+        stop_live_engine(self.sid)
         self.data["status"] = "stopped"
         save_strategy(self.sid, self.data)
         self.lbl_status.setText("🔴 Остановлен")
