@@ -92,7 +92,22 @@ def on_tick(tick_data: dict, params: dict, connector) -> None:
 # ── Бэктест / LiveEngine логика ─────────────────────────────────────────────
 
 def get_lookback(params: dict) -> int:
-    return 50
+    """Возвращает консервативный lookback для расчёта уровней предыдущей сессии.
+
+    Стратегии нужны:
+    - как минимум предыдущая завершённая сессия для `_prev_high/_prev_low`
+    - текущая сессия для проверки входов/стопов/реверса
+
+    Точного знания таймфрейма здесь нет, поэтому используем явную оценку:
+    базовое окно входов в минутах переводим в условные 5-минутные бары и
+    берём запас на две сессии.
+    """
+    time_start = int(params.get('time_start', 605))
+    time_end = int(params.get('time_end', 1080))
+
+    session_minutes = max(1, time_end - time_start)
+    estimated_bars_per_session = max(50, math.ceil(session_minutes / 5))
+    return estimated_bars_per_session * 2 + 10
 
 
 def on_precalc(df, params: dict):
@@ -133,7 +148,11 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     - Стоп лонг: Low[-1] - stop_long
     - Стоп шорт: уровень_шорта + stop_short
     - Реверс: противоположный сигнал закрывает текущую позицию
-    - Торговля Пн-Пт, 10:05 — 18:00
+    - Торговля только по будням
+    - Окно time_start/time_end ограничивает только новые входы
+
+    Перенос позиции через ночь допустим: после time_end стратегия не открывает
+    новые позиции, но уже открытую не закрывает принудительно только из-за времени.
     """
     if len(bars) < 2:
         return {"action": None}

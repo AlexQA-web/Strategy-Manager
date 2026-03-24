@@ -118,13 +118,12 @@ def on_precalc(df, params: dict):
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     """
-    Логика VALERA_TREND:
+    Логика VALERA_TREND в overnight-режиме:
     - Лонг:  time == time_open && open > sma && candle_count >= candles && !pos && не пятница/суббота/воскресенье
     - Шорт:  time == time_open && open < sma && candle_count >= candles && !pos && не пятница
-    - Выход: time == time_close
-             или candle_count < candles (фильтр сломался)
-             или entry_price > close && pos (цена ниже входа)
-             или entry_price < close && pos && close < sma (цена выше входа но ниже SMA — для шорта)
+    - Выход: в окне time_close <= time < time_open для уже открытой позиции
+
+    В стратегии не реализованы дополнительные выходы по слому фильтра или пересечению SMA.
     """
     if len(bars) < 2:
         return {"action": None}
@@ -154,11 +153,11 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
 
     filtr = candle_count >= candles_min
 
-    # Выход
+    # Выход в overnight-окне следующего дня: закрываем после time_close,
+    # но не на баре нового входа time_open.
     if position != 0:
-        # По времени
-        if time_min == time_close:
-            return {"action": "close", "qty": qty, "comment": f"Close by time {time_min}"}
+        if time_close <= time_min < time_open:
+            return {"action": "close", "qty": qty, "comment": f"Close by time window {time_min}"}
 
     # Вход — только в заданное время
     if time_min != time_open:

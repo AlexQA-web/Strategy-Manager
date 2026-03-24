@@ -181,10 +181,12 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
             _signal_done = True
             return {"action": "signal"}
 
-        if time_min >= time_close and not _close_done and _positions:
+        has_open_positions = any(pos.get("status", "open") == "open" for pos in _positions.values())
+
+        if time_min >= time_close and not _close_done and has_open_positions:
             return {"action": "close_limit"}
 
-        if time_min >= time_emergency and _positions:
+        if time_min >= time_emergency and has_open_positions:
             return {"action": "close_market"}
 
     return {"action": None}
@@ -344,7 +346,8 @@ def _record_trade(
 def _place(connector, account_id: str, board: str, ticker: str,
            side: str, qty: int, order_mode: str,
            spread_offset: float, agent_name: str = "Achilles",
-           strategy_id: str = "", connector_id: str = "") -> bool:
+           strategy_id: str = "", connector_id: str = "",
+           is_close: bool = False) -> bool:
     """
     Выставляет заявку в зависимости от order_mode:
       - "market"      — рыночная заявка
@@ -406,9 +409,8 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         f"сторона={side.upper()} qty={qty} цена=bid/offer "
                         f"вид=limit_book(стакан) — ничего не исполнено за 60 сек"
                     )
-                    # Если не исполнилось - сбрасываем статус closing
                     with _state_lock:
-                        if ticker in _positions and _positions[ticker].get("status") == "closing":
+                        if is_close and ticker in _positions and _positions[ticker].get("status") == "closing":
                             _positions[ticker]["status"] = "open"
                 else:
                     logger.info(
@@ -423,9 +425,23 @@ def _place(connector, account_id: str, board: str, ticker: str,
                             strategy_id=strategy_id, connector_id=connector_id,
                             comment=f"limit_book chase avg={chase.avg_price:.4f}",
                         )
-                    # Удаляем позицию после успешного исполнения
                     with _state_lock:
-                        _positions.pop(ticker, None)
+                        if is_close:
+                            current = _positions.get(ticker)
+                            if current is not None:
+                                remaining_qty = max(int(current.get("qty", qty)) - int(chase.filled_qty), 0)
+                                if remaining_qty > 0:
+                                    current["qty"] = remaining_qty
+                                    current["status"] = "open"
+                                else:
+                                    _positions.pop(ticker, None)
+                        else:
+                            _positions[ticker] = {
+                                "side": side,
+                                "qty": int(chase.filled_qty),
+                                "board": board,
+                                "status": "open",
+                            }
 
             t = threading.Thread(target=_run_chase, daemon=True,
                                  name=f"achilles-chase-{ticker}-{side}")
@@ -516,12 +532,22 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         comment=f"limit_price tid={tid} filled={filled}/{qty}",
                     )
                 with _state_lock:
-                    if filled >= qty:
-                        # Полное исполнение — удаляем позицию
-                        _positions.pop(ticker, None)
-                    elif ticker in _positions and _positions[ticker].get("status") == "closing":
-                        # Частичное исполнение или отказ при закрытии — сбрасываем статус
-                        _positions[ticker]["status"] = "open"
+                    if is_close:
+                        current = _positions.get(ticker)
+                        if current is not None:
+                            remaining_qty = max(int(current.get("qty", qty)) - int(filled), 0)
+                            if remaining_qty > 0:
+                                current["qty"] = remaining_qty
+                                current["status"] = "open"
+                            else:
+                                _positions.pop(ticker, None)
+                    elif filled > 0:
+                        _positions[ticker] = {
+                            "side": side,
+                            "qty": int(filled),
+                            "board": board,
+                            "status": "open",
+                        }
 
             t = threading.Thread(target=_monitor, daemon=True,
                                  name=f"achilles-lp-{ticker}-{tid}")
@@ -605,8 +631,9 @@ def _do_signal(connector, params: dict, account_id: str):
                         order_mode, spread_offset,
                         strategy_id=strategy_id, connector_id=connector_id)
             if ok:
-                with _state_lock:
-                    _positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board}
+                if order_mode == "market":
+                    with _state_lock:
+                        _positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] BUY {ticker} (+{pct:.2f}%) qty={actual_qty} "
                     f"порог={long_percent:.2f}%"
@@ -634,8 +661,9 @@ def _do_signal(connector, params: dict, account_id: str):
                         order_mode, spread_offset,
                         strategy_id=strategy_id, connector_id=connector_id)
             if ok:
-                with _state_lock:
-                    _positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board}
+                if order_mode == "market":
+                    with _state_lock:
+                        _positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] SELL {ticker} ({pct:.2f}%) qty={actual_qty} "
                     f"порог={short_percent:.2f}%"
@@ -661,21 +689,23 @@ def _do_close_limit(connector, params: dict, account_id: str):
         positions_snapshot = list(_positions.items())
 
     for ticker, pos in positions_snapshot:
-        # Пропускаем уже закрываемые позиции
-        if pos.get("status") == "closing":
+        if pos.get("status", "open") != "open":
             continue
         board      = pos.get("board", "TQBR")
         qty        = pos["qty"]
         close_side = "sell" if pos["side"] == "buy" else "buy"
         ok = _place(connector, account_id, board, ticker, close_side, qty,
                     order_mode, spread_offset,
-                    strategy_id=strategy_id, connector_id=connector_id)
+                    strategy_id=strategy_id, connector_id=connector_id,
+                    is_close=True)
         if ok:
             logger.info(f"[Achilles] CLOSE LIMIT {ticker}")
-            # Не удаляем сразу! Помечаем как closing и ждём исполнения
             with _state_lock:
                 if ticker in _positions:
-                    _positions[ticker]["status"] = "closing"
+                    if order_mode == "market":
+                        _positions.pop(ticker, None)
+                    else:
+                        _positions[ticker]["status"] = "closing"
 
 
 def _do_close_market(connector, params: dict, account_id: str):
@@ -688,6 +718,9 @@ def _do_close_market(connector, params: dict, account_id: str):
         positions_snapshot = list(_positions.items())
 
     for ticker, pos in positions_snapshot:
+        if pos.get("status", "open") != "open":
+            logger.info(f"[Achilles] CLOSE MARKET {ticker} пропущен: статус={pos.get('status')}")
+            continue
         board      = pos.get("board", "TQBR")
         qty        = pos["qty"]
         close_side = "sell" if pos["side"] == "buy" else "buy"

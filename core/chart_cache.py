@@ -1,8 +1,8 @@
 # core/chart_cache.py
 # Кеш исторических свечей на диске (pickle).
 # Используется chart_window для мгновенного открытия графика и инкрементальной догрузки.
-# Структура: data/chart_cache/{ticker}/{timeframe}.pkl
-# Ключ: ticker + timeframe (board не нужен — тикер уникален).
+# Структура: data/chart_cache/{board}/{ticker}/{timeframe}.pkl
+# Ключ: board + ticker + timeframe.
 # Pickle быстрее CSV, сохраняет типы данных (DatetimeIndex, float64, int64) без конвертации.
 
 from pathlib import Path
@@ -12,49 +12,89 @@ import pickle
 import pandas as pd
 from loguru import logger
 
-CACHE_DIR = Path(__file__).parent.parent / "data" / "chart_cache"
+from config.settings import DATA_DIR
+
+CACHE_DIR = DATA_DIR / 'chart_cache'
 
 
-def _path(ticker: str, timeframe: str) -> Path:
-    p = CACHE_DIR / ticker
+def _safe_path_part(value: str) -> str:
+    return str(value or '').replace('/', '_').replace('\\', '_').strip() or 'UNKNOWN'
+
+
+def _path(ticker: str, timeframe: str, board: str = 'TQBR') -> Path:
+    p = CACHE_DIR / _safe_path_part(board) / _safe_path_part(ticker)
     p.mkdir(parents=True, exist_ok=True)
-    return p / f"{timeframe}.pkl"
+    return p / f'{_safe_path_part(timeframe)}.pkl'
 
 
-def load(ticker: str, timeframe: str) -> Optional[pd.DataFrame]:
+def _quarantine_bad_cache(path: Path, board: str, ticker: str, timeframe: str, reason: str) -> None:
+    """Перемещает явно битый кеш в quarantine-файл вместо немедленного удаления."""
+    try:
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        quarantine_path = path.with_suffix(path.suffix + f'.corrupt_{reason}_{stamp}')
+        path.replace(quarantine_path)
+        logger.warning(
+            f'[Cache] Битый кеш {board}/{ticker}/{timeframe} перемещён в {quarantine_path.name}'
+        )
+    except Exception as e:
+        logger.warning(f'[Cache] Не удалось переместить битый кеш {board}/{ticker}/{timeframe}: {e}')
+
+
+def load(ticker: str, timeframe: str, board: str = 'TQBR') -> Optional[pd.DataFrame]:
     """Загружает кеш с диска. Возвращает None если кеша нет."""
-    path = _path(ticker, timeframe)
+    path = _path(ticker, timeframe, board)
     if not path.exists():
         return None
     try:
-        with open(path, "rb") as f:
+        with open(path, 'rb') as f:
             df = pickle.load(f)
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-        df.index = pd.to_datetime(df.index)
-        logger.debug(f"[Cache] Загружен {ticker}/{timeframe}: {len(df)} баров, "
-                     f"последний: {df.index[-1]}")
-        return df
+    except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as e:
+        logger.warning(f'[Cache] Битый кеш {board}/{ticker}/{timeframe}: {e}')
+        _quarantine_bad_cache(path, board, ticker, timeframe, 'pickle')
+        return None
     except Exception as e:
-        logger.warning(f"[Cache] Ошибка чтения {ticker}/{timeframe}: {e}")
-        path.unlink(missing_ok=True)
+        logger.warning(f'[Cache] Ошибка чтения {board}/{ticker}/{timeframe}: {e}')
         return None
 
+    if not isinstance(df, pd.DataFrame):
+        logger.warning(f'[Cache] Некорректный тип кеша {board}/{ticker}/{timeframe}: {type(df).__name__}')
+        _quarantine_bad_cache(path, board, ticker, timeframe, 'type')
+        return None
 
-def save(ticker: str, timeframe: str, df: pd.DataFrame):
+    if df.empty:
+        return None
+
+    try:
+        df.index = pd.to_datetime(df.index)
+    except Exception as e:
+        logger.warning(f'[Cache] Некорректный индекс кеша {board}/{ticker}/{timeframe}: {e}')
+        _quarantine_bad_cache(path, board, ticker, timeframe, 'index')
+        return None
+
+    logger.debug(f'[Cache] Загружен {board}/{ticker}/{timeframe}: {len(df)} баров, '
+                 f'последний: {df.index[-1]}')
+    return df
+
+
+def save(ticker: str, timeframe: str, df: pd.DataFrame, board: str = 'TQBR'):
     """Сохраняет df в кеш."""
     if df is None or df.empty:
         return
+    temp_path = None
     try:
-        path = _path(ticker, timeframe)
+        path = _path(ticker, timeframe, board)
+        temp_path = path.with_suffix(path.suffix + '.tmp')
         # Сохраняем только OHLCV + индикаторные колонки (_*)
-        cols = [c for c in df.columns if c in ("Open", "High", "Low", "Close", "Volume")
-                or c.startswith("_")]
-        with open(path, "wb") as f:
+        cols = [c for c in df.columns if c in ('Open', 'High', 'Low', 'Close', 'Volume')
+                or c.startswith('_')]
+        with open(temp_path, 'wb') as f:
             pickle.dump(df[cols], f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.debug(f"[Cache] Сохранён {ticker}/{timeframe}: {len(df)} баров")
+        temp_path.replace(path)
+        logger.debug(f"[Cache] Сохранён {board}/{ticker}/{timeframe}: {len(df)} баров")
     except Exception as e:
-        logger.warning(f"[Cache] Ошибка записи {ticker}/{timeframe}: {e}")
+        logger.warning(f"[Cache] Ошибка записи {board}/{ticker}/{timeframe}: {e}")
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
@@ -84,9 +124,9 @@ def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
     return combined
 
 
-def last_bar_time(ticker: str, timeframe: str) -> Optional[datetime]:
+def last_bar_time(ticker: str, timeframe: str, board: str = 'TQBR') -> Optional[datetime]:
     """Возвращает время последнего бара в кеше."""
-    df = load(ticker, timeframe)
+    df = load(ticker, timeframe, board)
     if df is None or df.empty:
         return None
     return df.index[-1].to_pydatetime()

@@ -163,10 +163,11 @@ def on_precalc(df, params: dict):
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     """
-    Реверсивная система:
-    - close > buy_level  → лонг (если шорт — разворот x2, если нет позиции — вход x1)
-    - close < sell_level → шорт (если лонг — разворот x2, если нет позиции — вход x1)
-    - Между уровнями — ничего не делаем
+    Канальная система без мгновенного реверса в один бар:
+    - close > buy_level  → лонг, если позиции нет
+    - close < sell_level → шорт, если позиции нет
+    - при противоположном сигнале сначала только закрываем текущую позицию
+    - новый вход возможен уже на следующем баре
     """
     if not bars:
         return {"action": None}
@@ -204,9 +205,8 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
                     "price": close + shag,
                     "comment": f"Long: cls={close:.2f} > buy={buy_level:.2f}"}
         if position == -1:
-            return {"action": "buy", "qty": qty * 2,
-                    "price": close + shag,
-                    "comment": f"Reverse→Long: cls={close:.2f} > buy={buy_level:.2f}"}
+            return {"action": "close", "qty": qty,
+                    "comment": f"Close short before long: cls={close:.2f} > buy={buy_level:.2f}"}
 
     # close ниже sell_level → нужен шорт (не в пятницу)
     elif close < sell_level and weekday != 5:
@@ -215,8 +215,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
                     "price": close - shag,
                     "comment": f"Short: cls={close:.2f} < sell={sell_level:.2f}"}
         if position == 1:
-            return {"action": "sell", "qty": qty * 2,
-                    "price": close - shag,
-                    "comment": f"Reverse→Short: cls={close:.2f} < sell={sell_level:.2f}"}
+            return {"action": "close", "qty": qty,
+                    "comment": f"Close long before short: cls={close:.2f} < sell={sell_level:.2f}"}
 
     return {"action": None}

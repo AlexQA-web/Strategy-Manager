@@ -13,7 +13,7 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("python-telegram-bot не установлен. Уведомления отключены.")
 
-from core.storage import get_setting, set_setting
+from core.storage import get_setting
 
 
 # ─────────────────────────────────────────────
@@ -29,6 +29,8 @@ class EventCode:
     TAKE_PROFIT_HIT     = "TAKE_PROFIT_HIT"     # Сработал тейк-профит
 
     # Ордера
+    ORDER_PLACED        = "ORDER_PLACED"        # Ордер выставлен
+    ORDER_FILLED        = "ORDER_FILLED"        # Ордер исполнен
     ORDER_REJECTED      = "ORDER_REJECTED"      # Ордер отклонён брокером
     ORDER_TIMEOUT       = "ORDER_TIMEOUT"       # Ордер не исполнен вовремя
     ORDER_PARTIAL_FILL  = "ORDER_PARTIAL_FILL"  # Частичное исполнение
@@ -93,6 +95,16 @@ _TEMPLATES: dict[str, str] = {
         "Агент: <code>{agent}</code>\n"
         "Тикер: <b>{ticker}</b> | Прибыль: +{profit_pct}%\n"
         "Цена входа: {entry_price} → Цена выхода: {exit_price}"
+    ),
+    EventCode.ORDER_PLACED: (
+        "📝 <b>Ордер выставлен</b>\n"
+        "Агент: <code>{agent}</code>\n"
+        "Детали: {description}"
+    ),
+    EventCode.ORDER_FILLED: (
+        "✅ <b>Ордер исполнен</b>\n"
+        "Агент: <code>{agent}</code>\n"
+        "Детали: {description}"
     ),
     EventCode.ORDER_REJECTED: (
         "❌ <b>Ордер отклонён брокером</b>\n"
@@ -356,13 +368,18 @@ class TelegramNotifier:
             logger.error(f"Telegram: неизвестная ошибка [{event_code}]: {e}")
 
     def _should_send(self, event_code: str) -> bool:
-        """Проверяет нужно ли отправлять событие — читает настройки из settings.json."""
+        """Проверяет нужно ли отправлять событие по явной настройке или уровню уведомлений."""
         key = f"notify_{event_code}"
         val = get_setting(key)
-        if val is None:
-            # Если настройка не задана — отправляем важные события по умолчанию
+        if val is not None:
+            return str(val).lower() == "true"
+
+        level = (self._level or NotificationLevel.ALL).lower()
+        if level == NotificationLevel.CRITICAL_ONLY:
+            return event_code in _CRITICAL_CODES
+        if level == NotificationLevel.ERRORS_ONLY:
             return event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
-        return str(val).lower() == "true"
+        return True
 
 
 class _SafeDict(dict):
@@ -374,5 +391,28 @@ class _SafeDict(dict):
         return "—"
 
 
-# Глобальный экземпляр — используется во всём приложении
-notifier = TelegramNotifier()
+_notifier_instance: Optional[TelegramNotifier] = None
+_notifier_lock = threading.Lock()
+
+
+def get_notifier() -> TelegramNotifier:
+    """Ленивая инициализация глобального TelegramNotifier без import-time side effect."""
+    global _notifier_instance
+    if _notifier_instance is not None:
+        return _notifier_instance
+
+    with _notifier_lock:
+        if _notifier_instance is None:
+            _notifier_instance = TelegramNotifier()
+        return _notifier_instance
+
+
+class _LazyNotifierProxy:
+    """Прокси, сохраняющий старый API `from core.telegram_bot import notifier`."""
+
+    def __getattr__(self, item):
+        return getattr(get_notifier(), item)
+
+
+# Глобальный ленивый прокси — используется во всём приложении
+notifier = _LazyNotifierProxy()

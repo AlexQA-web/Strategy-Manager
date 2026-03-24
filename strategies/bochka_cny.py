@@ -11,16 +11,10 @@
 # Особенности:
 #   - on_bar() одинаков для бэктеста и реала: сигнал на закрытом баре
 #   - execute_signal() реализует реальное исполнение через коннектор
-#   - Исполнение: рыночный ордер (order_type="market")
-#   - Позиция отслеживается через модульную переменную _position_live
-#     (LiveEngine передаёт position из своего состояния, но для close нужно
-#      знать направление — храним его здесь)
+#   - Для close стратегия использует подтверждённую брокерскую позицию,
+#     а не локальное оптимистичное состояние
 
 from loguru import logger
-
-# ── Состояние реальной торговли ───────────────────────────────────────────────
-# Направление открытой позиции: +1 лонг, -1 шорт, 0 нет
-_live_side: int = 0
 
 
 def get_info() -> dict:
@@ -71,9 +65,9 @@ def get_params() -> dict:
         },
         "time_close": {
             "type":        "time",
-            "default":     693,
+            "default":     900,
             "label":       "Time close",
-            "description": "Закрытие позиции (693 = 11:33)",
+            "description": "Закрытие позиции (900 = 15:00)",
         },
         "qty": {
             "type":        "int",
@@ -110,8 +104,12 @@ def get_indicators() -> list:
 
 
 def on_start(params: dict, connector) -> None:
-    global _live_side
-    _live_side = 0
+    time_open = int(params.get('time_open', 708))
+    time_close = int(params.get('time_close', 900))
+    if time_open >= time_close:
+        logger.warning(
+            f'[Бочка CNY] Некорректное окно времени: time_open={time_open} >= time_close={time_close}'
+        )
     logger.info(f"[Бочка CNY] Запуск. Тикер: {params.get('ticker')}")
 
 
@@ -184,7 +182,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     date_int   = current["date_int"]
     weekday    = current["weekday"]
     time_open  = int(params.get("time_open",  708))
-    time_close = int(params.get("time_close", 693))
+    time_close = int(params.get("time_close", 900))
     qty        = int(params.get("qty", 1))
 
     def _nan(v):
@@ -229,10 +227,9 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str) -> No
       - "limit"       — лимитка по лучшей цене стакана (ChaseOrder)
       - "limit_price" — лимитка по last price (висит до исполнения или до 23:45)
 
-    Отслеживает направление позиции в _live_side для корректного закрытия.
+    Для закрытия использует подтверждённую позицию из коннектора,
+    а не локальное оптимистичное состояние.
     """
-    global _live_side
-
     action     = signal.get("action")
     qty        = int(signal.get("qty", 1))
     comment    = signal.get("comment", "")
@@ -242,19 +239,17 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str) -> No
 
     if action == "buy":
         _place(connector, account_id, board, ticker, "buy", qty, comment, order_mode)
-        _live_side = +1
 
     elif action == "sell":
         _place(connector, account_id, board, ticker, "sell", qty, comment, order_mode)
-        _live_side = -1
 
     elif action == "close":
-        if _live_side == 0:
-            logger.warning("[Бочка CNY] close сигнал, но _live_side=0 — пропуск")
+        live_side, live_qty = _get_confirmed_position(connector, account_id, ticker, board)
+        if live_side == 0 or live_qty <= 0:
+            logger.warning('[Бочка CNY] close сигнал, но подтверждённая позиция отсутствует — пропуск')
             return
-        close_side = "sell" if _live_side > 0 else "buy"
-        _place(connector, account_id, board, ticker, close_side, qty, comment, order_mode)
-        _live_side = 0
+        close_side = "sell" if live_side > 0 else "buy"
+        _place(connector, account_id, board, ticker, close_side, live_qty, comment, order_mode)
 
 
 def _place(connector, account_id: str, board: str, ticker: str,
@@ -421,3 +416,34 @@ def _get_last_price(connector, board: str, ticker: str) -> float:
     except Exception as e:
         logger.warning(f"[Бочка CNY] _get_last_price {ticker}: {e}")
     return 0.0
+
+
+
+def _get_confirmed_position(connector, account_id: str, ticker: str, board: str) -> tuple[int, int]:
+    """Возвращает подтверждённую позицию из коннектора: (side, abs_qty)."""
+    try:
+        if not hasattr(connector, 'get_positions'):
+            return 0, 0
+        positions = connector.get_positions(account_id) or []
+        for pos in positions:
+            if pos.get('ticker') != ticker:
+                continue
+            pos_board = str(pos.get('board', board) or board)
+            if pos_board != board:
+                continue
+
+            raw_qty = float(pos.get('quantity', 0) or 0)
+            if raw_qty > 0:
+                return 1, int(abs(raw_qty))
+            if raw_qty < 0:
+                return -1, int(abs(raw_qty))
+
+            side = str(pos.get('side', '')).lower()
+            qty = int(abs(float(pos.get('quantity', 0) or 0)))
+            if side == 'buy' and qty > 0:
+                return 1, qty
+            if side == 'sell' and qty > 0:
+                return -1, qty
+    except Exception as e:
+        logger.warning(f'[Бочка CNY] _get_confirmed_position {ticker}: {e}')
+    return 0, 0

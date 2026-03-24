@@ -197,7 +197,7 @@ class DataLoader(QThread):
         logger.debug(f"[DataLoader] run start thread={_threading.current_thread().name}")
         try:
             from core import chart_cache
-            cached = chart_cache.load(self.ticker, self.interval)
+            cached = chart_cache.load(self.ticker, self.interval, self.board)
             if cached is not None and not cached.empty:
                 # Проверяем покрывает ли кеш нужный диапазон дней.
                 # Если кеш короче чем self.days — перегружаем полностью.
@@ -209,7 +209,7 @@ class DataLoader(QThread):
                     logger.debug(f"[DataLoader] кеш покрывает {cache_days}д < {self.days}д — полная перезагрузка")
                     df = self._load_history()
                     if df is not None and not df.empty:
-                        chart_cache.save(self.ticker, self.interval, df)
+                        chart_cache.save(self.ticker, self.interval, df, self.board)
                         t0 = _time.monotonic()
                         result = self._apply_precalc(df)
                         logger.debug(f"[DataLoader] precalc(full_reload) done in {_time.monotonic()-t0:.2f}s")
@@ -230,7 +230,7 @@ class DataLoader(QThread):
                     fresh = self._load_history(days=delta_days)
                     if fresh is not None and not fresh.empty:
                         merged = chart_cache.merge(cached, fresh)
-                        chart_cache.save(self.ticker, self.interval, merged)
+                        chart_cache.save(self.ticker, self.interval, merged, self.board)
                         if len(merged) != len(cached):
                             t0 = _time.monotonic()
                             result = self._apply_precalc(merged)
@@ -247,7 +247,7 @@ class DataLoader(QThread):
                         "Проверь подключение к брокеру."
                     )
                     return
-                chart_cache.save(self.ticker, self.interval, df)
+                chart_cache.save(self.ticker, self.interval, df, self.board)
                 t0 = _time.monotonic()
                 result = self._apply_precalc(df)
                 logger.debug(f"[DataLoader] precalc(fresh) done in {_time.monotonic()-t0:.2f}s")

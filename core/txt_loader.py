@@ -32,35 +32,39 @@ class TXTLoader:
     # Маппинг weekday(): 0=Mon..6=Sun → 1=Mon..7=Sun (как в TSLab)
     _WEEKDAY_MAP = {0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7}
 
-    def load(self, filepath: str | Path) -> list[Bar]:
+    def load(self, filepath: str | Path, board: str = 'TQBR') -> list[Bar]:
         path = Path(filepath)
         if not path.exists():
-            raise FileNotFoundError(f"Файл не найден: {path}")
+            raise FileNotFoundError(f'Файл не найден: {path}')
 
         bars: list[Bar] = []
 
-        with path.open(encoding="utf-8") as f:
+        with path.open(encoding='utf-8') as f:
             reader = csv.reader(f)
             for line_num, row in enumerate(reader, start=1):
-                # Пропускаем заголовок
-                if line_num == 1 and row[0].startswith("<"):
-                    logger.debug(f"Заголовок пропущен: {row}")
+                if not row or not any(str(cell).strip() for cell in row):
+                    logger.debug(f'Пустая строка {line_num} пропущена')
                     continue
 
-                bar = self._parse_row(row, line_num)
+                # Пропускаем заголовок
+                if line_num == 1 and row[0].startswith('<'):
+                    logger.debug(f'Заголовок пропущен: {row}')
+                    continue
+
+                bar = self._parse_row(row, line_num, board)
                 if bar is not None:
                     bars.append(bar)
 
         if not bars:
-            raise ValueError(f"Файл пустой или не удалось распарсить строки: {path}")
+            raise ValueError(f'Файл пустой или не удалось распарсить строки: {path}')
 
         logger.info(
-            f"Загружено {len(bars)} баров | {bars[0].ticker} | "
-            f"{bars[0].dt.date()} → {bars[-1].dt.date()}"
+            f'Загружено {len(bars)} баров | {bars[0].board}/{bars[0].ticker} | '
+            f'{bars[0].dt.date()} → {bars[-1].dt.date()}'
         )
         return bars
 
-    def _parse_row(self, row: list[str], line_num: int) -> Bar | None:
+    def _parse_row(self, row: list[str], line_num: int, board: str = 'TQBR') -> Bar | None:
         try:
             ticker   = row[0].strip()
             # row[1]  = период (игнорируем)
@@ -88,10 +92,11 @@ class TXTLoader:
                 low=low,
                 close=close,
                 vol=vol,
+                board=(board or 'TQBR').strip() or 'TQBR',
             )
 
         except (IndexError, ValueError) as e:
-            logger.warning(f"Строка {line_num} пропущена ({e}): {row}")
+            logger.warning(f'Строка {line_num} пропущена ({e}): {row}')
             return None
 
     @staticmethod
