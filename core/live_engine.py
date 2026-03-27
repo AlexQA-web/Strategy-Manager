@@ -836,9 +836,10 @@ class LiveEngine:
                 return
 
         fill_price = self._last_price
+        fill_price_text = f'{fill_price:.4f}' if fill_price else 'н/д'
 
         try:
-            if action in ("buy", "sell"):
+            if action in ('buy', 'sell'):
                 # Атомарная проверка позиции и флага in-flight под одной блокировкой
                 # для предотвращения race condition при одновременных сигналах.
                 # Используем единую блокировку _position_lock для избежания deadlock
@@ -846,17 +847,17 @@ class LiveEngine:
                 with self._position_lock:
                     if self._position != 0:
                         logger.warning(
-                            f"[LiveEngine:{self._strategy_id}] Позиция уже открыта "
-                            f"({self._position}, qty={self._position_qty}), "
-                            f"игнорируем {action.upper()}"
+                            f'[LiveEngine:{self._strategy_id}] Позиция уже открыта '
+                            f'({self._position}, qty={self._position_qty}), '
+                            f'игнорируем {action.upper()} цена~{fill_price_text}'
                         )
                         return
 
-                    if self._order_mode in ("limit", "limit_price"):
+                    if self._order_mode in ('limit', 'limit_price'):
                         if self._order_in_flight:
                             logger.warning(
-                                f"[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, "
-                                f"игнорируем {action.upper()}"
+                                f'[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, '
+                                f'игнорируем {action.upper()} цена~{fill_price_text}'
                             )
                             return
                         self._order_in_flight = True
@@ -869,19 +870,20 @@ class LiveEngine:
                 else:
                     self._execute_market(action, qty, comment, fill_price)
 
-            elif action == "close":
+            elif action == 'close':
                 with self._position_lock:
                     if self._position == 0 or self._position_qty == 0:
                         logger.warning(
-                            f"[LiveEngine:{self._strategy_id}] Нет открытой позиции, игнорируем CLOSE"
+                            f'[LiveEngine:{self._strategy_id}] Нет открытой позиции, '
+                            f'игнорируем CLOSE цена~{fill_price_text}'
                         )
                         return
 
-                    if self._order_mode in ("limit", "limit_price"):
+                    if self._order_mode in ('limit', 'limit_price'):
                         if self._order_in_flight:
                             logger.warning(
-                                f"[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, "
-                                f"игнорируем CLOSE"
+                                f'[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, '
+                                f'игнорируем CLOSE цена~{fill_price_text}'
                             )
                             return
                         self._order_in_flight = True
@@ -1005,8 +1007,8 @@ class LiveEngine:
         )
         if tid:
             self._record_success()
-            logger.info(f"[LiveEngine:{self._strategy_id}] "
-                        f"MARKET {side.upper()} x{qty} tid={tid} (мониторинг...)")
+            logger.info(f'[LiveEngine:{self._strategy_id}] '
+                        f'MARKET {side.upper()} x{qty} @ {fill_price:.4f} tid={tid} (мониторинг...)')
 
             # Запускаем фоновый мониторинг заявки
             t = threading.Thread(
@@ -1044,7 +1046,10 @@ class LiveEngine:
                     agent_name=self._agent_name,
                 )
             except Exception as e:
-                logger.warning(f"[LiveEngine:{self._strategy_id}] close_position error: {e}")
+                logger.warning(
+                    f'[LiveEngine:{self._strategy_id}] close_position error: {e}, '
+                    f'цена~{fill_price:.4f}'
+                )
                 tid_or_ok = False
 
         # Fallback: рыночный ордер напрямую
@@ -1061,8 +1066,8 @@ class LiveEngine:
             if tid:
                 tid_or_ok = tid
                 self._record_success()
-                logger.info(f"[LiveEngine:{self._strategy_id}] "
-                            f"CLOSE MARKET {close_side.upper()} x{close_qty} tid={tid} (мониторинг...)")
+                logger.info(f'[LiveEngine:{self._strategy_id}] '
+                            f'CLOSE MARKET {close_side.upper()} x{close_qty} @ {fill_price:.4f} tid={tid} (мониторинг...)')
 
                 # Запускаем фоновый мониторинг заявки
                 t = threading.Thread(
@@ -1086,11 +1091,11 @@ class LiveEngine:
         # close_position вернул True (без tid) - считаем исполненным
         if tid_or_ok is True:
             with self._position_lock:
-                self._record_trade(close_side, close_qty, fill_price, comment, order_type="market")
+                self._record_trade(close_side, close_qty, fill_price, comment, order_type='market')
                 self._position = 0
                 self._position_qty = 0
                 self._entry_price = 0.0
-            logger.info(f"[LiveEngine:{self._strategy_id}] CLOSE ({comment})")
+            logger.info(f'[LiveEngine:{self._strategy_id}] CLOSE {close_side.upper()} x{close_qty} @ {fill_price:.4f} ({comment})')
         elif tid_or_ok:  # это tid - запускаем мониторинг
             t = threading.Thread(
                 target=self._monitor_market_order,
@@ -1283,8 +1288,8 @@ class LiveEngine:
         filled = 0
         confirmed = False
 
-        logger.debug(f"[LiveEngine:{self._strategy_id}] "
-                     f"Мониторинг MARKET tid={tid} {side.upper()} x{qty}")
+        logger.debug(f'[LiveEngine:{self._strategy_id}] '
+                     f'Мониторинг MARKET tid={tid} {side.upper()} x{qty} @ {price:.4f}')
 
         deadline = time.monotonic() + TIMEOUT_SEC
 
@@ -1305,14 +1310,14 @@ class LiveEngine:
                 if balance is not None and quantity_field is not None:
                     filled = int(quantity_field) - int(balance)
 
-                if status == "matched":
+                if status == 'matched':
                     confirmed = True
-                    logger.info(f"[LiveEngine:{self._strategy_id}] "
-                                f"MARKET tid={tid} исполнен filled={filled}/{qty}")
+                    logger.info(f'[LiveEngine:{self._strategy_id}] '
+                                f'MARKET tid={tid} исполнен filled={filled}/{qty} @ {price:.4f}')
                     break
                 elif status in _TERMINAL:
-                    logger.info(f"[LiveEngine:{self._strategy_id}] "
-                                f"MARKET tid={tid} завершён статус={status} filled={filled}/{qty}")
+                    logger.info(f'[LiveEngine:{self._strategy_id}] '
+                                f'MARKET tid={tid} завершён статус={status} filled={filled}/{qty} @ {price:.4f}')
                     break
 
             time.sleep(0.5)
@@ -1375,12 +1380,12 @@ class LiveEngine:
                             self._position = -1
                             self._position_qty = -filled
                         self._entry_price = price
-                    self._record_trade(side, filled, price, comment, order_type="market")
-                    logger.info(f"[LiveEngine:{self._strategy_id}] "
-                                f"MARKET частично: {side.upper()} filled={filled}/{qty}")
+                    self._record_trade(side, filled, price, comment, order_type='market')
+                    logger.info(f'[LiveEngine:{self._strategy_id}] '
+                                f'MARKET частично: {side.upper()} filled={filled}/{qty} @ {price:.4f}')
                     return True
-                logger.warning(f"[LiveEngine:{self._strategy_id}] "
-                               f"MARKET tid={tid} не исполнен за {TIMEOUT_SEC} сек")
+                logger.warning(f'[LiveEngine:{self._strategy_id}] '
+                               f'MARKET tid={tid} не исполнен за {TIMEOUT_SEC} сек @ {price:.4f}')
                 return False
 
     def _execute_chase(self, side: str, qty: int, comment: str, is_close: bool = False):
@@ -1393,8 +1398,10 @@ class LiveEngine:
         # Флаг _order_in_flight уже установлен в _execute_signal() под блокировкой
         # Здесь только запускаем chase-поток
 
-        logger.info(f"[LiveEngine:{self._strategy_id}] "
-                    f"Chase {side.upper()} x{qty} ({comment}) — фоновый поток")
+        chase_price = self._last_price or 0.0
+        chase_price_text = f'{chase_price:.4f}' if chase_price else 'bid/offer'
+        logger.info(f'[LiveEngine:{self._strategy_id}] '
+                    f'Chase {side.upper()} x{qty} цена~{chase_price_text} ({comment}) — фоновый поток')
 
         chase = ChaseOrder(
             connector=self._connector,
@@ -1420,14 +1427,16 @@ class LiveEngine:
                 
                 if fill_rate < 50:
                     logger.warning(
-                        f"[{self._strategy_id}] Частичное исполнение: "
-                        f"{filled_qty}/{target_qty} ({fill_rate:.1f}%)"
+                        f'[{self._strategy_id}] Частичное исполнение: '
+                        f'{filled_qty}/{target_qty} ({fill_rate:.1f}%) '
+                        f'цена~{chase.avg_price:.4f}'
                     )
                     # TODO: Опционально можно добавить retry-логику здесь
                 elif fill_rate < 100:
                     logger.info(
-                        f"[{self._strategy_id}] Неполное исполнение: "
-                        f"{filled_qty}/{target_qty} ({fill_rate:.1f}%)"
+                        f'[{self._strategy_id}] Неполное исполнение: '
+                        f'{filled_qty}/{target_qty} ({fill_rate:.1f}%) '
+                        f'цена~{chase.avg_price:.4f}'
                     )
             finally:
                 with self._chase_lock:

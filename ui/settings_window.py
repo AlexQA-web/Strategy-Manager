@@ -139,13 +139,13 @@ class _SettingsMixin:
 
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._tab_finam(),         "🔌  Финам")
-        self.tabs.addTab(self._tab_quik(),          "🖥  QUIK")
-        self.tabs.addTab(self._tab_accounts(),      "🏦  Счета")
-        self.tabs.addTab(self._tab_telegram(),      "✈  Telegram")
-        self.tabs.addTab(self._tab_notifications(), "🔔  Уведомления")
-        self.tabs.addTab(self._tab_general(),       "⚙  Общие")
-        self.tabs.addTab(self._tab_commissions(),   "💰  Комиссии")
+        self.tabs.addTab(self._tab_finam(),              "🔌  Финам")
+        self.tabs.addTab(self._tab_quik(),               "🖥  QUIK")
+        self.tabs.addTab(self._tab_accounts(),           "🏦  Счета")
+        self.tabs.addTab(self._tab_notifications(),      "🔔  Уведомления")
+        self.tabs.addTab(self._tab_notification_events(), "📢  Типы уведомлений")
+        self.tabs.addTab(self._tab_general(),            "⚙  Общие")
+        self.tabs.addTab(self._tab_commissions(),        "💰  Комиссии")
         layout.addWidget(self.tabs, stretch=1)
 
         # Подключаем сигналы изменений всех виджетов для подсветки кнопки Сохранить
@@ -388,19 +388,24 @@ class _SettingsMixin:
         return tab
 
     # ─────────────────────────────────────────────
-    # Вкладка: Telegram
+    # Вкладка: Уведомления
     # ─────────────────────────────────────────────
 
-    def _tab_telegram(self) -> QWidget:
-        tab    = QWidget()
+    def _tab_notifications(self) -> QWidget:
+        tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        tg_group = QGroupBox("Параметры Telegram бота")
-        form = QFormLayout(tg_group)
-        form.setSpacing(12)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        # Группа для Telegram
+        tg_group = QGroupBox("Telegram")
+        tg_form = QFormLayout(tg_group)
+        tg_form.setSpacing(12)
+        tg_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.tg_enabled = QCheckBox("Включить Telegram уведомления")
+        self.tg_enabled.setChecked(str(get_setting("telegram_enabled", "false")).lower() == "true")
+        tg_form.addRow(self.tg_enabled)
 
         self.tg_token = QLineEdit()
         self.tg_token.setText(get_setting("telegram_token") or "")
@@ -412,40 +417,73 @@ class _SettingsMixin:
         btn_show.setFixedWidth(34)
         btn_show.clicked.connect(lambda: self._toggle_echo(self.tg_token))
         token_row.addWidget(btn_show)
-        form.addRow("Bot Token:", token_row)
+        tg_form.addRow("Bot Token:", token_row)
         hint = QLabel("Получи токен у @BotFather в Telegram")
         hint.setObjectName("lbl_hint")
-        form.addRow("", hint)
+        tg_form.addRow("", hint)
 
         self.tg_chat_id = QLineEdit()
         self.tg_chat_id.setText(str(get_setting("telegram_chat_id") or ""))
         self.tg_chat_id.setPlaceholderText("-100123456789")
-        form.addRow("Chat ID:", self.tg_chat_id)
+        tg_form.addRow("Chat ID:", self.tg_chat_id)
         hint2 = QLabel("Узнай свой Chat ID у бота @userinfobot")
         hint2.setObjectName("lbl_hint")
-        form.addRow("", hint2)
+        tg_form.addRow("", hint2)
 
         layout.addWidget(tg_group)
 
+        # Группа для NTFY
+        ntfy_group = QGroupBox("NTFY")
+        ntfy_form = QFormLayout(ntfy_group)
+        ntfy_form.setSpacing(12)
+        ntfy_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.ntfy_enabled = QCheckBox("Включить NTFY уведомления")
+        self.ntfy_enabled.setChecked(str(get_setting("ntfy_enabled", "false")).lower() == "true")
+        ntfy_form.addRow(self.ntfy_enabled)
+
+        self.ntfy_server_url = QLineEdit()
+        self.ntfy_server_url.setText(get_setting("ntfy_server_url") or "https://ntfy.sh")
+        self.ntfy_server_url.setPlaceholderText("https://ntfy.sh")
+        ntfy_form.addRow("Server URL:", self.ntfy_server_url)
+
+        self.ntfy_topic = QLineEdit()
+        self.ntfy_topic.setText(get_setting("ntfy_topic") or "")
+        self.ntfy_topic.setPlaceholderText("my-topic-name")
+        ntfy_form.addRow("Topic:", self.ntfy_topic)
+
+        layout.addWidget(ntfy_group)
+
+        # Кнопки тестирования
         test_row = QHBoxLayout()
         self.lbl_tg_status = QLabel("")
         test_row.addWidget(self.lbl_tg_status)
+        self.lbl_ntfy_status = QLabel("")
+        test_row.addWidget(self.lbl_ntfy_status)
         test_row.addStretch()
-        btn_test = QPushButton("✈ Тест отправки")
-        btn_test.setObjectName("btn_test")
-        btn_test.setFixedWidth(150)
-        btn_test.clicked.connect(self._test_telegram)
-        test_row.addWidget(btn_test)
+
+        btn_test_tg = QPushButton("✈ Тест Telegram")
+        btn_test_tg.setObjectName("btn_test")
+        btn_test_tg.setFixedWidth(120)
+        btn_test_tg.clicked.connect(self._test_telegram)
+        test_row.addWidget(btn_test_tg)
+
+        btn_test_ntfy = QPushButton("🔔 Тест NTFY")
+        btn_test_ntfy.setObjectName("btn_test")
+        btn_test_ntfy.setFixedWidth(120)
+        btn_test_ntfy.clicked.connect(self._test_ntfy)
+        test_row.addWidget(btn_test_ntfy)
+
         layout.addLayout(test_row)
 
         layout.addStretch()
         return tab
 
     # ─────────────────────────────────────────────
-    # Вкладка: Уведомления
+    # Вкладка: Настройка уведомлений
     # ─────────────────────────────────────────────
 
-    def _tab_notifications(self) -> QWidget:
+    def _tab_notification_events(self) -> QWidget:
         from PyQt6.QtWidgets import QScrollArea
         from core.telegram_bot import EventCode
 
@@ -461,7 +499,13 @@ class _SettingsMixin:
         layout.setContentsMargins(20, 16, 20, 16)
         layout.setSpacing(12)
 
-        self._notify_checks: dict[str, QCheckBox] = {}
+        # Заголовок
+        header_label = QLabel("Выберите, в каких каналах отправлять каждое уведомление:")
+        header_label.setStyleSheet("font-weight: bold; color: #89b4fa; margin-bottom: 10px;")
+        layout.addWidget(header_label)
+
+        self._notify_telegram_checks: dict[str, QCheckBox] = {}
+        self._notify_ntfy_checks: dict[str, QCheckBox] = {}
 
         groups = [
             ("Позиции", [
@@ -501,9 +545,19 @@ class _SettingsMixin:
             grp = QGroupBox(group_name)
             grp_layout = QVBoxLayout(grp)
             grp_layout.setSpacing(6)
+            
             for code, label in events:
-                key = f"notify_{code}"
-                cb = QCheckBox(label)
+                # Горизонтальный контейнер для метки и чекбоксов
+                row_layout = QHBoxLayout()
+                
+                # Метка события
+                event_label = QLabel(label)
+                event_label.setMinimumWidth(300)  # Чтобы выравнивать чекбоксы
+                row_layout.addWidget(event_label)
+                
+                # Чекбокс для Telegram
+                telegram_key = f"notify_telegram_{code}"
+                cb_telegram = QCheckBox("Telegram")
                 # по умолчанию включены только важные события
                 default = code in {
                     EventCode.MISSED_ENTRY, EventCode.MISSED_EXIT,
@@ -512,9 +566,21 @@ class _SettingsMixin:
                     EventCode.CONNECTOR_DISCONNECTED, EventCode.CONNECTOR_ERROR,
                     EventCode.STRATEGY_ERROR, EventCode.STRATEGY_CRASHED,
                 }
-                cb.setChecked(str(get_setting(key) or ("true" if default else "false")).lower() == "true")
-                self._notify_checks[key] = cb
-                grp_layout.addWidget(cb)
+                cb_telegram.setChecked(str(get_setting(telegram_key) or ("true" if default else "false")).lower() == "true")
+                self._notify_telegram_checks[telegram_key] = cb_telegram
+                row_layout.addWidget(cb_telegram)
+                
+                # Чекбокс для NTFY
+                ntfy_key = f"notify_ntfy_{code}"
+                cb_ntfy = QCheckBox("NTFY")
+                cb_ntfy.setChecked(str(get_setting(ntfy_key) or ("true" if default else "false")).lower() == "true")
+                self._notify_ntfy_checks[ntfy_key] = cb_ntfy
+                row_layout.addWidget(cb_ntfy)
+                
+                row_layout.addStretch()  # Для выравнивания
+                
+                grp_layout.addLayout(row_layout)
+                
             layout.addWidget(grp)
 
         layout.addStretch()
@@ -750,7 +816,17 @@ class _SettingsMixin:
         # Telegram
         save_setting("telegram_token",   self.tg_token.text().strip())
         save_setting("telegram_chat_id", self.tg_chat_id.text().strip())
-        for key, cb in self._notify_checks.items():
+        save_setting("telegram_enabled", "true" if self.tg_enabled.isChecked() else "false")
+        
+        # NTFY
+        save_setting("ntfy_server_url", self.ntfy_server_url.text().strip())
+        save_setting("ntfy_topic", self.ntfy_topic.text().strip())
+        save_setting("ntfy_enabled", "true" if self.ntfy_enabled.isChecked() else "false")
+        
+        # Уведомления для каждого канала
+        for key, cb in self._notify_telegram_checks.items():
+            save_setting(key, "true" if cb.isChecked() else "false")
+        for key, cb in self._notify_ntfy_checks.items():
             save_setting(key, "true" if cb.isChecked() else "false")
 
         # Общие
@@ -822,6 +898,7 @@ class _SettingsMixin:
         import threading
         save_setting("telegram_token",   self.tg_token.text().strip())
         save_setting("telegram_chat_id", self.tg_chat_id.text().strip())
+        save_setting("telegram_enabled", "true" if self.tg_enabled.isChecked() else "false")
         notifier.load_from_settings()
         self.lbl_tg_status.setText("⏳ Отправляем...")
         self.lbl_tg_status.setStyleSheet("color: #f9e2af;")
@@ -834,6 +911,32 @@ class _SettingsMixin:
             else:
                 self.lbl_tg_status.setText(f"🔴 {msg}")
                 self.lbl_tg_status.setStyleSheet("color: #f38ba8;")
+
+        threading.Thread(target=_go, daemon=True).start()
+
+    def _test_ntfy(self):
+        import threading
+        from core.ntfy_notifier import ntfy_notifier
+        
+        # Сохраняем настройки
+        save_setting("ntfy_server_url", self.ntfy_server_url.text().strip())
+        save_setting("ntfy_topic", self.ntfy_topic.text().strip())
+        save_setting("ntfy_enabled", "true" if self.ntfy_enabled.isChecked() else "false")
+        
+        # Загружаем настройки в нотификатор
+        ntfy_notifier.load_from_settings()
+        
+        self.lbl_ntfy_status.setText("⏳ Отправляем...")
+        self.lbl_ntfy_status.setStyleSheet("color: #f9e2af;")
+
+        def _go():
+            ok, msg = ntfy_notifier.test_connection()
+            if ok:
+                self.lbl_ntfy_status.setText(f"🟢 {msg}")
+                self.lbl_ntfy_status.setStyleSheet("color: #a6e3a1;")
+            else:
+                self.lbl_ntfy_status.setText(f"🔴 {msg}")
+                self.lbl_ntfy_status.setStyleSheet("color: #f38ba8;")
 
         threading.Thread(target=_go, daemon=True).start()
 
@@ -921,9 +1024,18 @@ class _SettingsMixin:
         # --- Telegram ---
         self.tg_token.setText(get_setting("telegram_token") or "")
         self.tg_chat_id.setText(str(get_setting("telegram_chat_id") or ""))
+        self.tg_enabled.setChecked(str(get_setting("telegram_enabled", "false")).lower() == "true")
 
-        # --- Уведомления ---
-        for key, cb in self._notify_checks.items():
+        # --- NTFY ---
+        self.ntfy_server_url.setText(get_setting("ntfy_server_url") or "https://ntfy.sh")
+        self.ntfy_topic.setText(get_setting("ntfy_topic") or "")
+        self.ntfy_enabled.setChecked(str(get_setting("ntfy_enabled", "false")).lower() == "true")
+
+        # --- Уведомления для каждого канала ---
+        for key, cb in self._notify_telegram_checks.items():
+            default = "false"
+            cb.setChecked(str(get_setting(key) or default).lower() == "true")
+        for key, cb in self._notify_ntfy_checks.items():
             default = "false"
             cb.setChecked(str(get_setting(key) or default).lower() == "true")
 

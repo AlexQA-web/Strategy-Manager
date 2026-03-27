@@ -99,9 +99,21 @@ class PositionManager:
 
     def get_position(self, account_id: str, ticker: str) -> Optional[dict]:
         for pos in self.get_positions(account_id):
-            if pos.get("ticker") == ticker:
+            if pos.get('ticker') == ticker:
                 return pos
         return None
+
+    @staticmethod
+    def _format_price(price: Optional[float]) -> str:
+        if price is None or price <= 0:
+            return 'н/д'
+        return f'{price:.4f}'
+
+    def _get_market_price_for_log(self, connector, ticker: str, board: str = 'TQBR') -> str:
+        try:
+            return self._format_price(connector.get_last_price(ticker, board))
+        except Exception:
+            return 'н/д'
 
     # ── Закрытие позиций ──────────────────────────────────────────────────
 
@@ -115,17 +127,21 @@ class PositionManager:
         """Закрывает позицию по рыночной цене. quantity=0 → полное закрытие."""
         connector = self._connector()
         if not connector or not connector.is_connected():
-            logger.warning(f"close_position({ticker}): коннектор не подключён")
+            logger.warning(f'close_position({ticker}): коннектор не подключён, цена=н/д')
             return False
 
         pos = self.get_position(account_id, ticker)
         if not pos:
-            logger.warning(f"close_position: позиция {ticker} не найдена на {account_id}")
+            logger.warning(f'close_position: позиция {ticker} не найдена на {account_id}, цена=н/д')
             return False
 
-        total_qty = int(abs(float(pos.get("quantity", 0))))
+        total_qty = int(abs(float(pos.get('quantity', 0))))
+        board = pos.get('board', 'TQBR')
+        market_price = self._get_market_price_for_log(connector, ticker, board)
         if total_qty == 0:
-            logger.warning(f"close_position: {ticker} — нулевая позиция")
+            logger.warning(
+                f'close_position: {ticker} — нулевая позиция, счёт={account_id}, цена~{market_price}'
+            )
             return False
 
         close_qty = quantity if 0 < quantity < total_qty else total_qty
@@ -136,8 +152,16 @@ class PositionManager:
             agent_name=agent_name,
         )
         if result:
-            label = "частично" if close_qty < total_qty else "полностью"
-            logger.info(f"Позиция {ticker} закрыта {label} (qty={close_qty})")
+            label = 'частично' if close_qty < total_qty else 'полностью'
+            logger.info(
+                f'Позиция {ticker} закрывается {label}: qty={close_qty}, '
+                f'счёт={account_id}, цена~{market_price}'
+            )
+        else:
+            logger.warning(
+                f'close_position: не удалось отправить закрытие {ticker} '
+                f'qty={close_qty}, счёт={account_id}, цена~{market_price}'
+            )
         return result
 
     def close_all_positions(self, account_id: str, agent_name: str = "manual") -> int:
@@ -167,9 +191,14 @@ class PositionManager:
         """Выставляет ручной ордер. Возвращает order_id или None."""
         connector = self._connector()
         if not connector or not connector.is_connected():
-            logger.warning("place_manual_order: коннектор не подключён")
+            logger.warning('place_manual_order: коннектор не подключён, цена=н/д')
             return None
 
+        price_text = (
+            self._format_price(price)
+            if order_type == 'limit'
+            else self._get_market_price_for_log(connector, ticker)
+        )
         order_id = connector.place_order(
             account_id=account_id,
             ticker=ticker,
@@ -177,12 +206,18 @@ class PositionManager:
             quantity=quantity,
             order_type=order_type,
             price=price,
-            agent_name="manual",
+            agent_name='manual',
         )
         if order_id:
-            logger.info(f"Ручной ордер выставлен: {side.upper()} {ticker} x{quantity} → {order_id}")
+            logger.info(
+                f'Ручной ордер выставлен: {side.upper()} {ticker} x{quantity} '
+                f'тип={order_type} цена={price_text} → {order_id}'
+            )
         else:
-            logger.warning(f"Ручной ордер отклонён: {side.upper()} {ticker} x{quantity}")
+            logger.warning(
+                f'Ручной ордер отклонён: {side.upper()} {ticker} x{quantity} '
+                f'тип={order_type} цена={price_text}'
+            )
         return order_id
 
     # ── UI подписка ───────────────────────────────────────────────────────

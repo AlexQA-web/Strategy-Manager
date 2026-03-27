@@ -1,6 +1,7 @@
 import sys
 import threading
 from datetime import datetime
+from html import escape
 from typing import Optional
 
 from PyQt6.QtWidgets import (
@@ -484,9 +485,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 600)
         self.resize(1400, 820)
         self._log_visible = True
+        self._log_views: dict[str, QTextEdit] = {}
         self._expanded: set = set()  # sid стратегий с развёрнутым списком инструментов
         self._row_order: list = []   # порядок sid агентов (in-memory, синхронизируется с QSettings)
-        
+
         # Кэш для sec_info (чтобы не блокировать GUI при запросах к QUIK)
         self._sec_info_cache: dict = {}  # {(connector_id, ticker, board): (sec_info, timestamp)}
         self._refreshing_sec_info: set = set()  # множество ключей, которые уже загружаются
@@ -527,7 +529,7 @@ class MainWindow(QMainWindow):
         quik_connector._on_error = lambda m: ui_signals.log_message.emit(f"[QUIK] Ошибка: {m}", "error")
         quik_connector._on_positions_update = lambda: ui_signals.positions_updated.emit()
 
-        logger.add(self._handle_log, level="INFO", format="{message}")
+        logger.add(self._handle_log, level="DEBUG", format="{message}")
         self._preload_strategies()
 
     def _preload_strategies(self):
@@ -817,15 +819,24 @@ class MainWindow(QMainWindow):
         btn_clear = QPushButton("Очистить")
         btn_clear.setObjectName("btn_log_toggle")
         btn_clear.setFixedWidth(70)
-        btn_clear.clicked.connect(lambda: self.log_view.clear())
+        btn_clear.clicked.connect(self._clear_logs)
         hl.addWidget(btn_clear)
 
         layout.addWidget(header)
 
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        layout.addWidget(self.log_view)
+        self.log_tabs = QTabWidget()
+        self.log_tabs.setDocumentMode(True)
+        self.log_tabs.setTabPosition(QTabWidget.TabPosition.North)
+
+        for tab_name in ('Общий', 'Соединение', 'Позиции', 'Дебаг', 'Ошибки'):
+            view = QTextEdit()
+            view.setReadOnly(True)
+            view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+            self._log_views[tab_name] = view
+            self.log_tabs.addTab(view, tab_name)
+
+        self.log_view = self._log_views['Общий']
+        layout.addWidget(self.log_tabs)
 
         return self.logbar
 
@@ -1607,41 +1618,91 @@ class MainWindow(QMainWindow):
             # Qt объект уже удалён при завершении программы — игнорируем
             pass
 
-    def _log(self, text: str, level: str = "info"):
+    def _log(self, text: str, level: str = 'info'):
         ui_signals.log_message.emit(text, level)
 
     def _append_log(self, text: str, level: str):
         colors = {
-            "debug":    "#6c7086",
-            "info":     "#cdd6f4",
-            "warning":  "#f9e2af",
-            "error":    "#f38ba8",
-            "critical": "#fab387",
+            'debug': '#6c7086',
+            'info': '#cdd6f4',
+            'warning': '#f9e2af',
+            'error': '#f38ba8',
+            'critical': '#fab387',
         }
-        color = colors.get(level, "#cdd6f4")
-        t = datetime.now().strftime("%H:%M:%S")
-        self.log_view.append(
+        color = colors.get(level, '#cdd6f4')
+        html = self._format_log_html(text, color)
+
+        if level != 'debug':
+            self._append_log_to_view(self._log_views['Общий'], html)
+        if self._is_connection_log(text):
+            self._append_log_to_view(self._log_views['Соединение'], html)
+        if self._is_position_log(text):
+            self._append_log_to_view(self._log_views['Позиции'], html)
+        if level == 'debug':
+            self._append_log_to_view(self._log_views['Дебаг'], html)
+        if self._is_error_log(text, level):
+            self._append_log_to_view(self._log_views['Ошибки'], html)
+
+    def _format_log_html(self, text: str, color: str) -> str:
+        t = datetime.now().strftime('%H:%M:%S')
+        safe_text = escape(text)
+        return (
             f'<span style="color:#45475a">{t}</span>  '
-            f'<span style="color:{color}">{text}</span>'
+            f'<span style="color:{color}">{safe_text}</span>'
         )
-        # Ограничиваем лог — максимум 5000 блоков
-        doc = self.log_view.document()
-        if doc.blockCount() > 5000:
-            cursor = self.log_view.textCursor()
-            cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.movePosition(cursor.MoveOperation.Down,
-                                cursor.MoveMode.KeepAnchor,
-                                doc.blockCount() - 5000)
-            cursor.removeSelectedText()
-        sb = self.log_view.verticalScrollBar()
+
+    def _append_log_to_view(self, view: QTextEdit, html: str):
+        view.append(html)
+        self._trim_log_view(view)
+        sb = view.verticalScrollBar()
         sb.setValue(sb.maximum())
+
+    def _trim_log_view(self, view: QTextEdit, max_blocks: int = 5000):
+        doc = view.document()
+        if doc.blockCount() <= max_blocks:
+            return
+        cursor = view.textCursor()
+        cursor.movePosition(cursor.MoveOperation.Start)
+        cursor.movePosition(
+            cursor.MoveOperation.Down,
+            cursor.MoveMode.KeepAnchor,
+            doc.blockCount() - max_blocks,
+        )
+        cursor.removeSelectedText()
+
+    def _clear_logs(self):
+        for view in self._log_views.values():
+            view.clear()
+
+    def _is_connection_log(self, text: str) -> bool:
+        text_lower = text.lower()
+        keywords = (
+            '[quik]', '[финам]', '[finam]', '[connectormanager]',
+            'подключение', 'подключён', 'подключен', 'отключение', 'отключён', 'отключен',
+            'коннектор', 'disconnect', 'reconnect', 'connect', 'lua-скрипт', 'серверу брокера',
+        )
+        return any(keyword in text_lower for keyword in keywords)
+
+    def _is_position_log(self, text: str) -> bool:
+        text_lower = text.lower()
+        keywords = (
+            'позиц', 'positionmanager', 'ордер', 'заявк', 'close_position', 'place_manual_order',
+            'limit ', 'market ', ' chase ', 'filled=', 'tid=', ' buy ', ' sell ', ' close ', 'qty=',
+        )
+        return any(keyword in text_lower for keyword in keywords)
+
+    def _is_error_log(self, text: str, level: str) -> bool:
+        if level in {'error', 'critical'}:
+            return True
+        text_lower = text.lower()
+        return 'ошиб' in text_lower or 'exception' in text_lower or 'traceback' in text_lower
 
     def _toggle_log(self):
         self._log_visible = not self._log_visible
-        self.log_view.setVisible(self._log_visible)
+        self.log_tabs.setVisible(self._log_visible)
         self.logbar.setFixedHeight(160 if self._log_visible else 26)
         self.btn_log_toggle.setText(
-            "Свернуть" if self._log_visible else "Развернуть"
+            'Свернуть' if self._log_visible else 'Развернуть'
         )
 
     # ─────────────────────────────────────────────

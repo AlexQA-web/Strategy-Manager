@@ -14,6 +14,7 @@ except ImportError:
     logger.warning("python-telegram-bot не установлен. Уведомления отключены.")
 
 from core.storage import get_setting
+from core.ntfy_notifier import ntfy_notifier
 
 
 # ─────────────────────────────────────────────
@@ -258,6 +259,9 @@ class TelegramNotifier:
             self.configure(token, chat_id, level)
         else:
             logger.info("Telegram не настроен (нет токена или chat_id в settings.json)")
+        
+        # Загружаем настройки для NTFY
+        ntfy_notifier.load_from_settings()
 
     def send(self, event_code: str, **kwargs) -> bool:
         """
@@ -270,9 +274,7 @@ class TelegramNotifier:
                           ticker="SBER",
                           reason="нет ликвидности")
         """
-        if not self._enabled:
-            return False
-
+        # Проверяем, нужно ли отправлять уведомление
         if not self._should_send(event_code):
             return False
 
@@ -294,22 +296,50 @@ class TelegramNotifier:
             logger.error(f"Ошибка форматирования шаблона [{event_code}]: {e}")
             return False
 
-        # Отправляем асинхронно — не блокируем основной поток
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_message(text), self._loop
-        )
-        future.add_done_callback(lambda f: self._on_send_done(f, event_code))
-        return True
+        # Отправляем в оба канала, если они включены
+        sent_anywhere = False
+        
+        # Отправка в Telegram
+        if self._enabled:
+            future = asyncio.run_coroutine_threadsafe(
+                self._send_message(text), self._loop
+            )
+            future.add_done_callback(lambda f: self._on_send_done(f, event_code))
+            sent_anywhere = True
+            
+        # Отправка в NTFY
+        if self._ntfy_enabled():
+            ntfy_success = ntfy_notifier.send(text)
+            if ntfy_success:
+                sent_anywhere = True
+
+        return sent_anywhere
 
     def send_raw(self, text: str) -> bool:
         """Отправляет произвольный текст без шаблона."""
-        if not self._enabled:
-            return False
-        future = asyncio.run_coroutine_threadsafe(
-            self._send_message(text), self._loop
-        )
-        future.add_done_callback(lambda f: self._on_send_done(f, "raw"))
-        return True
+        sent_anywhere = False
+        
+        # Отправка в Telegram
+        if self._enabled:
+            future = asyncio.run_coroutine_threadsafe(
+                self._send_message(text), self._loop
+            )
+            future.add_done_callback(lambda f: self._on_send_done(f, "raw"))
+            sent_anywhere = True
+            
+        # Отправка в NTFY
+        if self._ntfy_enabled():
+            ntfy_success = ntfy_notifier.send(text)
+            if ntfy_success:
+                sent_anywhere = True
+
+        return sent_anywhere
+
+    def _ntfy_enabled(self) -> bool:
+        """Проверяет, включена ли отправка в NTFY."""
+        # Загружаем настройки NTFY и проверяем, включена ли она
+        from core.storage import get_setting
+        return bool(get_setting("ntfy_enabled", False))
 
     async def test_connection(self) -> tuple[bool, str]:
         """
@@ -369,17 +399,29 @@ class TelegramNotifier:
 
     def _should_send(self, event_code: str) -> bool:
         """Проверяет нужно ли отправлять событие по явной настройке или уровню уведомлений."""
-        key = f"notify_{event_code}"
-        val = get_setting(key)
-        if val is not None:
-            return str(val).lower() == "true"
-
-        level = (self._level or NotificationLevel.ALL).lower()
-        if level == NotificationLevel.CRITICAL_ONLY:
-            return event_code in _CRITICAL_CODES
-        if level == NotificationLevel.ERRORS_ONLY:
-            return event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
-        return True
+        # Проверяем, включена ли отправка для этого типа уведомления хотя бы в одном из каналов
+        telegram_key = f"notify_telegram_{event_code}"
+        ntfy_key = f"notify_ntfy_{event_code}"
+        
+        # Получаем настройки для каждого канала
+        telegram_notify = get_setting(telegram_key)
+        ntfy_notify = get_setting(ntfy_key)
+        
+        # Если для какого-то канала настройка явно указана, используем её
+        telegram_enabled = self._enabled and (telegram_notify is None or str(telegram_notify).lower() == "true")
+        ntfy_enabled = self._ntfy_enabled() and (ntfy_notify is None or str(ntfy_notify).lower() == "true")
+        
+        # Отправляем, если хотя бы в одном канале разрешено
+        if telegram_enabled or ntfy_enabled:
+            # Также проверяем уровень уведомлений
+            level = (self._level or NotificationLevel.ALL).lower()
+            if level == NotificationLevel.CRITICAL_ONLY:
+                return event_code in _CRITICAL_CODES
+            if level == NotificationLevel.ERRORS_ONLY:
+                return event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
+            return True
+        
+        return False
 
 
 class _SafeDict(dict):
