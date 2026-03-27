@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFileDialog, QSpinBox,
     QDoubleSpinBox, QGroupBox, QProgressBar,
-    QMessageBox, QFrame, QScrollArea, QWidget,
+    QMessageBox, QFrame, QScrollArea, QWidget, QComboBox,
 )
 
 from core.backtest_engine import BacktestEngine, BacktestResult
@@ -256,7 +256,7 @@ class BacktestWindow(QDialog):
                 item.widget().deleteLater()
         self._param_widgets.clear()
 
-        SKIP = {"ticker"}  # нередактируемые в бэктесте
+        SKIP = {"ticker", "instruments"}  # нередактируемые/сложные в бэктесте
 
         for row_idx, (fname, meta) in enumerate(params_schema.items()):
             if fname in SKIP:
@@ -277,7 +277,7 @@ class BacktestWindow(QDialog):
                     meta.get("max", 99999)
                 )
                 widget.setValue(int(default))
-            else:
+            elif ftype in ("float", "commission"):
                 widget = QDoubleSpinBox()
                 widget.setRange(
                     float(meta.get("min", -99999)),
@@ -285,7 +285,30 @@ class BacktestWindow(QDialog):
                 )
                 widget.setDecimals(6)
                 widget.setSingleStep(0.001)
-                widget.setValue(float(default))
+                if default == "auto":
+                    widget.setValue(0.0)
+                else:
+                    widget.setValue(float(default))
+            elif ftype == "time":
+                widget = QSpinBox()
+                widget.setRange(0, 1439)
+                widget.setValue(int(default))
+            elif ftype in ("str", "select"):
+                widget = QComboBox()
+                if meta.get("options"):
+                    for idx, option in enumerate(meta.get("options", [])):
+                        label_text = meta.get("labels", meta.get("options", []))[idx]
+                        widget.addItem(str(label_text), option)
+                    current_idx = widget.findData(default)
+                    if current_idx >= 0:
+                        widget.setCurrentIndex(current_idx)
+                else:
+                    widget.addItem(str(default), default)
+            else:
+                logger.debug(
+                    f"[BacktestWindow] Параметр {fname} type={ftype} пропущен в UI бэктеста"
+                )
+                continue
 
             self._params_layout.addWidget(widget, row_idx, 1)
             self._param_widgets[fname] = widget
@@ -424,7 +447,11 @@ class BacktestWindow(QDialog):
         if hasattr(self._strategy_module, "get_params"):
             original = self._strategy_module.get_params()
             for fname, widget in self._param_widgets.items():
-                if fname in original:
+                if fname not in original:
+                    continue
+                if isinstance(widget, QComboBox):
+                    original[fname]["default"] = widget.currentData()
+                else:
                     original[fname]["default"] = widget.value()
             self._strategy_module.get_params = lambda: original
 
@@ -441,8 +468,8 @@ class BacktestWindow(QDialog):
         # Получаем board из параметров стратегии
         board = self._board
         # Пытаемся получить board из виджета параметров если есть
-        if "board" in self._param_widgets:
-            board = self._param_widgets["board"].currentText() or board
+        if "board" in self._param_widgets and isinstance(self._param_widgets["board"], QComboBox):
+            board = self._param_widgets["board"].currentData() or board
         
         self._worker = BacktestWorker(
             module, self._data_filepath, 

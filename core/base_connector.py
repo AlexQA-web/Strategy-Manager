@@ -3,6 +3,7 @@ import threading
 import time
 import math
 from typing import Callable, Optional
+from loguru import logger
 
 
 class BaseConnector(ABC):
@@ -143,8 +144,14 @@ class BaseConnector(ABC):
         """Запускает фоновый поток переподключения при обрыве.
 
         Идемпотентен: если поток уже запущен — повторный вызов игнорируется.
+        Перед запуском сбрасывает флаг _stop_reconnect для корректной работы
+        после планового отключения по расписанию.
         """
+        # Сбрасываем флаг перед запуском — это критично для работы после disconnect()
+        self._stop_reconnect.clear()
+        
         if hasattr(self, "_reconnect_thread") and self._reconnect_thread.is_alive():
+            logger.debug(f"[{self.__class__.__name__}] reconnect-loop уже запущен")
             return
         self._reconnect_thread = threading.Thread(
             target=self._reconnect_loop, daemon=True, name="reconnect-loop"
@@ -153,13 +160,24 @@ class BaseConnector(ABC):
 
     def _reconnect_loop(self):
         from loguru import logger
+        from core.scheduler import is_in_schedule
+
         name = self.__class__.__name__
+        connector_id = name.removesuffix('Connector').lower()
         attempt = 0
         while not self._stop_reconnect.is_set():
             time.sleep(2)
             if self.is_connected():
                 attempt = 0
                 continue
+
+            if not is_in_schedule(connector_id):
+                if attempt != 0:
+                    logger.info(f'[{name}] Вне окна расписания — счётчик переподключения сброшен')
+                    attempt = 0
+                self._stop_reconnect.wait(30)
+                continue
+
             if attempt >= self._reconnect_attempts:
                 logger.error(f"[{name}] Исчерпаны попытки переподключения")
                 self._fire(

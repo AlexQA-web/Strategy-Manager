@@ -115,6 +115,7 @@ class LiveEngine:
         self._entry_price: float = 0.0    # цена входа
         self._last_price: float = 0.0     # последняя цена (из последнего бара)
         self._point_cost: float = 1.0     # стоимость пункта в рублях
+        self._lot_size: int = 1           # размер лота для акций/ETF/облигаций
         self._running = False
         self._stop_event = threading.Event()
         self._last_bar_dt: Optional[datetime] = None
@@ -123,7 +124,7 @@ class LiveEngine:
         self._active_chase_orders: list = []  # активные chase-ордера для graceful shutdown
         self._chase_lock = threading.Lock()    # защита списка chase-ордеров
 
-        # Флаг for chase/limit-ордеров — не блокирует poll_loop
+        # Флаг активного лимитного ордера (limit/limit_price) — не блокирует poll_loop
         self._order_in_flight: bool = False
 
         # Circuit breaker для ошибок коннектора
@@ -220,7 +221,8 @@ class LiveEngine:
                     price=price,
                     order_role=order_role,
                     point_cost=self._point_cost,
-                    connector_id=self._connector_id
+                    connector_id=self._connector_id,
+                    lot_size=self._lot_size,
                 )
                 logger.debug(
                     f"[LiveEngine:{self._strategy_id}] Комиссия (авто): "
@@ -250,20 +252,29 @@ class LiveEngine:
           2. Иначе — берём point_cost напрямую от коннектора.
          """
         try:
-            if hasattr(self._connector, "get_sec_info"):
+            if hasattr(self._connector, 'get_sec_info'):
                sec_info = self._connector.get_sec_info(self._ticker, self._board)
                if sec_info:
-                    minstep = sec_info.get("minstep")
-                    pc_from_connector = float(sec_info.get("point_cost") or 1.0)
+                    minstep = sec_info.get('minstep')
+                    pc_from_connector = float(sec_info.get('point_cost') or 1.0)
+                    lot_size = sec_info.get('lotsize') or sec_info.get('lot_size') or 1
+                    try:
+                        self._lot_size = max(int(lot_size), 1)
+                    except (TypeError, ValueError):
+                        self._lot_size = 1
 
-                    # Приоритет 1: попробуем получить точное значение с MOEX API (для фьючерсов)
-                    if hasattr(self._connector, "get_moex_info"):
-                        moex_info = self._connector.get_moex_info(self._ticker, sec_type='futures')
-                        if moex_info and moex_info.get('point_cost'):
-                            self._point_cost = moex_info['point_cost']
+                    # Приоритет 1: попробуем получить точное значение с MOEX API
+                    if hasattr(self._connector, 'get_moex_info'):
+                        moex_sec_type = 'futures' if self._is_futures(self._ticker) else 'stock'
+                        moex_info = self._connector.get_moex_info(self._ticker, sec_type=moex_sec_type)
+                        if moex_info:
+                            if moex_info.get('point_cost'):
+                                self._point_cost = moex_info['point_cost']
+                            if moex_info.get('lot_size'):
+                                self._lot_size = max(int(moex_info['lot_size']), 1)
                             logger.info(
-                                f"[LiveEngine:{self._strategy_id}] point_cost={moex_info['point_cost']}"
-                                f" (из MOEX API для {self._ticker})"
+                                f'[LiveEngine:{self._strategy_id}] point_cost={self._point_cost} '
+                                f'lot_size={self._lot_size} (из MOEX API для {self._ticker})'
                             )
                             return
 
@@ -271,8 +282,9 @@ class LiveEngine:
                     if pc_from_connector > 0:
                         self._point_cost = pc_from_connector
                         logger.info(
-                            f"[LiveEngine:{self._strategy_id}] point_cost={pc_from_connector}"
-                            f" minstep={minstep}"
+                            f'[LiveEngine:{self._strategy_id}] point_cost={pc_from_connector}'
+                            f' minstep={minstep}'
+                            f' lot_size={self._lot_size}'
                             f" step_cost={round(pc_from_connector * float(minstep), 6) if minstep else 'n/a'}"
                         )
         except Exception as e:
@@ -839,18 +851,14 @@ class LiveEngine:
                             f"игнорируем {action.upper()}"
                         )
                         return
-                    
-                    # Для limit режима проверяем и устанавливаем флаг атомарно
-                    if self._order_mode == "limit":
-                        # Проверяем и устанавливаем флаг внутри той же критической секции
-                        # (ранее была вложенная блокировка _order_in_flight_lock, теперь - единая)
+
+                    if self._order_mode in ("limit", "limit_price"):
                         if self._order_in_flight:
                             logger.warning(
-                                f"[LiveEngine:{self._strategy_id}] Ордер уже в работе, "
+                                f"[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, "
                                 f"игнорируем {action.upper()}"
                             )
                             return
-                        # Устанавливаем флаг внутри критической секции
                         self._order_in_flight = True
 
                 if self._order_mode == "limit":
@@ -862,10 +870,25 @@ class LiveEngine:
                     self._execute_market(action, qty, comment, fill_price)
 
             elif action == "close":
-                # Читаем позицию под блокировкой
                 with self._position_lock:
+                    if self._position == 0 or self._position_qty == 0:
+                        logger.warning(
+                            f"[LiveEngine:{self._strategy_id}] Нет открытой позиции, игнорируем CLOSE"
+                        )
+                        return
+
+                    if self._order_mode in ("limit", "limit_price"):
+                        if self._order_in_flight:
+                            logger.warning(
+                                f"[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, "
+                                f"игнорируем CLOSE"
+                            )
+                            return
+                        self._order_in_flight = True
+
                     close_side = "sell" if self._position == 1 else "buy"
-                    close_qty = abs(self._position_qty) or qty
+                    close_qty = abs(self._position_qty)
+
                 if self._order_mode == "limit":
                     self._execute_chase(close_side, close_qty, comment, is_close=True)
                 elif self._order_mode == "limit_price":
@@ -887,6 +910,9 @@ class LiveEngine:
                     pass
 
         except Exception as e:
+            if self._order_mode in ("limit", "limit_price"):
+                with self._position_lock:
+                    self._order_in_flight = False
             logger.error(f"[LiveEngine:{self._strategy_id}] "
                          f"Ошибка исполнения {action}: {e}\n{traceback.format_exc()}")
 
@@ -896,15 +922,15 @@ class LiveEngine:
         Использует новый метод _calculate_commission() для расчета комиссии.
         Комиссия учитывается в order_history для расчёта net PnL через get_order_pairs().
         """
-        # Рассчитываем комиссию через новый метод (автоопределение типа инструмента)
-        # CommissionManager.calculate возвращает комиссию за весь объём, 
-        # но make_order ожидает commission за 1 лот (одна сторона)
+        # Рассчитываем комиссию через новый метод (автоопределение типа инструмента).
+        # Храним и legacy-значение руб/лот, и точную абсолютную комиссию за сторону.
         commission_rub = self._calculate_commission(self._ticker, qty, price)
-        commission_per_lot = commission_rub / qty if qty > 0 else commission_rub
+        commission_per_lot = commission_rub / abs(qty) if qty != 0 else 0
         
         logger.info(
             f"[LiveEngine:{self._strategy_id}] Запись сделки: {side.upper()} {self._ticker} "
-            f"x{qty} @ {price:.4f}, комиссия={commission_per_lot:.2f} руб/лот"
+            f"x{qty} @ {price:.4f}, комиссия={commission_rub:.2f} руб "
+            f"({commission_per_lot:.2f} руб/лот)"
         )
         
         try:
@@ -917,6 +943,7 @@ class LiveEngine:
                 board=self._board,
                 comment=comment,
                 commission=commission_per_lot,
+                commission_total=commission_rub,
                 point_cost=self._point_cost,
             )
             save_order(order)
@@ -1105,6 +1132,9 @@ class LiveEngine:
                 f"сторона={side.upper()} qty={qty} цена={price} "
                 f"вид=limit_price | {comment}"
             )
+            self._record_failure()
+            with self._position_lock:
+                self._order_in_flight = False
             return
 
         logger.info(f"[LiveEngine:{self._strategy_id}] "
@@ -1189,8 +1219,9 @@ class LiveEngine:
 
             time.sleep(1.0)
 
-        # Обновляем позицию по фактически исполненному объёму (под блокировкой)
+        # Обновляем позицию по фактически исполненному объёму и освобождаем in-flight флаг
         with self._position_lock:
+            self._order_in_flight = False
             if filled > 0:
                 if is_close:
                     if filled >= qty:

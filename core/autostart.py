@@ -8,10 +8,14 @@ def autoconnect_connectors():
     """Автоподключение коннекторов по расписанию."""
     from core.storage import get_bool_setting, get_all_schedules
     from core.connector_manager import connector_manager, register_connectors
+    from core.scheduler import strategy_scheduler
     from datetime import datetime, time as dtime
     
     # Регистрируем коннекторы (отложенная инициализация)
     register_connectors()
+    # Планировщик мог стартовать до регистрации коннекторов,
+    # поэтому после регистрации обязательно пересобираем cron-задачи.
+    strategy_scheduler.setup_connector_schedule()
 
     if not get_bool_setting("autoconnect"):
         return

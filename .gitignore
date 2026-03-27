@@ -34,6 +34,13 @@ data/order_history.json.bak
 data/equity/
 data/chart_cache/
 
+# Локальные секреты и пользовательские экспорты
+app_profile/secrets.local.json
+app_profile/secrets.local.json.bak
+app_profile/trading_manager_settings.json
+app_profile/trading_manager_settings.private.json
+!app_profile/trading_manager_settings.example.json
+
 # DLL брокера (не распространяется)
 txmlconnector.dll
 txmlconnector64.dll

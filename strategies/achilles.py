@@ -21,7 +21,8 @@ import threading
 _state_lock = threading.Lock()
 
 _reference_prices: dict[str, float] = {}
-_positions: dict[str, dict] = {}   # {ticker: {side, qty, board, status: "open"|"closing"}}
+_positions: dict[str, dict] = {}   # {ticker: {side, qty, board, status: "opening"|"open"|"closing"}}
+_pending_orders: dict[str, dict] = {}  # {ticker: {side, qty, board, status, mode, is_close}}
 _snapshot_done: bool = False
 _signal_done: bool = False
 _close_done: bool = False
@@ -29,10 +30,11 @@ _close_done: bool = False
 
 def reset_state():
     """Сбрасывает состояние стратегии. Вызывать при каждом перезапуске LiveEngine."""
-    global _reference_prices, _positions, _snapshot_done, _signal_done, _close_done
+    global _reference_prices, _positions, _pending_orders, _snapshot_done, _signal_done, _close_done
     with _state_lock:
         _reference_prices = {}
         _positions = {}
+        _pending_orders = {}
         _snapshot_done = False
         _signal_done = False
         _close_done = False
@@ -302,7 +304,8 @@ def _record_trade(
 
     logger.info(
         f"[Achilles] Запись сделки: {side.upper()} {ticker}x{qty} @{price:.4f} "
-        f"role={order_role} комиссия={commission_per_lot:.4f} руб/лот"
+        f"role={order_role} комиссия={commission_rub:.4f} руб "
+        f"({commission_per_lot:.4f} руб/лот)"
     )
 
     try:
@@ -316,6 +319,7 @@ def _record_trade(
             board=board,
             comment=comment,
             commission=commission_per_lot,
+            commission_total=commission_rub,
             point_cost=point_cost,
         )
         save_order(order)
@@ -389,8 +393,46 @@ def _place(connector, account_id: str, board: str, ticker: str,
             import threading
             from core.chase_order import ChaseOrder
 
+            with _state_lock:
+                pending = _pending_orders.get(ticker)
+                if pending is not None:
+                    logger.warning(
+                        f"[Achilles] {ticker}: уже есть активный лимитный ордер "
+                        f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
+                    )
+                    return False
+
+                if is_close:
+                    current = _positions.get(ticker)
+                    if current is None:
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
+                        return False
+                    if current.get("status") == "closing":
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
+                        return False
+                    current["status"] = "closing"
+                else:
+                    if ticker in _positions:
+                        logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
+                        return False
+                    _positions[ticker] = {
+                        "side": side,
+                        "qty": int(qty),
+                        "board": board,
+                        "status": "opening",
+                    }
+
+                _pending_orders[ticker] = {
+                    "side": side,
+                    "qty": int(qty),
+                    "board": board,
+                    "status": "closing" if is_close else "opening",
+                    "mode": order_mode,
+                    "is_close": is_close,
+                }
+
             def _run_chase():
-                global _positions  # Для доступа к глобальной переменной
+                global _positions, _pending_orders
                 chase = ChaseOrder(
                     connector=connector,
                     account_id=account_id,
@@ -410,8 +452,15 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         f"вид=limit_book(стакан) — ничего не исполнено за 60 сек"
                     )
                     with _state_lock:
-                        if is_close and ticker in _positions and _positions[ticker].get("status") == "closing":
-                            _positions[ticker]["status"] = "open"
+                        _pending_orders.pop(ticker, None)
+                        if is_close:
+                            current = _positions.get(ticker)
+                            if current is not None and current.get("status") == "closing":
+                                current["status"] = "open"
+                        else:
+                            current = _positions.get(ticker)
+                            if current is not None and current.get("status") == "opening":
+                                _positions.pop(ticker, None)
                 else:
                     logger.info(
                         f"[Achilles] Chase {side.upper()} {ticker}x{qty} "
@@ -426,6 +475,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
                             comment=f"limit_book chase avg={chase.avg_price:.4f}",
                         )
                     with _state_lock:
+                        _pending_orders.pop(ticker, None)
                         if is_close:
                             current = _positions.get(ticker)
                             if current is not None:
@@ -436,12 +486,19 @@ def _place(connector, account_id: str, board: str, ticker: str,
                                 else:
                                     _positions.pop(ticker, None)
                         else:
-                            _positions[ticker] = {
-                                "side": side,
-                                "qty": int(chase.filled_qty),
-                                "board": board,
-                                "status": "open",
-                            }
+                            current = _positions.get(ticker)
+                            if current is None:
+                                _positions[ticker] = {
+                                    "side": side,
+                                    "qty": int(chase.filled_qty),
+                                    "board": board,
+                                    "status": "open",
+                                }
+                            else:
+                                current["side"] = side
+                                current["qty"] = int(chase.filled_qty)
+                                current["board"] = board
+                                current["status"] = "open"
 
             t = threading.Thread(target=_run_chase, daemon=True,
                                  name=f"achilles-chase-{ticker}-{side}")
@@ -453,9 +510,47 @@ def _place(connector, account_id: str, board: str, ticker: str,
             import threading, time as _time
             from datetime import datetime as _dt
 
+            with _state_lock:
+                pending = _pending_orders.get(ticker)
+                if pending is not None:
+                    logger.warning(
+                        f"[Achilles] {ticker}: уже есть активный лимитный ордер "
+                        f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
+                    )
+                    return False
+
+                if is_close:
+                    current = _positions.get(ticker)
+                    if current is None:
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
+                        return False
+                    if current.get("status") == "closing":
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
+                        return False
+                    current["status"] = "closing"
+                else:
+                    if ticker in _positions:
+                        logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
+                        return False
+                    _positions[ticker] = {
+                        "side": side,
+                        "qty": int(qty),
+                        "board": board,
+                        "status": "opening",
+                    }
+
             price = _get_price(connector, board, ticker)
             if not price:
                 logger.warning(f"[Achilles] limit_price: нет цены для {ticker}, пропуск")
+                with _state_lock:
+                    if is_close:
+                        current = _positions.get(ticker)
+                        if current is not None and current.get("status") == "closing":
+                            current["status"] = "open"
+                    else:
+                        current = _positions.get(ticker)
+                        if current is not None and current.get("status") == "opening":
+                            _positions.pop(ticker, None)
                 return False
 
             tid = connector.place_order(
@@ -474,7 +569,27 @@ def _place(connector, account_id: str, board: str, ticker: str,
                     f"сторона={side.upper()} qty={qty} цена={price:.4f} "
                     f"вид=limit_price — ордер не выставлен"
                 )
+                with _state_lock:
+                    if is_close:
+                        current = _positions.get(ticker)
+                        if current is not None and current.get("status") == "closing":
+                            current["status"] = "open"
+                    else:
+                        current = _positions.get(ticker)
+                        if current is not None and current.get("status") == "opening":
+                            _positions.pop(ticker, None)
                 return False
+
+            with _state_lock:
+                _pending_orders[ticker] = {
+                    "side": side,
+                    "qty": int(qty),
+                    "board": board,
+                    "status": "closing" if is_close else "opening",
+                    "mode": order_mode,
+                    "is_close": is_close,
+                    "tid": tid,
+                }
 
             logger.info(f"[Achilles] LIMIT {side.upper()} {ticker}x{qty} @{price:.4f} tid={tid}")
 
@@ -483,6 +598,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
             CANCEL_MIN = TRADING_END_TIME_MIN
 
             def _monitor():
+                global _positions, _pending_orders
                 filled = 0
                 while True:
                     try:
@@ -522,7 +638,6 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         break
                     _time.sleep(1.0)
 
-                # После выхода из цикла — записываем сделку и чистим _positions
                 if filled > 0 and strategy_id:
                     _record_trade(
                         ticker=ticker, board=board, side=side,
@@ -532,6 +647,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         comment=f"limit_price tid={tid} filled={filled}/{qty}",
                     )
                 with _state_lock:
+                    _pending_orders.pop(ticker, None)
                     if is_close:
                         current = _positions.get(ticker)
                         if current is not None:
@@ -541,13 +657,25 @@ def _place(connector, account_id: str, board: str, ticker: str,
                                 current["status"] = "open"
                             else:
                                 _positions.pop(ticker, None)
-                    elif filled > 0:
-                        _positions[ticker] = {
-                            "side": side,
-                            "qty": int(filled),
-                            "board": board,
-                            "status": "open",
-                        }
+                    else:
+                        if filled > 0:
+                            current = _positions.get(ticker)
+                            if current is None:
+                                _positions[ticker] = {
+                                    "side": side,
+                                    "qty": int(filled),
+                                    "board": board,
+                                    "status": "open",
+                                }
+                            else:
+                                current["side"] = side
+                                current["qty"] = int(filled)
+                                current["board"] = board
+                                current["status"] = "open"
+                        else:
+                            current = _positions.get(ticker)
+                            if current is not None and current.get("status") == "opening":
+                                _positions.pop(ticker, None)
 
             t = threading.Thread(target=_monitor, daemon=True,
                                  name=f"achilles-lp-{ticker}-{tid}")
@@ -701,11 +829,8 @@ def _do_close_limit(connector, params: dict, account_id: str):
         if ok:
             logger.info(f"[Achilles] CLOSE LIMIT {ticker}")
             with _state_lock:
-                if ticker in _positions:
-                    if order_mode == "market":
-                        _positions.pop(ticker, None)
-                    else:
-                        _positions[ticker]["status"] = "closing"
+                if ticker in _positions and order_mode == "market":
+                    _positions.pop(ticker, None)
 
 
 def _do_close_market(connector, params: dict, account_id: str):
@@ -718,9 +843,6 @@ def _do_close_market(connector, params: dict, account_id: str):
         positions_snapshot = list(_positions.items())
 
     for ticker, pos in positions_snapshot:
-        if pos.get("status", "open") != "open":
-            logger.info(f"[Achilles] CLOSE MARKET {ticker} пропущен: статус={pos.get('status')}")
-            continue
         board      = pos.get("board", "TQBR")
         qty        = pos["qty"]
         close_side = "sell" if pos["side"] == "buy" else "buy"
@@ -745,6 +867,7 @@ def _do_close_market(connector, params: dict, account_id: str):
                         comment=f"close_market tid={tid}",
                     )
                 with _state_lock:
+                    _pending_orders.pop(ticker, None)
                     _positions.pop(ticker, None)
             else:
                 logger.error(f"[Achilles] CLOSE MARKET {ticker} — не удалось")

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QTime, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
+from ui.icons import apply_icon
 from loguru import logger
 from core.position_manager import position_manager  # для синхронизации
 
@@ -348,17 +349,41 @@ class StrategyWindow(QDialog):
 
         layout.addStretch()
 
-        self.btn_start = QPushButton("▶ Запустить")
+        self.btn_start = QPushButton('Запустить')
         self.btn_start.setObjectName("btn_start")
         self.btn_start.setFixedSize(110, 34)
+        apply_icon(self.btn_start, 'actions/play.svg', 16)
         self.btn_start.clicked.connect(self._start_strategy)
         layout.addWidget(self.btn_start)
 
-        self.btn_stop = QPushButton("■ Остановить")
+        self.btn_stop = QPushButton('Остановить')
         self.btn_stop.setObjectName("btn_stop")
         self.btn_stop.setFixedSize(110, 34)
+        apply_icon(self.btn_stop, 'actions/stop.svg', 16)
         self.btn_stop.clicked.connect(self._stop_strategy)
         layout.addWidget(self.btn_stop)
+
+        self.btn_backtest = QPushButton('Бэктест')
+        self.btn_backtest.setFixedSize(120, 34)
+        self.btn_backtest.setStyleSheet("""
+            QPushButton {
+                background-color: #94e2d5;
+                color: #1e1e2e;
+                border: none;
+                border-radius: 5px;
+                padding: 7px 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #7fd8c9;
+            }
+            QPushButton:pressed {
+                background-color: #6ccdbc;
+            }
+        """)
+        apply_icon(self.btn_backtest, 'actions/backtest.svg', 16)
+        self.btn_backtest.clicked.connect(self._open_backtest)
+        layout.addWidget(self.btn_backtest)
 
         return header
 
@@ -428,6 +453,19 @@ class StrategyWindow(QDialog):
         layout.addWidget(btn_save, alignment=Qt.AlignmentFlag.AlignRight)
 
         return tab
+
+    def _open_backtest(self):
+        from ui.backtest_window import BacktestWindow
+
+        file_path = self.data.get('file_path', '')
+        dlg = BacktestWindow(
+            strategy_id=self.sid,
+            strategy_file_path=file_path,
+            connector_id=self.data.get('connector', 'finam'),
+            board=self.data.get('board', 'TQBR'),
+            parent=self,
+        )
+        dlg.exec()
 
     def _on_connector_changed(self):
         """При смене коннектора обновляем счета и тикер-селектор."""

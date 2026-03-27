@@ -7,7 +7,14 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTime
 from loguru import logger
 
-from core.storage import get_setting, set_setting as save_setting, get_all_schedules, SCHEDULES_FILE, _write
+from core.storage import (
+    get_exportable_settings,
+    get_setting,
+    set_setting as save_setting,
+    get_all_schedules,
+    SCHEDULES_FILE,
+    _write,
+)
 from config.settings import APP_PROFILE_DIR
 from core.telegram_bot import notifier
 from core.scheduler import DAYS_RU
@@ -1038,50 +1045,53 @@ class _SettingsMixin:
         )
 
     def _export_settings(self):
-        """Сохраняет все настройки приложения в выбранный пользователем JSON-файл.
+        """Сохраняет публичные настройки приложения в выбранный пользователем JSON-файл.
 
         Бизнес-логика:
-          - Собирает settings.json + schedules.json + commission_config.json в единый словарь.
+          - Собирает settings.json без секретов + schedules.json + commission_config.json.
           - Открывает QFileDialog для выбора пути сохранения.
           - Записывает файл с отступами (indent=2) в UTF-8.
-          - Не перезаписывает рабочие файлы data/ — только экспорт.
+          - Не экспортирует токены, пароли, логины и идентификаторы счетов.
 
         Вызывается: кнопкой "Сохранить в файл" в панели кнопок _build_ui.
         """
         import json as _json
-        from core.storage import get_settings, get_all_schedules
+        from core.storage import get_all_schedules
         from core.commission_manager import commission_manager
         from core.instrument_classifier import instrument_classifier
 
-        # Собираем полный снимок настроек
         commission_data = dict(commission_manager.config)
-        commission_data["prefix_rules"] = dict(instrument_classifier.prefix_rules)
-        commission_data["manual_mapping"] = dict(instrument_classifier.manual_mapping)
+        commission_data['prefix_rules'] = dict(instrument_classifier.prefix_rules)
+        commission_data['manual_mapping'] = dict(instrument_classifier.manual_mapping)
 
         export_data = {
-            "settings":  get_settings(),
-            "schedules": get_all_schedules(),
-            "commissions": commission_data,
+            'settings': get_exportable_settings(),
+            'schedules': get_all_schedules(),
+            'commissions': commission_data,
         }
 
-        default_path = str(APP_PROFILE_DIR / "trading_manager_settings.json")
+        default_path = str(APP_PROFILE_DIR / 'trading_manager_settings.public.json')
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Сохранить настройки в файл",
+            'Сохранить настройки в файл',
             default_path,
-            "JSON файлы (*.json);;Все файлы (*)",
+            'JSON файлы (*.json);;Все файлы (*)',
         )
         if not path:
-            return  # пользователь отменил
+            return
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, 'w', encoding='utf-8') as f:
                 _json.dump(export_data, f, ensure_ascii=False, indent=2)
-            logger.info(f"Настройки экспортированы в {path}")
-            QMessageBox.information(self, "Экспорт настроек", f"Настройки сохранены в файл:\n{path}")
+            logger.info(f'Публичные настройки экспортированы в {path}')
+            QMessageBox.information(
+                self,
+                'Экспорт настроек',
+                f'Публичные настройки сохранены в файл:\n{path}\n\nСекреты в экспорт не включаются.',
+            )
         except OSError as e:
-            logger.error(f"Ошибка экспорта настроек: {e}")
-            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{e}")
+            logger.error(f'Ошибка экспорта настроек: {e}')
+            QMessageBox.critical(self, 'Ошибка', f'Не удалось сохранить файл:\n{e}')
 
     # ─────────────────────────────────────────────
     # Утилиты

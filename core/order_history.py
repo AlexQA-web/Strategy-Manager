@@ -1,9 +1,14 @@
 # core/order_history.py
 """
 Хранилище истории ордеров агентов.
-Каждый ордер содержит поле commission (руб/лот на одну сторону).
-При расчёте PnL пары комиссия вычитается за обе стороны (вход + выход):
-    net_pnl = gross_pnl - commission_per_lot * qty * 2
+
+Каждый ордер хранит:
+- commission: руб/лот на одну сторону (legacy, для обратной совместимости)
+- commission_total: абсолютная комиссия в рублях за всю исполненную сторону
+
+При расчёте PnL пары используется точная абсолютная комиссия:
+    net_pnl = gross_pnl - entry_commission_abs - exit_commission_abs
+
 Потребляется: LiveEngine (запись), UI (отображение), equity_tracker (realized PnL).
 
 NOTE: Race condition fix - добавлен _orders_lock для защиты read-modify-write цикла.
@@ -14,6 +19,7 @@ from datetime import datetime
 from typing import Optional
 from loguru import logger
 
+from core.moex_api import MOEXClient
 from core.storage import read_json, write_json, DATA_DIR
 
 # Lock для защиты race condition при одновременной записи ордеров от разных стратегий
@@ -36,22 +42,31 @@ def make_order(
     comment: str = "",
     commission: float = 0.0,  # комиссия в руб. на 1 лот (одна сторона)
     point_cost: float = 1.0,  # стоимость пункта в рублях
+    commission_total: float | None = None,  # абсолютная комиссия за всю сторону
 ) -> dict:
+    qty_abs = abs(int(quantity or 0))
+    commission_per_lot = float(commission or 0.0)
+    if commission_total is None:
+        commission_total = commission_per_lot * qty_abs
+    else:
+        commission_total = float(commission_total)
+
     return {
-        "id":           str(uuid.uuid4()),
-        "strategy_id":  strategy_id,
-        "ticker":       ticker,
-        "board":        board,
-        "side":         side,
-        "quantity":     quantity,
-        "price":        price,
-        "timestamp":    datetime.now().isoformat(),
-        "status":       "filled",
-        "comment":      comment,
-        "commission":   commission,  # руб/лот, одна сторона
-        "point_cost":   point_cost,  # стоимость пункта в рублях
-        "pnl":          None,   # Заполняется при закрытии
-        "pair_id":      None,   # ID ордера-открытия (для закрывающих ордеров)
+        "id":                 str(uuid.uuid4()),
+        "strategy_id":        strategy_id,
+        "ticker":             ticker,
+        "board":              board,
+        "side":               side,
+        "quantity":           quantity,
+        "price":              price,
+        "timestamp":          datetime.now().isoformat(),
+        "status":             "filled",
+        "comment":            comment,
+        "commission":         commission_per_lot,  # руб/лот, одна сторона (legacy)
+        "commission_total":   commission_total,    # руб за всю сторону
+        "point_cost":         point_cost,          # стоимость пункта в рублях
+        "pnl":                None,   # Заполняется при закрытии
+        "pair_id":            None,   # ID ордера-открытия (для закрывающих ордеров)
     }
 
 
@@ -110,10 +125,91 @@ def clear_orders(strategy_id: str):
         data.pop(strategy_id, None)
         _save(data)
 
+# ─────────────────────────────────────────────
+# Утилиты комиссии
+# ─────────────────────────────────────────────
+
+
+def get_order_commission_total(order: dict) -> float:
+    """Возвращает абсолютную комиссию ордера в рублях за всю сторону."""
+    if "commission_total" in order:
+        try:
+            return float(order.get("commission_total", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        per_lot = float(order.get("commission", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        per_lot = 0.0
+    qty_abs = abs(int(order.get("quantity", 0) or 0))
+    return per_lot * qty_abs
+
+
+def get_order_pnl_multiplier(order: dict) -> float:
+    """Возвращает денежный множитель для расчёта PnL по ордеру.
+
+    Для фьючерсов это point_cost, для акций/ETF/облигаций — lot_size.
+    Сначала используем явно сохранённый pnl_multiplier, затем пробуем
+    восстановить значение через MOEX API.
+    """
+    try:
+        explicit = float(order.get('pnl_multiplier', 0.0) or 0.0)
+        if explicit > 0:
+            return explicit
+    except (TypeError, ValueError):
+        pass
+
+    board = str(order.get('board', '') or '').upper()
+    ticker = str(order.get('ticker', '') or '').strip().upper()
+
+    if ticker:
+        try:
+            if 'FUT' in board or board == 'OPT':
+                info = MOEXClient.get_instrument_info(ticker, sec_type='futures')
+                if info and float(info.get('point_cost') or 0.0) > 0:
+                    return float(info['point_cost'])
+            else:
+                info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
+                if info and int(info.get('lot_size') or 0) > 0:
+                    return float(info['lot_size'])
+        except Exception:
+            pass
+
+    try:
+        point_cost = float(order.get('point_cost', 0.0) or 0.0)
+        if point_cost > 0:
+            return point_cost
+    except (TypeError, ValueError):
+        pass
+
+    return 1.0
+
+
+def get_total_commission(strategy_id: str) -> float:
+    """Возвращает накопленную общую комиссию по агенту."""
+    orders = get_orders(strategy_id)
+    total = sum(get_order_commission_total(order) for order in orders)
+    return round(total, 2)
+
+
+def get_open_commission(strategy_id: str) -> Optional[float]:
+    """Возвращает комиссию текущей открытой позиции по агенту.
+
+    Это фактически уже уплаченная комиссия по незакрытым остаткам FIFO.
+    Если открытой позиции нет — возвращает None.
+    """
+    pairs = get_order_pairs(strategy_id)
+    open_pairs = [p for p in pairs if p.get("close") is None]
+    if not open_pairs:
+        return None
+    total = sum(get_order_commission_total(p["open"]) for p in open_pairs)
+    return round(total, 2)
+
 
 # ─────────────────────────────────────────────
 # Сопоставление пар ордеров (открытие → закрытие)
 # ─────────────────────────────────────────────
+
 
 def get_order_pairs(strategy_id: str) -> list[dict]:
     """
@@ -131,6 +227,11 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
     NOTE: Защищено от race condition через _orders_lock, так как ранее
     get_orders() освобождала lock до окончания долгой обработки FIFO-цикла.
     """
+    def _slice_commission(total_commission: float, slice_qty: int, source_qty: int) -> float:
+        if total_commission <= 0 or slice_qty <= 0 or source_qty <= 0:
+            return 0.0
+        return total_commission * (slice_qty / source_qty)
+
     # Защищаем всю обработку lock-ом для избежания race condition
     with _orders_lock:
         data = _load()
@@ -143,12 +244,13 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
 
         for order in orders:
             side = order["side"]
-            qty  = order["quantity"]
+            qty = int(order["quantity"])
             remaining_qty = qty
+            remaining_commission_total = get_order_commission_total(order)
 
             while remaining_qty > 0 and open_queue:
                 open_order = open_queue[0]  # Берём самый старый ордер (FIFO)
-                open_qty = open_order["quantity"]
+                open_qty = int(open_order["quantity"])
 
                 if side == open_order["side"]:
                     # Та же сторона — пирамидинг/усреднение
@@ -160,41 +262,63 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
                 open_price = open_order["price"]
                 close_price = order["price"]
 
-                # Учитываем point_cost для фьючерсов
-                point_cost = open_order.get("point_cost", 1.0)
+                # Денежный множитель: для фьючерсов point_cost, для акций lot_size
+                pnl_multiplier = get_order_pnl_multiplier(open_order)
 
                 if is_long:
-                    gross_pnl = (close_price - open_price) * close_qty * point_cost
+                    gross_pnl = (close_price - open_price) * close_qty * pnl_multiplier
                 else:
-                    gross_pnl = (open_price - close_price) * close_qty * point_cost
+                    gross_pnl = (open_price - close_price) * close_qty * pnl_multiplier
 
-                # Комиссия: берём максимум из open/close ордера
-                commission_per_lot = max(
-                    float(open_order.get("commission", 0.0)),
-                    float(order.get("commission", 0.0)),
-                )
-                total_commission = commission_per_lot * close_qty * 2  # вход + выход
+                open_commission_total = get_order_commission_total(open_order)
+                entry_commission = _slice_commission(open_commission_total, close_qty, open_qty)
+                exit_commission = _slice_commission(remaining_commission_total, close_qty, remaining_qty)
+                total_commission = entry_commission + exit_commission
                 net_pnl = gross_pnl - total_commission
 
+                open_pair_order = {
+                    **open_order,
+                    "quantity": close_qty,
+                    "commission_total": entry_commission,
+                    "commission": entry_commission / close_qty if close_qty > 0 else 0.0,
+                }
+                close_pair_order = {
+                    **order,
+                    "quantity": close_qty,
+                    "commission_total": exit_commission,
+                    "commission": exit_commission / close_qty if close_qty > 0 else 0.0,
+                }
+
                 pairs.append({
-                    "open": open_order,
-                    "close": order,
+                    "open": open_pair_order,
+                    "close": close_pair_order,
+                    "quantity": close_qty,
                     "gross_pnl": round(gross_pnl, 4),
                     "commission": round(total_commission, 4),
+                    "entry_commission": round(entry_commission, 4),
+                    "exit_commission": round(exit_commission, 4),
                     "pnl": round(net_pnl, 4),
                     "is_long": is_long,
                 })
 
                 # Обновляем остатки
                 remaining_qty -= close_qty
+                remaining_commission_total -= exit_commission
                 if close_qty >= open_qty:
                     # Открывающий ордер полностью закрыт
                     open_queue.pop(0)
                 else:
-                    # Частичное закрытие — обновляем количество
+                    # Частичное закрытие — обновляем количество и остаток комиссии
+                    open_remaining_qty = open_qty - close_qty
+                    open_remaining_commission = open_commission_total - entry_commission
                     open_queue[0] = {
                         **open_order,
-                        "quantity": open_qty - close_qty,
+                        "quantity": open_remaining_qty,
+                        "commission_total": open_remaining_commission,
+                        "commission": (
+                            open_remaining_commission / open_remaining_qty
+                            if open_remaining_qty > 0 else 0.0
+                        ),
                     }
 
             # Если остаток не закрыт — добавляем в очередь
@@ -204,9 +328,19 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
                     open_queue.append({
                         **order,
                         "quantity": remaining_qty,
+                        "commission_total": remaining_commission_total,
+                        "commission": (
+                            remaining_commission_total / remaining_qty
+                            if remaining_qty > 0 else 0.0
+                        ),
                     })
                 else:
                     # Не был закрыт вообще — добавляем как есть
+                    if "commission_total" not in order:
+                        order = {
+                            **order,
+                            "commission_total": remaining_commission_total,
+                        }
                     open_queue.append(order)
 
         # Незакрытые позиции
@@ -244,3 +378,13 @@ def get_pnl_by_ticker(strategy_id: str) -> dict[str, Optional[float]]:
         ticker = p["open"]["ticker"]
         result.setdefault(ticker, []).append(p["pnl"])
     return {t: round(sum(v), 2) for t, v in result.items()}
+
+
+
+def get_closed_order_pairs(strategy_id: str, ticker: str | None = None) -> list[dict]:
+    """Возвращает только закрытые пары сделок, опционально по тикеру."""
+    pairs = [p for p in get_order_pairs(strategy_id) if p.get("close") is not None]
+    if ticker:
+        ticker_upper = ticker.upper()
+        pairs = [p for p in pairs if str(p.get("open", {}).get("ticker", "")).upper() == ticker_upper]
+    return pairs

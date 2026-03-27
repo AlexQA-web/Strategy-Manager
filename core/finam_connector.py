@@ -44,6 +44,10 @@ class FinamConnector(BaseConnector):
         self._processed_trades: dict = {}  # {tradeno: timestamp} для дедупликации
         self._processed_trades_lock = threading.Lock()  # Lock для защиты _processed_trades
         self._last_cleanup = time.time()  # Время последней очистки старых записей
+        self._sec_info_failures: dict[tuple[str, str], float] = {}  # {(ticker, board): monotonic_ts}
+        self._sec_info_failure_ttl = 300.0
+        self._error_throttle: dict[str, float] = {}  # {message: monotonic_ts}
+        self._error_throttle_ttl = 300.0
         # Для get_history — ожидание свечей из callback
         self._candles_event = threading.Event()
         self._candles_buffer: list[dict] = []
@@ -187,9 +191,12 @@ class FinamConnector(BaseConnector):
                 self._parse_client(root)
 
             elif tag == "error":
-                err_text = root.text or "Ошибка"
-                logger.error(f"[Finam] DLL error: {err_text}")
-                self._fire(self._on_error, err_text)
+                err_text = (root.text or "Ошибка").strip()
+                if self._should_emit_error(err_text):
+                    logger.error(f"[Finam] DLL error: {err_text}")
+                    self._fire(self._on_error, err_text)
+                else:
+                    logger.debug(f"[Finam] DLL error suppressed: {err_text}")
 
             elif tag == "trades":
                 self._parse_trades(root)
@@ -265,6 +272,50 @@ class FinamConnector(BaseConnector):
                         for f in ("minstep", "point_cost", "lotsize"):
                             if f in entry and f not in self._sec_info[ticker]:
                                 self._sec_info[ticker][f] = entry[f]
+    def _has_security_in_cache(self, ticker: str, board: str) -> bool:
+        """Проверяет, есть ли инструмент в уже загруженном кеше securities."""
+        market = self._BOARD_TO_MARKET.get(board, "1")
+        ticker = (ticker or '').strip().upper()
+        board = (board or '').strip().upper()
+        for sec in self._securities:
+            sec_ticker = str(sec.get('ticker', '')).strip().upper()
+            sec_board = str(sec.get('board', '')).strip().upper()
+            sec_market = str(sec.get('market', '')).strip()
+            if sec_ticker != ticker:
+                continue
+            if sec_board == board or sec_market == market:
+                return True
+        return False
+
+    def _remember_sec_info_failure(self, ticker: str, board: str):
+        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        self._sec_info_failures[key] = time.monotonic()
+
+    def _has_recent_sec_info_failure(self, ticker: str, board: str) -> bool:
+        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        ts = self._sec_info_failures.get(key)
+        if ts is None:
+            return False
+        if time.monotonic() - ts < self._sec_info_failure_ttl:
+            return True
+        self._sec_info_failures.pop(key, None)
+        return False
+
+    def _clear_sec_info_failure(self, ticker: str, board: str):
+        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        self._sec_info_failures.pop(key, None)
+
+    def _should_emit_error(self, err_text: str) -> bool:
+        now = time.monotonic()
+        last_ts = self._error_throttle.get(err_text)
+        if last_ts is not None and now - last_ts < self._error_throttle_ttl:
+            return False
+        self._error_throttle[err_text] = now
+        stale = [msg for msg, ts in self._error_throttle.items() if now - ts >= self._error_throttle_ttl]
+        for msg in stale:
+            self._error_throttle.pop(msg, None)
+        return True
+
     def _parse_positions(self, root):
         """Парсит позиции из callback (акции + фьючерсы)."""
         result = []
@@ -484,6 +535,11 @@ class FinamConnector(BaseConnector):
                     pass
         with self._sec_info_lock:
             self._sec_info[seccode] = info
+        board = ''
+        with self._sec_info_lock:
+            cached = self._sec_info.get(seccode, {})
+            board = str(cached.get('board', ''))
+        self._clear_sec_info_failure(seccode, board)
         self._sec_info_event.set()
 
     def _parse_sec_info_upd(self, root):
@@ -514,6 +570,11 @@ class FinamConnector(BaseConnector):
         TRANSAQ DLL часто возвращает некорректные данные (особенно point_cost и lotsize),
         поэтому MOEX данные используются как основной источник.
         """
+        ticker = (ticker or '').strip().upper()
+        board = (board or 'TQBR').strip().upper()
+        if not ticker:
+            return None
+
         # 1. Получаем данные из TRANSAQ (существующая логика)
         with self._sec_info_lock:
             cached = self._sec_info.get(ticker)
@@ -524,6 +585,15 @@ class FinamConnector(BaseConnector):
 
         if result is None:
             if not self._connected:
+                return None
+
+            if self._has_recent_sec_info_failure(ticker, board):
+                logger.debug(f'[Finam] get_sec_info suppressed for {ticker} board={board} after recent failure')
+                return None
+
+            if self._securities and not self._has_security_in_cache(ticker, board):
+                logger.debug(f'[Finam] get_sec_info skipped: {ticker} не найден в кеше securities для board={board}')
+                self._remember_sec_info_failure(ticker, board)
                 return None
 
             # Запрашиваем у DLL
@@ -537,17 +607,25 @@ class FinamConnector(BaseConnector):
             response = self._send_command(cmd)
             err = self._parse_error(response)
             if err:
-                logger.warning(f"[Finam] get_sec_info error: {err}")
+                self._remember_sec_info_failure(ticker, board)
+                logger.debug(f'[Finam] get_sec_info rejected for {ticker} board={board}: {err}')
                 return None
 
             # Ждём callback sec_info
             if not self._sec_info_event.wait(timeout=5):
-                logger.warning(f"[Finam] get_sec_info: таймаут {ticker}")
+                self._remember_sec_info_failure(ticker, board)
+                logger.debug(f'[Finam] get_sec_info timeout for {ticker} board={board}')
                 return None
 
             with self._sec_info_lock:
                 cached = self._sec_info.get(ticker)
                 result = dict(cached) if cached else None
+
+            if result is None:
+                self._remember_sec_info_failure(ticker, board)
+                return None
+
+            self._clear_sec_info_failure(ticker, board)
 
         if result is None:
             return None
@@ -947,6 +1025,14 @@ class FinamConnector(BaseConnector):
             response = self._send_command(cmd)
             err = self._parse_error(response)
             if err:
+                err_lc = err.lower()
+                if 'соединение уже установлено' in err_lc or 'connection already established' in err_lc:
+                    self._connected = True
+                    self._stop_reconnect.clear()
+                    self.start_reconnect_loop()
+                    logger.warning('[Finam] DLL сообщает, что соединение уже установлено — считаем коннектор подключённым')
+                    self._fire(self._on_connect)
+                    return True
                 logger.error(f"[Finam] Ошибка подключения: {err}")
                 self._fire(self._on_error, err)
                 return False

@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QIcon
+from ui.icons import apply_icon
 from loguru import logger
 
 from config.settings import APP_NAME, APP_VERSION
@@ -23,7 +24,10 @@ from core.telegram_bot import notifier
 from core.scheduler import strategy_scheduler
 from core.finam_connector import finam_connector
 from core.quik_connector  import quik_connector
-from core.order_history import get_total_pnl, get_pnl_by_ticker, clear_orders
+from core.order_history import (
+    get_total_pnl, get_pnl_by_ticker, get_open_commission,
+    get_total_commission, clear_orders,
+)
 
 # ─────────────────────────────────────────────
 # Тёмная тема
@@ -189,17 +193,20 @@ QTabBar::close-button:hover {
 # Колонки
 # ─────────────────────────────────────────────
 COLUMNS = [
-    ("Агент",       240),   # шире — под кнопки
-    ("Тикер",        80),
-    ("Счёт",        120),
-    ("Состояние",   120),
-    ("Позиция",      70),
-    ("П.Лот",        60),
-    ("Уч. цена",     90),
-    ("Текущая",      90),
-    ("П/У",          85),
-    ("Итог П/У",     95),   # нарастающий итог
-    ("📈",            44),
+    ("Агент",             240),   # шире — под кнопки
+    ("Тикер",              80),
+    ("Счёт",              120),
+    ("Состояние",         120),
+    ("Позиция",            70),
+    ("П.Лот",              60),
+    ("Уч. цена",           90),
+    ("Текущая",            90),
+    ("П/У",                85),
+    ("Комиссия",          100),
+    ("Итог П/У",           95),   # нарастающий итог
+    ("Итого комиссия",    120),
+    ("История ордеров",   110),
+    ("📈",                  44),
 ]
 
 COL = {name: i for i, (name, _) in enumerate(COLUMNS)}
@@ -223,7 +230,7 @@ ui_signals = UISignals()
 # ─────────────────────────────────────────────
 class AgentCellWidget(QWidget):
     def __init__(self, name: str, sid: str,
-                 on_start, on_stop, on_backtest, is_active: bool):  # ← on_backtest
+                 on_start, on_stop, is_active: bool):
         super().__init__()
         self.setAutoFillBackground(False)
 
@@ -236,8 +243,8 @@ class AgentCellWidget(QWidget):
         lbl.setToolTip(name)
         layout.addWidget(lbl, stretch=1)
 
-        # ▶ Запуск
-        btn_start = QPushButton("▶")
+        # Запуск
+        btn_start = QPushButton()
         btn_start.setFixedSize(32, 28)
         btn_start.setToolTip("Запустить агента")
         btn_start.setStyleSheet("""
@@ -250,12 +257,13 @@ class AgentCellWidget(QWidget):
             QPushButton:pressed { background: #72c07a; }
             QPushButton:disabled { background: #3a3a4a; color: #6c7086; }
         """)
+        apply_icon(btn_start, 'actions/play.svg', 16)
         btn_start.setEnabled(not is_active)
         btn_start.clicked.connect(lambda: on_start(sid))
         layout.addWidget(btn_start)
 
-        # ■ Стоп
-        btn_stop = QPushButton("■")
+        # Стоп
+        btn_stop = QPushButton()
         btn_stop.setFixedSize(32, 28)
         btn_stop.setToolTip("Остановить агента")
         btn_stop.setStyleSheet("""
@@ -268,25 +276,35 @@ class AgentCellWidget(QWidget):
             QPushButton:pressed { background: #c05070; }
             QPushButton:disabled { background: #3a3a4a; color: #6c7086; }
         """)
+        apply_icon(btn_stop, 'actions/stop.svg', 16)
         btn_stop.setEnabled(is_active)
         btn_stop.clicked.connect(lambda: on_stop(sid))
         layout.addWidget(btn_stop)
 
-        # 📊 Бэктест  ← НОВАЯ КНОПКА
-        btn_bt = QPushButton("📊")
-        btn_bt.setFixedSize(32, 28)
-        btn_bt.setToolTip("Бэктест стратегии")
-        btn_bt.setStyleSheet("""
-            QPushButton {
-                background: #313244; color: #cdd6f4;
-                border: none; border-radius: 3px;
-                font-size: 12px;
-            }
-            QPushButton:hover  { background: #89b4fa; color: #1e1e2e; }
-            QPushButton:pressed{ background: #74a8f5; }
-        """)
-        btn_bt.clicked.connect(lambda: on_backtest(sid))
-        layout.addWidget(btn_bt)
+
+
+class StatusCellWidget(QWidget):
+    def __init__(self, text: str, color: str):
+        super().__init__()
+        self.setAutoFillBackground(False)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(6, 0, 6, 0)
+        layout.setSpacing(6)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        dot = QFrame()
+        dot.setFixedSize(10, 10)
+        dot.setStyleSheet(
+            f'background: {color}; border: none; border-radius: 5px;'
+        )
+        layout.addWidget(dot)
+
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f'color: {color}; background: transparent;')
+        layout.addWidget(lbl)
+
+        self.setLayout(layout)
 
 
 # ─────────────────────────────────────────────
@@ -305,7 +323,7 @@ class TickerExpandWidget(QWidget):
         layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
 
-        self._btn = QPushButton("+")
+        self._btn = QPushButton()
         self._btn.setFixedSize(22, 22)
         self._btn.setToolTip("Развернуть/свернуть инструменты")
         self._btn.setStyleSheet("""
@@ -317,6 +335,7 @@ class TickerExpandWidget(QWidget):
             QPushButton:hover  { background: #f9a070; }
             QPushButton:pressed{ background: #e8905a; }
         """)
+        self.set_expanded(expanded)
         self._btn.clicked.connect(lambda: toggle_fn(sid))
         layout.addWidget(self._btn)
 
@@ -326,7 +345,7 @@ class TickerExpandWidget(QWidget):
         layout.addWidget(lbl, stretch=1)
 
     def set_expanded(self, expanded: bool):
-        self._btn.setText("−" if expanded else "+")
+        apply_icon(self._btn, 'actions/collapse.svg' if expanded else 'actions/expand.svg', 14)
 
 
 # ─────────────────────────────────────────────
@@ -952,18 +971,20 @@ class MainWindow(QMainWindow):
                 cur_price = f"{pos['current_price']:.3f}" if pos else "—"
                 pnl = pos["pnl"] if pos else None
 
-            # Нарастающий итог П/У — общий по стратегии
+            # Нарастающий итог П/У и комиссия — общие по стратегии
             total_pnl = get_total_pnl(sid)
+            open_commission = get_open_commission(sid)
+            total_commission = get_total_commission(sid)
 
             # Статус
             status_map = {
-                "active": ("🟢 Активен", "#a6e3a1"),
-                "stopped": ("🔴 Остановлен", "#f38ba8"),
-                "waiting": ("🟡 Ожидание", "#f9e2af"),
-                "error": ("🔥 Ошибка", "#fab387"),
+                "active": ("Активен", "#a6e3a1"),
+                "stopped": ("Остановлен", "#f38ba8"),
+                "waiting": ("Ожидание", "#f9e2af"),
+                "error": ("Ошибка", "#fab387"),
             }
             status_text, status_color = status_map.get(
-                status, ("⚫ Неизвестно", "#6c7086")
+                status, ("Неизвестно", "#6c7086")
             )
 
             center = Qt.AlignmentFlag.AlignCenter
@@ -983,7 +1004,6 @@ class MainWindow(QMainWindow):
                 name=name, sid=sid,
                 on_start=self._start_agent,
                 on_stop=self._stop_agent,
-                on_backtest=self._open_backtest,
                 is_active=is_active,
             )
             dummy = QTableWidgetItem()
@@ -1006,8 +1026,10 @@ class MainWindow(QMainWindow):
 
             self.table.setItem(row, COL["Счёт"],
                                cell(account_label, "#6c7086", center))
-            self.table.setItem(row, COL["Состояние"],
-                               cell(status_text, status_color, center))
+            status_dummy = QTableWidgetItem()
+            status_dummy.setData(Qt.ItemDataRole.UserRole, sid)
+            self.table.setItem(row, COL["Состояние"], status_dummy)
+            self.table.setCellWidget(row, COL["Состояние"], StatusCellWidget(status_text, status_color))
             self.table.setItem(row, COL["Позиция"],
                                cell(pos_qty, "#cdd6f4", center))
 
@@ -1071,6 +1093,14 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL["П/У"],
                                cell(pnl_str, pnl_color, center))
 
+            # Комиссия текущей позиции — уже уплаченная комиссия по открытому остатку
+            if open_commission is not None:
+                comm_color, comm_str = "#f9e2af", f"{open_commission:.2f}"
+            else:
+                comm_color, comm_str = "#6c7086", "—"
+            self.table.setItem(row, COL["Комиссия"],
+                               cell(comm_str, comm_color, center))
+
             # Итог П/У — общий по стратегии
             if total_pnl is not None:
                 tc = "#a6e3a1" if total_pnl >= 0 else "#f38ba8"
@@ -1080,17 +1110,38 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL["Итог П/У"],
                                cell(t_str, tc, center))
 
+            # Накопленная комиссия по агенту
+            total_commission_str = f"{total_commission:.2f}"
+            self.table.setItem(row, COL["Итого комиссия"],
+                               cell(total_commission_str, "#f9e2af", center))
+
+            # Кнопка истории ордеров
+            btn_history = QPushButton()
+            btn_history.setFixedSize(36, 26)
+            btn_history.setToolTip(f"История ордеров {name}")
+            btn_history.setStyleSheet("""
+                QPushButton {
+                    background: #f9e2af; border: none;
+                    border-radius: 4px; font-size: 14px;
+                }
+                QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
+            """)
+            apply_icon(btn_history, 'actions/history.svg', 16)
+            btn_history.clicked.connect(lambda _, s=sid: self._open_order_history(s))
+            self.table.setCellWidget(row, COL["История ордеров"], btn_history)
+
             # Кнопка чарта
-            btn_chart = QPushButton("📈")
+            btn_chart = QPushButton()
             btn_chart.setFixedSize(36, 26)
             btn_chart.setToolTip(f"График {ticker}")
             btn_chart.setStyleSheet("""
                 QPushButton {
-                    background: #313244; border: none;
+                    background: #89b4fa; border: none;
                     border-radius: 4px; font-size: 14px;
                 }
                 QPushButton:hover { background: #89b4fa; }
             """)
+            apply_icon(btn_chart, 'actions/chart.svg', 16)
             btn_chart.clicked.connect(lambda _, s=sid: self._open_chart(s))
             self.table.setCellWidget(row, COL["📈"], btn_chart)
 
@@ -1130,8 +1181,11 @@ class MainWindow(QMainWindow):
                     board_label = f"{t_ticker}" + (f" [{t_board}]" if t_board else "")
                     self.table.setItem(row, COL["Тикер"],
                                        child_cell(board_label, "#89b4fa", center))
-                    # Счёт, Состояние, Позиция, П.Лот, Уч.цена, Текущая — пусто
-                    for col_name in ("Счёт", "Состояние", "Позиция", "П.Лот", "Уч. цена", "Текущая", "П/У"):
+                    # Счёт, Состояние, Позиция, П.Лот, Уч.цена, Текущая, П/У, комиссии — пусто
+                    for col_name in (
+                        "Счёт", "Состояние", "Позиция", "П.Лот", "Уч. цена",
+                        "Текущая", "П/У", "Комиссия", "Итого комиссия",
+                    ):
                         self.table.setItem(row, COL[col_name], child_cell("—", "#45475a"))
 
                     # Итог П/У по тикеру
@@ -1144,17 +1198,35 @@ class MainWindow(QMainWindow):
                     self.table.setItem(row, COL["Итог П/У"],
                                        child_cell(tp_str, tp_color, center))
 
+                    # Кнопка истории ордеров для инструмента
+                    btn_child_history = QPushButton()
+                    btn_child_history.setFixedSize(36, 26)
+                    btn_child_history.setToolTip(f"История ордеров {t_ticker}")
+                    btn_child_history.setStyleSheet("""
+                        QPushButton {
+                            background: #f9e2af; border: none;
+                            border-radius: 4px; font-size: 14px;
+                        }
+                        QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
+                    """)
+                    apply_icon(btn_child_history, 'actions/history.svg', 16)
+                    btn_child_history.clicked.connect(
+                        lambda _, s=sid, t=t_ticker: self._open_order_history(s, t)
+                    )
+                    self.table.setCellWidget(row, COL["История ордеров"], btn_child_history)
+
                     # Кнопка чарта для инструмента
-                    btn_child_chart = QPushButton("📈")
+                    btn_child_chart = QPushButton()
                     btn_child_chart.setFixedSize(36, 26)
                     btn_child_chart.setToolTip(f"График {t_ticker}")
                     btn_child_chart.setStyleSheet("""
                         QPushButton {
-                            background: #313244; border: none;
+                            background: #89b4fa; border: none;
                             border-radius: 4px; font-size: 14px;
                         }
                         QPushButton:hover { background: #89b4fa; }
                     """)
+                    apply_icon(btn_child_chart, 'actions/chart.svg', 16)
                     btn_child_chart.clicked.connect(
                         lambda _, s=sid, t=t_ticker, b=t_board: self._open_chart_instrument(s, t, b)
                     )
@@ -1173,6 +1245,20 @@ class MainWindow(QMainWindow):
             strategy_id=strategy_id,
             strategy_file_path=file_path,
             parent=self
+        )
+        dlg.exec()
+
+    def _open_order_history(self, strategy_id: str, ticker: str | None = None):
+        from core.storage import get_strategy
+        from ui.order_history_window import OrderHistoryWindow
+
+        data = get_strategy(strategy_id) or {}
+        strategy_name = data.get('name', strategy_id)
+        dlg = OrderHistoryWindow(
+            strategy_id=strategy_id,
+            strategy_name=strategy_name,
+            ticker=ticker,
+            parent=self,
         )
         dlg.exec()
 
@@ -1244,8 +1330,8 @@ class MainWindow(QMainWindow):
         idx = self._tabs.addTab(chart, tab_label)
         self._chart_tabs[key] = idx
 
-        # Кастомная красная кнопка закрытия × для этой вкладки
-        btn_close = QPushButton("×")
+        # Кастомная кнопка закрытия вкладки
+        btn_close = QPushButton()
         btn_close.setFixedSize(18, 18)
         btn_close.setStyleSheet("""
             QPushButton {
@@ -1262,6 +1348,7 @@ class MainWindow(QMainWindow):
                 color: #1e1e2e;
             }
         """)
+        apply_icon(btn_close, 'actions/close.svg', 12)
         btn_close.setToolTip("Закрыть вкладку")
         btn_close.clicked.connect(lambda _, i=idx: self._close_tab_by_key(key))
         self._tabs.tabBar().setTabButton(idx, QTabBar.ButtonPosition.RightSide, btn_close)

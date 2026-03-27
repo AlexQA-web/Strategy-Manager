@@ -13,6 +13,7 @@ from typing import Optional
 from loguru import logger
 
 from core.instrument_classifier import instrument_classifier
+from core.moex_api import MOEXClient
 
 
 class CommissionManager:
@@ -27,8 +28,8 @@ class CommissionManager:
         broker_part = broker_futures_rub × quantity
         итог = moex_part + broker_part
     
-    Для акций:
-        trade_value = price × quantity
+    Для акций / облигаций / ETF:
+        trade_value = price × lot_size × quantity
         moex_part = trade_value × moex_taker_pct / 100
         broker_part = trade_value × broker_stock_pct / 100
         итог = moex_part + broker_part
@@ -118,9 +119,10 @@ class CommissionManager:
         board: str,
         quantity: float,
         price: float,
-        order_role: str = "taker",
+        order_role: str = 'taker',
         point_cost: Optional[float] = None,
-        connector_id: str = "transaq"
+        connector_id: str = 'transaq',
+        lot_size: Optional[int] = None,
     ) -> float:
         """
         Рассчитывает комиссию за одну сторону сделки.
@@ -133,6 +135,8 @@ class CommissionManager:
             order_role: Роль ордера ("taker" или "maker")
             point_cost: Стоимость пункта (для фьючерсов)
             connector_id: ID коннектора ("transaq" или "quik")
+            lot_size: Размер лота для акций/облигаций/ETF; если None, пытаемся
+                      определить автоматически
         
         Returns:
             Комиссия в рублях за одну сторону
@@ -165,19 +169,23 @@ class CommissionManager:
                         f"trade_value={trade_value:.2f}, moex={moex_part:.2f}, "
                         f"broker={broker_part:.2f}, total={total:.2f}")
         else:
-            # Для акций/облигаций/ETF
-            trade_value = price * quantity
+            # Для акций/облигаций/ETF quantity приходит в лотах,
+            # поэтому комиссия должна считаться от полной денежной суммы сделки.
+            resolved_lot_size = self._resolve_lot_size(ticker, board, lot_size)
+            trade_value = price * quantity * resolved_lot_size
             moex_part = trade_value * moex_pct / 100
             
             # Получаем процентную ставку брокера в зависимости от коннектора
-            broker_pct = broker_config.get(f"{instrument_type}_pct", 0.04)
+            broker_pct = broker_config.get(f'{instrument_type}_pct', 0.04)
             broker_part = trade_value * broker_pct / 100
             
             total = moex_part + broker_part
             
-            logger.debug(f"[CommissionManager] {ticker}: stock, connector={connector_id}, "
-                        f"trade_value={trade_value:.2f}, moex={moex_part:.2f}, "
-                        f"broker={broker_part:.2f}, total={total:.2f}")
+            logger.debug(
+                f'[CommissionManager] {ticker}: stock, connector={connector_id}, '
+                f'lot_size={resolved_lot_size}, trade_value={trade_value:.2f}, '
+                f'moex={moex_part:.2f}, broker={broker_part:.2f}, total={total:.2f}'
+            )
         
         return total
     
@@ -187,9 +195,10 @@ class CommissionManager:
         board: str,
         quantity: float,
         price: float,
-        order_role: str = "taker",
+        order_role: str = 'taker',
         point_cost: Optional[float] = None,
-        connector_id: str = "transaq"
+        connector_id: str = 'transaq',
+        lot_size: Optional[int] = None,
     ) -> dict:
         """
         Возвращает детализированный расчёт комиссии.
@@ -202,6 +211,7 @@ class CommissionManager:
             order_role: Роль ордера ("taker" или "maker")
             point_cost: Стоимость пункта (для фьючерсов)
             connector_id: ID коннектора ("transaq" или "quik")
+            lot_size: Размер лота для акций/облигаций/ETF
         
         Returns:
             Словарь с детализацией расчёта
@@ -243,28 +253,30 @@ class CommissionManager:
                 "connector_id": connector_id
             }
         else:
-            # Для акций/облигаций/ETF
-            trade_value = price * quantity
+            # Для акций/облигаций/ETF quantity приходит в лотах.
+            resolved_lot_size = self._resolve_lot_size(ticker, board, lot_size)
+            trade_value = price * quantity * resolved_lot_size
             moex_rub = trade_value * moex_pct / 100
             
             # Получаем процентную ставку брокера в зависимости от коннектора
-            broker_pct = broker_config.get(f"{instrument_type}_pct", 0.04)
+            broker_pct = broker_config.get(f'{instrument_type}_pct', 0.04)
             broker_rub = trade_value * broker_pct / 100
             
             total_one_side = moex_rub + broker_rub
             
             return {
-                "instrument_type": instrument_type,
-                "is_futures": False,
-                "trade_value": trade_value,
-                "moex_pct": moex_pct,
-                "moex_rub": moex_rub,
-                "broker_rub": broker_rub,
-                "broker_pct": broker_pct,
-                "total_one_side": total_one_side,
-                "total_roundtrip": total_one_side * 2,
-                "order_role": order_role,
-                "connector_id": connector_id
+                'instrument_type': instrument_type,
+                'is_futures': False,
+                'trade_value': trade_value,
+                'lot_size': resolved_lot_size,
+                'moex_pct': moex_pct,
+                'moex_rub': moex_rub,
+                'broker_rub': broker_rub,
+                'broker_pct': broker_pct,
+                'total_one_side': total_one_side,
+                'total_roundtrip': total_one_side * 2,
+                'order_role': order_role,
+                'connector_id': connector_id
             }
     
     def effective_rate_pct(
@@ -305,10 +317,32 @@ class CommissionManager:
             broker_pct = broker_config.get(f"{instrument_type}_pct", 0.04)
             return moex_pct + broker_pct
     
+    def _resolve_lot_size(self, ticker: str, board: str, lot_size: Optional[int]) -> int:
+        """Возвращает размер лота для акций/облигаций/ETF."""
+        if lot_size is not None:
+            try:
+                parsed = int(lot_size)
+                if parsed > 0:
+                    return parsed
+            except (TypeError, ValueError):
+                pass
+
+        try:
+            moex_info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
+            if moex_info:
+                parsed = int(moex_info.get('lot_size') or 1)
+                if parsed > 0:
+                    return parsed
+        except Exception as e:
+            logger.debug(f'[CommissionManager] lot_size lookup error for {ticker}.{board}: {e}')
+
+        logger.debug(f'[CommissionManager] lot_size for {ticker}.{board} not found, используем 1')
+        return 1
+
     def _get_moex_rate(self, instrument_type: str, order_role: str) -> float:
         """Получает ставку MOEX для типа инструмента и роли ордера."""
-        role_key = "maker_pct" if order_role == "maker" else "taker_pct"
-        return self.config.get("moex", {}).get(role_key, {}).get(instrument_type, 0.0)
+        role_key = 'maker_pct' if order_role == 'maker' else 'taker_pct'
+        return self.config.get('moex', {}).get(role_key, {}).get(instrument_type, 0.0)
 
     def _get_broker_config(self, connector_id: str) -> dict:
         """Возвращает конфиг брокера по ID коннектора.
