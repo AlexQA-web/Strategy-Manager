@@ -43,6 +43,8 @@ def make_order(
     commission: float = 0.0,  # комиссия в руб. на 1 лот (одна сторона)
     point_cost: float = 1.0,  # стоимость пункта в рублях
     commission_total: float | None = None,  # абсолютная комиссия за всю сторону
+    exec_key: str = "",
+    source: str = "",
 ) -> dict:
     qty_abs = abs(int(quantity or 0))
     commission_per_lot = float(commission or 0.0)
@@ -67,6 +69,8 @@ def make_order(
         "point_cost":         point_cost,          # стоимость пункта в рублях
         "pnl":                None,   # Заполняется при закрытии
         "pair_id":            None,   # ID ордера-открытия (для закрывающих ордеров)
+        "exec_key":           str(exec_key or ""),
+        "source":             str(source or ""),
     }
 
 
@@ -90,6 +94,12 @@ def save_order(order: dict):
         strategy_id = order["strategy_id"]
         if strategy_id not in data:
             data[strategy_id] = []
+        exec_key = str(order.get("exec_key", "") or "")
+        if exec_key:
+            for existing in data[strategy_id]:
+                if str(existing.get("exec_key", "") or "") == exec_key:
+                    logger.debug(f"[{strategy_id}] duplicate execution ignored: exec_key={exec_key}")
+                    return
         data[strategy_id].append(order)
         _save(data)
     logger.debug(
@@ -388,3 +398,4 @@ def get_closed_order_pairs(strategy_id: str, ticker: str | None = None) -> list[
         ticker_upper = ticker.upper()
         pairs = [p for p in pairs if str(p.get("open", {}).get("ticker", "")).upper() == ticker_upper]
     return pairs
+

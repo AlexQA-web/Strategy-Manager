@@ -275,6 +275,7 @@ def _record_trade(
     strategy_id: str,
     connector_id: str,
     comment: str = "",
+    order_ref: str = "",
 ):
     """Записывает исполненную сделку в order_history.json и trades_history.json.
 
@@ -321,6 +322,11 @@ def _record_trade(
             commission=commission_per_lot,
             commission_total=commission_rub,
             point_cost=point_cost,
+            exec_key=(
+                f"achilles:{strategy_id}:{ticker}:{order_role}:{order_ref}:{side}:{qty}:{round(float(price), 8)}"
+                if order_ref else ""
+            ),
+            source="achilles_execute_signal",
         )
         save_order(order)
     except Exception as e:
@@ -378,6 +384,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         price=price, order_role="taker",
                         strategy_id=strategy_id, connector_id=connector_id,
                         comment=f"market tid={tid}",
+                        order_ref=str(tid),
                     )
                 return True
             else:
@@ -645,6 +652,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         order_role="maker",
                         strategy_id=strategy_id, connector_id=connector_id,
                         comment=f"limit_price tid={tid} filled={filled}/{qty}",
+                        order_ref=str(tid),
                     )
                 with _state_lock:
                     _pending_orders.pop(ticker, None)
@@ -865,6 +873,7 @@ def _do_close_market(connector, params: dict, account_id: str):
                         price=price, order_role="taker",
                         strategy_id=strategy_id, connector_id=connector_id,
                         comment=f"close_market tid={tid}",
+                        order_ref=str(tid),
                     )
                 with _state_lock:
                     _pending_orders.pop(ticker, None)

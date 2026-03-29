@@ -1,4 +1,4 @@
-import ctypes
+﻿import ctypes
 import platform
 import threading
 import time
@@ -1027,12 +1027,20 @@ class FinamConnector(BaseConnector):
             if err:
                 err_lc = err.lower()
                 if 'соединение уже установлено' in err_lc or 'connection already established' in err_lc:
-                    self._connected = True
+                    # Server may still reject commands in this state.
+                    # Keep connector disconnected until server_status=true callback.
+                    self._connected = False
+                    try:
+                        self._send_command('<command id="disconnect"/>')
+                    except Exception:
+                        pass
                     self._stop_reconnect.clear()
                     self.start_reconnect_loop()
-                    logger.warning('[Finam] DLL сообщает, что соединение уже установлено — считаем коннектор подключённым')
-                    self._fire(self._on_connect)
-                    return True
+                    logger.warning(
+                        '[Finam] DLL reports already-established session; running soft-disconnect and waiting '
+                        'for server_status=true'
+                    )
+                    return False
                 logger.error(f"[Finam] Ошибка подключения: {err}")
                 self._fire(self._on_error, err)
                 return False
@@ -1321,8 +1329,8 @@ class FinamConnector(BaseConnector):
             self._candles_event.set()
             return
 
-        # Для get_history (синхронный запрос) — всегда обновляем буфер
-        self._candles_buffer = rows
+        # For synchronous get_history, keep a copy to avoid callback-side mutation.
+        self._candles_buffer = [dict(r) for r in rows]
         self._candles_event.set()
 
         # Вызываем зарегистрированные callbacks для (seccode, period)
@@ -1333,9 +1341,22 @@ class FinamConnector(BaseConnector):
             if cbs:
                 for cb in cbs:
                     try:
-                        cb(rows, status)
+                        cb([dict(r) for r in rows], status)
                     except Exception as e:
                         logger.error(f"[Finam] candle callback error ({seccode}): {e}")
+
+    @staticmethod
+    def _parse_candle_dt(row: dict) -> Optional[datetime]:
+        date_str = str(row.get("date", "") or row.get("datetime", "")).strip()
+        if not date_str:
+            return None
+        try:
+            return datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S.%f")
+        except ValueError:
+            try:
+                return datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S")
+            except ValueError:
+                return None
 
     def get_history(self, ticker: str, board: str,
                     period: str, days: int):
@@ -1381,15 +1402,20 @@ class FinamConnector(BaseConnector):
             if not rows:
                 return None
 
+            normalized_rows = []
             for r in rows:
-                date_str = r.pop("date")
-                # DLL может прислать дату с миллисекундами или без
-                try:
-                    r["datetime"] = datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S.%f")
-                except ValueError:
-                    r["datetime"] = datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S")
+                row = dict(r)
+                dt = self._parse_candle_dt(row)
+                if dt is None:
+                    continue
+                row["datetime"] = dt
+                normalized_rows.append(row)
 
-            df = pd.DataFrame(rows)
+            if not normalized_rows:
+                logger.warning(f"[Finam] get_history: no valid candle datetime for {ticker}")
+                return None
+
+            df = pd.DataFrame(normalized_rows)
             df.rename(columns={
                 "open": "Open", "high": "High",
                 "low": "Low", "close": "Close", "volume": "Volume",
@@ -1454,14 +1480,20 @@ class FinamConnector(BaseConnector):
         if not rows:
             return None
 
+        normalized_rows = []
         for r in rows:
-            date_str = r.pop("date")
-            try:
-                r["datetime"] = datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S.%f")
-            except ValueError:
-                r["datetime"] = datetime.strptime(date_str, "%d.%m.%Y %H:%M:%S")
+            row = dict(r)
+            dt = self._parse_candle_dt(row)
+            if dt is None:
+                continue
+            row["datetime"] = dt
+            normalized_rows.append(row)
 
-        df = pd.DataFrame(rows)
+        if not normalized_rows:
+            logger.warning(f"[Finam] _get_history_via_subscribe: no valid candle datetime for {ticker}")
+            return None
+
+        df = pd.DataFrame(normalized_rows)
         df.rename(columns={
             "open": "Open", "high": "High",
             "low": "Low", "close": "Close", "volume": "Volume",

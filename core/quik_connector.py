@@ -1,7 +1,7 @@
 import threading
 import time
 import re
-from typing import Optional
+from typing import Callable, Optional
 from loguru import logger
 
 from core.base_connector import BaseConnector
@@ -23,7 +23,12 @@ class QuikConnector(BaseConnector):
         self._connected = False
         self._client    = None
         self._lock      = threading.Lock()
+        self._connector_id = CONNECTOR_ID
         self.moex_client = MOEXClient()
+        self._watch_lock = threading.Lock()
+        self._order_watchers: dict[str, list[Callable]] = {}
+        self._watch_threads: dict[str, threading.Thread] = {}
+        self._terminal_statuses = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
 
     # ── Подключение ─────────────────────────────────────────────────────
 
@@ -176,6 +181,176 @@ class QuikConnector(BaseConnector):
         except Exception as e:
             logger.error(f"[QUIK] cancel_order error: {e}")
             return False
+
+    @staticmethod
+    def _to_int(value, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+    def _fetch_orders(self) -> list[dict]:
+        if not self._connected or not self._client:
+            return []
+        for method_name in ("get_orders", "get_all_orders"):
+            method = getattr(self._client, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                with self._lock:
+                    result = method()
+                rows = result.get("data", [])
+                if isinstance(rows, list):
+                    return rows
+            except Exception as e:
+                logger.debug(f"[QUIK] {method_name} error: {e}")
+        return []
+
+    def _map_order_status(self, raw: str) -> str:
+        status = (raw or "").strip().lower()
+        if status in ("matched", "filled", "executed"):
+            return "matched"
+        if status in ("cancelled", "canceled", "killed"):
+            return "canceled"
+        if status in ("rejected", "denied"):
+            return "denied"
+        if status in ("working", "active", "open"):
+            return "working"
+        return status or "working"
+
+    def get_order_status(self, transaction_id: str) -> Optional[dict]:
+        if not self._connected or not self._client or not transaction_id:
+            return None
+
+        tid = str(transaction_id)
+        orders = self._fetch_orders()
+        order = next(
+            (
+                row for row in orders
+                if str(
+                    row.get("trans_id")
+                    or row.get("transid")
+                    or row.get("transaction_id")
+                    or row.get("TRANS_ID")
+                    or ""
+                ) == tid
+            ),
+            None,
+        )
+        if not order:
+            return None
+
+        quantity = self._to_int(
+            order.get("qty")
+            or order.get("quantity")
+            or order.get("QUANTITY")
+            or order.get("order_qty"),
+            0,
+        )
+        balance = self._to_int(
+            order.get("balance")
+            or order.get("BALANCE")
+            or order.get("qty_left")
+            or quantity,
+            quantity,
+        )
+        status = self._map_order_status(
+            str(order.get("status") or order.get("state") or order.get("STATUS") or "")
+        )
+
+        # Fallback на флаги QUIK, если явного статуса нет.
+        if status == "working":
+            flags = self._to_int(order.get("flags"), 0)
+            if quantity > 0 and balance <= 0:
+                status = "matched"
+            elif flags & 0b10:
+                status = "canceled"
+            elif flags & 0b1:
+                status = "working"
+
+        return {
+            "status": status,
+            "quantity": quantity,
+            "balance": max(0, balance),
+        }
+
+    def watch_order(self, transaction_id: str, callback: Callable):
+        tid = str(transaction_id)
+        if not tid or not callable(callback):
+            return
+
+        with self._watch_lock:
+            callbacks = self._order_watchers.setdefault(tid, [])
+            if callback not in callbacks:
+                callbacks.append(callback)
+
+            thread = self._watch_threads.get(tid)
+            if thread and thread.is_alive():
+                return
+
+            watcher = threading.Thread(
+                target=self._watch_order_loop,
+                args=(tid,),
+                daemon=True,
+                name=f"quik-watch-{tid}",
+            )
+            self._watch_threads[tid] = watcher
+            watcher.start()
+
+    def unwatch_order(self, transaction_id: str, callback: Callable):
+        tid = str(transaction_id)
+        with self._watch_lock:
+            callbacks = self._order_watchers.get(tid)
+            if not callbacks:
+                return
+            self._order_watchers[tid] = [cb for cb in callbacks if cb is not callback]
+            if not self._order_watchers[tid]:
+                self._order_watchers.pop(tid, None)
+
+    def _watch_order_loop(self, transaction_id: str):
+        tid = str(transaction_id)
+        last_payload: Optional[tuple[str, int, int]] = None
+        started_at = time.monotonic()
+
+        while self._connected:
+            with self._watch_lock:
+                callbacks = list(self._order_watchers.get(tid, []))
+            if not callbacks:
+                break
+
+            info = None
+            try:
+                info = self.get_order_status(tid)
+            except Exception as e:
+                logger.debug(f"[QUIK] watch_order get_order_status tid={tid}: {e}")
+
+            if info:
+                payload = (
+                    str(info.get("status", "")),
+                    self._to_int(info.get("quantity")),
+                    self._to_int(info.get("balance")),
+                )
+                if payload != last_payload:
+                    last_payload = payload
+                    for cb in callbacks:
+                        try:
+                            cb(tid, info)
+                        except Exception as e:
+                            logger.debug(f"[QUIK] watch_order callback error tid={tid}: {e}")
+
+                if info.get("status") in self._terminal_statuses:
+                    break
+            elif time.monotonic() - started_at > 45:
+                # Защита от вечного monitor-loop, если ордер уже исчез из таблиц.
+                break
+
+            time.sleep(0.25)
+
+        with self._watch_lock:
+            self._order_watchers.pop(tid, None)
+            self._watch_threads.pop(tid, None)
 
     def close_position(
         self,

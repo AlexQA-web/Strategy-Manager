@@ -394,19 +394,23 @@ def get_strategy(strategy_id: str) -> Optional[dict]:
 
 
 def save_strategy(strategy_id: str, data: dict):
-    strategies = get_all_strategies()
-    strategies[strategy_id] = data
-    _write(STRATEGIES_FILE, strategies)
+    with _write_lock:
+        strategies = _read(STRATEGIES_FILE, use_cache=False)
+        if not isinstance(strategies, dict):
+            strategies = {}
+        strategies[strategy_id] = data
+        _write_unsafe(STRATEGIES_FILE, strategies)
 
 
 def delete_strategy(strategy_id: str) -> bool:
-    strategies = get_all_strategies()
-    if strategy_id not in strategies:
-        return False
-    del strategies[strategy_id]
-    _write(STRATEGIES_FILE, strategies)
-    logger.info(f'Стратегия {strategy_id} удалена')
-    return True
+    with _write_lock:
+        strategies = _read(STRATEGIES_FILE, use_cache=False)
+        if not isinstance(strategies, dict) or strategy_id not in strategies:
+            return False
+        del strategies[strategy_id]
+        _write_unsafe(STRATEGIES_FILE, strategies)
+        logger.info(f'Стратегия {strategy_id} удалена')
+        return True
 
 
 # ── Расписания коннекторов ─────────────────────────────────────────────────────

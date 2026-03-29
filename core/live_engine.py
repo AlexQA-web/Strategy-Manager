@@ -132,6 +132,11 @@ class LiveEngine:
         self._last_failure_time: float = 0.0   # время последней ошибки
         self._CIRCUIT_BREAKER_THRESHOLD = 3   # порог для остановки
         self._CIRCUIT_BREAKER_TIMEOUT = 60.0   # таймаут сброса счётчика (сек)
+        
+        self._reconcile_interval_sec = 60.0
+        self._reconcile_alert_cooldown_sec = 300.0
+        self._last_reconcile_ts = 0.0
+        self._last_reconcile_alert_ts = 0.0
 
     def _record_failure(self):
         """Регистрирует ошибку для circuit breaker."""
@@ -543,6 +548,80 @@ class LiveEngine:
             pass
         return 0.0
 
+    def _get_open_qty_from_history(self) -> int:
+        """Return signed open qty from order_history for current ticker."""
+        try:
+            pairs = get_order_pairs(self._strategy_id)
+            total = 0
+            for pair in pairs:
+                if pair.get("close") is not None:
+                    continue
+                open_order = pair.get("open") or {}
+                if str(open_order.get("ticker", "")) != self._ticker:
+                    continue
+                qty = int(open_order.get("quantity", 0) or 0)
+                side = str(open_order.get("side", ""))
+                total += qty if side == "buy" else -qty
+            return int(total)
+        except Exception:
+            return 0
+
+    def _send_reconcile_alert(self, message: str):
+        now = time.monotonic()
+        if now - self._last_reconcile_alert_ts < self._reconcile_alert_cooldown_sec:
+            return
+        self._last_reconcile_alert_ts = now
+        try:
+            notifier.send(
+                EventCode.STRATEGY_ERROR,
+                agent=self._strategy_id,
+                description=message,
+            )
+        except Exception:
+            pass
+
+    def _maybe_reconcile(self):
+        """Periodic reconciliation: connector <-> engine <-> order_history."""
+        now = time.monotonic()
+        if now - self._last_reconcile_ts < self._reconcile_interval_sec:
+            return
+        self._last_reconcile_ts = now
+
+        with self._position_lock:
+            if self._order_in_flight:
+                return
+            internal_qty = int(self._position_qty or 0)
+
+        broker_qty = 0
+        try:
+            positions = self._connector.get_positions(self._account_id)
+            for pos in positions:
+                if str(pos.get("ticker", "")) == self._ticker:
+                    broker_qty = int(float(pos.get("quantity", 0) or 0))
+                    break
+        except Exception as e:
+            logger.debug(f"[LiveEngine:{self._strategy_id}] reconcile get_positions error: {e}")
+            return
+
+        history_qty = self._get_open_qty_from_history()
+
+        if broker_qty != internal_qty:
+            msg = (
+                f"Reconcile mismatch engine vs broker: ticker={self._ticker} "
+                f"engine_qty={internal_qty} broker_qty={broker_qty}. Running self-heal."
+            )
+            logger.warning(f"[LiveEngine:{self._strategy_id}] {msg}")
+            self._send_reconcile_alert(msg)
+            self._detect_position()
+
+        if broker_qty != history_qty:
+            msg = (
+                f"Reconcile mismatch history vs broker: ticker={self._ticker} "
+                f"history_qty={history_qty} broker_qty={broker_qty}."
+            )
+            logger.warning(f"[LiveEngine:{self._strategy_id}] {msg}")
+            self._send_reconcile_alert(msg)
+
     def _get_lookback(self) -> int:
         if hasattr(self._module, "get_lookback"):
             try:
@@ -567,6 +646,7 @@ class LiveEngine:
                 continue
             try:
                 self._load_and_update()
+                self._maybe_reconcile()
             except Exception as e:
                 logger.error(f"[LiveEngine:{self._strategy_id}] Ошибка в poll_loop: {e}\n"
                              f"{traceback.format_exc()}")
@@ -723,6 +803,29 @@ class LiveEngine:
             # Если стратегия реализует execute_signal — делегируем ей (мультиинструментальные)
             if hasattr(self._module, "execute_signal"):
                 try:
+                    allowed_actions = {"buy", "sell", "close"}
+                    signal_action = signal.get("action")
+                    if signal_action not in allowed_actions:
+                        logger.warning(
+                            f"[LiveEngine:{self._strategy_id}] Некорректный action={signal_action!r} "
+                            f"в сигнале custom execute_signal, сигнал пропущен"
+                        )
+                        return
+                    try:
+                        signal_qty = int(signal.get("qty", 1))
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            f"[LiveEngine:{self._strategy_id}] Некорректный qty в сигнале "
+                            f"custom execute_signal: {signal.get('qty')!r}"
+                        )
+                        return
+                    if signal_qty <= 0:
+                        logger.warning(
+                            f"[LiveEngine:{self._strategy_id}] qty <= 0 в сигнале "
+                            f"custom execute_signal: {signal_qty}"
+                        )
+                        return
+
                     self._params["_strategy_id"] = self._strategy_id      # для записи сделок в стратегии
                     self._params["_connector_id"] = self._connector_id     # для расчёта комиссии
                     self._module.execute_signal(
@@ -918,7 +1021,15 @@ class LiveEngine:
             logger.error(f"[LiveEngine:{self._strategy_id}] "
                          f"Ошибка исполнения {action}: {e}\n{traceback.format_exc()}")
 
-    def _record_trade(self, side: str, qty: int, price: float, comment: str, order_type: str = "market"):
+    def _record_trade(
+        self,
+        side: str,
+        qty: int,
+        price: float,
+        comment: str,
+        order_type: str = "market",
+        order_ref: str = "",
+    ):
         """Записывает исполненную сделку в order_history и trades_history.
 
         Использует новый метод _calculate_commission() для расчета комиссии.
@@ -936,6 +1047,10 @@ class LiveEngine:
         )
         
         try:
+            exec_key = (
+                f"engine:{self._strategy_id}:{order_type}:{order_ref}:{side}:{abs(int(qty))}:{round(float(price), 8)}"
+                if order_ref else ""
+            )
             order = make_order(
                 strategy_id=self._strategy_id,
                 ticker=self._ticker,
@@ -947,6 +1062,8 @@ class LiveEngine:
                 commission=commission_per_lot,
                 commission_total=commission_rub,
                 point_cost=self._point_cost,
+                exec_key=exec_key,
+                source="live_engine",
             )
             save_order(order)
         except Exception as e:
@@ -1088,14 +1205,14 @@ class LiveEngine:
                 )
                 return
 
-        # close_position вернул True (без tid) - считаем исполненным
+        # close_position вернул True без tid:
+        # не обновляем позицию оптимистично, т.к. нет подтверждения исполнения.
         if tid_or_ok is True:
-            with self._position_lock:
-                self._record_trade(close_side, close_qty, fill_price, comment, order_type='market')
-                self._position = 0
-                self._position_qty = 0
-                self._entry_price = 0.0
-            logger.info(f'[LiveEngine:{self._strategy_id}] CLOSE {close_side.upper()} x{close_qty} @ {fill_price:.4f} ({comment})')
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] close_position вернул True без transaction id; "
+                f"позиция не обновлена без подтверждения. "
+                f"{close_side.upper()} {self._ticker} x{close_qty} @ {fill_price:.4f}"
+            )
         elif tid_or_ok:  # это tid - запускаем мониторинг
             t = threading.Thread(
                 target=self._monitor_market_order,
@@ -1248,7 +1365,7 @@ class LiveEngine:
                         self._position_qty = -filled
                     self._entry_price = price
 
-                self._record_trade(side, filled, price, comment, order_type="limit")
+                self._record_trade(side, filled, price, comment, order_type="limit", order_ref=str(tid))
                 logger.info(f"[LiveEngine:{self._strategy_id}] "
                             f"LIMIT исполнена: {side.upper()} filled={filled}/{qty} @ {price} "
                             f"{'(снята по времени, частично)' if cancelled_by_time and filled < qty else ''}")
@@ -1345,7 +1462,7 @@ class LiveEngine:
                         self._position_qty = -filled
                     self._entry_price = price
 
-                self._record_trade(side, filled, price, comment, order_type="market")
+                self._record_trade(side, filled, price, comment, order_type="market", order_ref=str(tid))
                 logger.info(f"[LiveEngine:{self._strategy_id}] "
                             f"MARKET подтверждено: {side.upper()} filled={filled}/{qty} @ {price}")
 
@@ -1380,7 +1497,7 @@ class LiveEngine:
                             self._position = -1
                             self._position_qty = -filled
                         self._entry_price = price
-                    self._record_trade(side, filled, price, comment, order_type='market')
+                    self._record_trade(side, filled, price, comment, order_type='market', order_ref=str(tid))
                     logger.info(f'[LiveEngine:{self._strategy_id}] '
                                 f'MARKET частично: {side.upper()} filled={filled}/{qty} @ {price:.4f}')
                     return True
@@ -1520,3 +1637,4 @@ class LiveEngine:
     def __repr__(self):
         return (f"<LiveEngine {self._strategy_id} ticker={self._ticker} "
                 f"pos={self._position} running={self._running}>")
+

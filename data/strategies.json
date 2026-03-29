@@ -3,7 +3,7 @@
     "name": "Бочка CNY",
     "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/bochka_cny.py",
     "description": "Пробой Highest/Lowest за период. Инструмент: CNY фьючерс.",
-    "status": "stopped",
+    "status": "active",
     "finam_account": "802690RIIT6",
     "is_enabled": true,
     "params": {
@@ -123,7 +123,7 @@
     "name": "Tracker",
     "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/tracker.py",
     "description": "Канал SMA ± ATR*K. Вход лимиткой при пробое канала на старшем ТФ с подтверждением на 1-минутном. Выход при возврате в канал.",
-    "status": "stopped",
+    "status": "active",
     "finam_account": "802690RIIT6",
     "is_enabled": true,
     "params": {

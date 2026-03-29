@@ -398,7 +398,6 @@ def _place(connector, account_id: str, board: str, ticker: str,
             order_type="market",
             board=board,
             agent_name="Бочка CNY",
-            comment=comment,
         )
         if tid:
             logger.info(f"[Бочка CNY] {side.upper()} {ticker}x{qty} tid={tid} | {comment}")

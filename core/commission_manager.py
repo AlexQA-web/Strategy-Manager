@@ -5,7 +5,6 @@
 Использует классификатор инструментов и конфигурацию ставок.
 """
 
-import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,6 +13,7 @@ from loguru import logger
 
 from core.instrument_classifier import instrument_classifier
 from core.moex_api import MOEXClient
+from core.storage import read_json, write_json
 
 
 class CommissionManager:
@@ -54,10 +54,16 @@ class CommissionManager:
             if not self.config_path.exists():
                 logger.warning(f"[CommissionManager] Конфиг не найден: {self.config_path}")
                 self._create_default_config()
+                self.save_config()
                 return
-            
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                self.config = json.load(f)
+
+            loaded = read_json(self.config_path)
+            self.config = loaded if isinstance(loaded, dict) else {}
+            if not self.config:
+                logger.warning(f"[CommissionManager] Пустой/битый конфиг: {self.config_path}")
+                self._create_default_config()
+                self.save_config()
+                return
             
             logger.debug(f"[CommissionManager] Конфиг загружен: {self.config_path}")
         
@@ -370,9 +376,7 @@ class CommissionManager:
         """Сохраняет текущую конфигурацию в файл."""
         try:
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
+            write_json(self.config_path, self.config)
             
             logger.info(f"[CommissionManager] Конфиг сохранён: {self.config_path}")
         

@@ -4,7 +4,7 @@ from PyQt6.QtWidgets import (
     QFormLayout, QGroupBox, QMessageBox, QSpinBox, QTimeEdit,
     QScrollArea, QFrame, QFileDialog,
 )
-from PyQt6.QtCore import Qt, QTime
+from PyQt6.QtCore import Qt, QTime, QTimer
 from loguru import logger
 
 from core.storage import (
@@ -854,6 +854,11 @@ class _SettingsMixin:
     # Тесты
     # ─────────────────────────────────────────────
 
+    @staticmethod
+    def _set_status_label(label: QLabel, text: str, color: str):
+        """Потокобезопасно обновляет QLabel в главном потоке Qt."""
+        QTimer.singleShot(0, lambda: (label.setText(text), label.setStyleSheet(f"color: {color};")))
+
     def _test_finam(self):
         import threading
         from core.finam_connector import finam_connector
@@ -861,17 +866,14 @@ class _SettingsMixin:
         save_setting("finam_password", self.finam_password.text())
         save_setting("finam_host",     self.finam_host.text().strip())
         save_setting("finam_port",     str(self.finam_port.value()))
-        self.lbl_finam_status.setText("⏳ Подключаемся...")
-        self.lbl_finam_status.setStyleSheet("color: #f9e2af;")
+        self._set_status_label(self.lbl_finam_status, "⏳ Подключаемся...", "#f9e2af")
 
         def _go():
             ok = finam_connector.connect()
             if ok:
-                self.lbl_finam_status.setText("🟢 Подключено")
-                self.lbl_finam_status.setStyleSheet("color: #a6e3a1;")
+                self._set_status_label(self.lbl_finam_status, "🟢 Подключено", "#a6e3a1")
             else:
-                self.lbl_finam_status.setText("🔴 Ошибка подключения")
-                self.lbl_finam_status.setStyleSheet("color: #f38ba8;")
+                self._set_status_label(self.lbl_finam_status, "🔴 Ошибка подключения", "#f38ba8")
 
         threading.Thread(target=_go, daemon=True).start()
 
@@ -880,17 +882,14 @@ class _SettingsMixin:
         from core.quik_connector import quik_connector
         save_setting("quik_host", self.quik_host.text().strip())
         save_setting("quik_port", str(self.quik_port.value()))
-        self.lbl_quik_status.setText("⏳ Подключаемся...")
-        self.lbl_quik_status.setStyleSheet("color: #f9e2af;")
+        self._set_status_label(self.lbl_quik_status, "⏳ Подключаемся...", "#f9e2af")
 
         def _go():
             ok = quik_connector.connect()
             if ok:
-                self.lbl_quik_status.setText("🟢 Подключено")
-                self.lbl_quik_status.setStyleSheet("color: #a6e3a1;")
+                self._set_status_label(self.lbl_quik_status, "🟢 Подключено", "#a6e3a1")
             else:
-                self.lbl_quik_status.setText("🔴 Ошибка подключения")
-                self.lbl_quik_status.setStyleSheet("color: #f38ba8;")
+                self._set_status_label(self.lbl_quik_status, "🔴 Ошибка подключения", "#f38ba8")
 
         threading.Thread(target=_go, daemon=True).start()
 
@@ -900,17 +899,14 @@ class _SettingsMixin:
         save_setting("telegram_chat_id", self.tg_chat_id.text().strip())
         save_setting("telegram_enabled", "true" if self.tg_enabled.isChecked() else "false")
         notifier.load_from_settings()
-        self.lbl_tg_status.setText("⏳ Отправляем...")
-        self.lbl_tg_status.setStyleSheet("color: #f9e2af;")
+        self._set_status_label(self.lbl_tg_status, "⏳ Отправляем...", "#f9e2af")
 
         def _go():
             ok, msg = notifier.test_connection_sync()
             if ok:
-                self.lbl_tg_status.setText(f"🟢 {msg}")
-                self.lbl_tg_status.setStyleSheet("color: #a6e3a1;")
+                self._set_status_label(self.lbl_tg_status, f"🟢 {msg}", "#a6e3a1")
             else:
-                self.lbl_tg_status.setText(f"🔴 {msg}")
-                self.lbl_tg_status.setStyleSheet("color: #f38ba8;")
+                self._set_status_label(self.lbl_tg_status, f"🔴 {msg}", "#f38ba8")
 
         threading.Thread(target=_go, daemon=True).start()
 
@@ -926,17 +922,14 @@ class _SettingsMixin:
         # Загружаем настройки в нотификатор
         ntfy_notifier.load_from_settings()
         
-        self.lbl_ntfy_status.setText("⏳ Отправляем...")
-        self.lbl_ntfy_status.setStyleSheet("color: #f9e2af;")
+        self._set_status_label(self.lbl_ntfy_status, "⏳ Отправляем...", "#f9e2af")
 
         def _go():
             ok, msg = ntfy_notifier.test_connection()
             if ok:
-                self.lbl_ntfy_status.setText(f"🟢 {msg}")
-                self.lbl_ntfy_status.setStyleSheet("color: #a6e3a1;")
+                self._set_status_label(self.lbl_ntfy_status, f"🟢 {msg}", "#a6e3a1")
             else:
-                self.lbl_ntfy_status.setText(f"🔴 {msg}")
-                self.lbl_ntfy_status.setStyleSheet("color: #f38ba8;")
+                self._set_status_label(self.lbl_ntfy_status, f"🔴 {msg}", "#f38ba8")
 
         threading.Thread(target=_go, daemon=True).start()
 
