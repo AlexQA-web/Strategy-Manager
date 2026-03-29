@@ -10,10 +10,11 @@ from loguru import logger
 def get_info() -> dict:
     return {
         "name":        "Tracker",
-        "version":     "1.0",
+        "version":     "1.1",
         "author":      "Alexey",
-        "description": "Канал SMA ± ATR*K. Вход лимиткой при пробое канала на старшем ТФ "
-                       "с подтверждением на 1-минутном. Выход при возврате в канал.",
+        "description": "Канал SMA ± ATR*K. Вход по сигналу при пробое канала на старшем ТФ "
+                       "с подтверждением на 1-минутном. Выход при возврате в канал. "
+                       "Тип ордера определяется в настройках агента.",
         "tickers":     ["SiH6", "SiM6"],
     }
 
@@ -50,25 +51,20 @@ def get_params() -> dict:
             "label": "Время входа (мин)",
             "description": "Начало торговли в минутах от полуночи (630 = 10:30)",
         },
-        "time_close": {
-            "type": "time", "default": 1425,
-            "label": "Время выхода (мин)",
-            "description": "Принудительное закрытие в минутах от полуночи (1425 = 23:45)",
+        "close_friday_enabled": {
+            "type": "bool", "default": False,
+            "label": "Закрывать в пятницу?",
+            "description": "Принудительно закрывать позицию в пятницу в указанное время"
         },
         "friday_close": {
             "type": "time", "default": 1005,
-            "label": "Закрытие в пятницу (мин)",
+            "label": "Время закрытия в пятницу (мин)",
             "description": "Принудительное закрытие в пятницу (1005 = 16:45)",
         },
         "qty": {
             "type": "int", "default": 1, "min": 1, "max": 100,
             "label": "Лот",
             "description": "Кол-во контрактов (при статическом лоте)",
-        },
-        "shag": {
-            "type": "float", "default": 1.0, "min": 0.01, "max": 1000.0, "step": 0.01,
-            "label": "Шаг цены",
-            "description": "Минимальный шаг цены инструмента (для Si = 1, для RI = 10)",
         },
         "commission": {
             "type": "commission", "default": 10.0, "min": 0.0, "max": 1000.0,
@@ -180,20 +176,16 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     sell_level = cur.get("_sell_level")
 
     time_open    = int(params.get("time_open",    630))
-    time_close_p = int(params.get("time_close",   1425))
     friday_close = int(params.get("friday_close", 1005))
+    close_friday_enabled = bool(params.get("close_friday_enabled", False))
     qty          = int(params.get("qty", 1))
-    shag         = float(params.get("shag", 1.0))
 
     if buy_level is None or sell_level is None or buy_level != buy_level or sell_level != sell_level:
         return {"action": None}
 
-    # Принудительное закрытие
-    if position != 0:
-        if weekday == 5 and time_min >= friday_close:
-            return {"action": "close", "qty": qty, "comment": "Close Friday"}
-        if time_min >= time_close_p:
-            return {"action": "close", "qty": qty, "comment": "Close EOD"}
+    # Принудительное закрытие только в пятницу (если включено)
+    if position != 0 and close_friday_enabled and weekday == 5 and time_min >= friday_close:
+        return {"action": "close", "qty": qty, "comment": "Close Friday"}
 
     if time_min < time_open or weekday in (6, 7):
         return {"action": None}
@@ -202,7 +194,6 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     if close > buy_level:
         if position == 0:
             return {"action": "buy", "qty": qty,
-                    "price": close + shag,
                     "comment": f"Long: cls={close:.2f} > buy={buy_level:.2f}"}
         if position == -1:
             return {"action": "close", "qty": qty,
@@ -212,7 +203,6 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     elif close < sell_level and weekday != 5:
         if position == 0:
             return {"action": "sell", "qty": qty,
-                    "price": close - shag,
                     "comment": f"Short: cls={close:.2f} < sell={sell_level:.2f}"}
         if position == 1:
             return {"action": "close", "qty": qty,

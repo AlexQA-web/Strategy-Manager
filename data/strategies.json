@@ -135,6 +135,7 @@
       "k": 0.9,
       "time_open": 605,
       "time_close": 1125,
+      "close_friday_enabled": true,
       "friday_close": 1005,
       "qty": 1,
       "shag": 1.0,

@@ -69,6 +69,12 @@ def get_params() -> dict:
             "label":       "Time close",
             "description": "Закрытие позиции (900 = 15:00)",
         },
+        "time_limit": {
+            "type":        "time",
+            "default":     900,
+            "label":       "Time limit",
+            "description": "Ограничение времени торговли (900 = 15:00)",
+        },
         "qty": {
             "type":        "int",
             "default":     1,
@@ -106,9 +112,14 @@ def get_indicators() -> list:
 def on_start(params: dict, connector) -> None:
     time_open = int(params.get('time_open', 708))
     time_close = int(params.get('time_close', 900))
+    time_limit = int(params.get('time_limit', 900))
     if time_open >= time_close:
         logger.warning(
             f'[Бочка CNY] Некорректное окно времени: time_open={time_open} >= time_close={time_close}'
+        )
+    if time_open >= time_limit:
+        logger.warning(
+            f'[Бочка CNY] Некорректное окно времени: time_open={time_open} >= time_limit={time_limit}'
         )
     logger.info(f"[Бочка CNY] Запуск. Тикер: {params.get('ticker')}")
 
@@ -169,7 +180,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     Логика входа:
       - Текущий бар закрылся выше _highest (= Highest на баре [-2]) → BUY
       - Текущий бар закрылся ниже  _lowest  (= Lowest  на баре [-2]) → SELL
-      - Только в окне time_open < time_min < 900
+      - Только в окне time_open < time_min < time_limit
       - Только если нет открытой позиции
 
     Логика выхода:
@@ -183,6 +194,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     weekday    = current["weekday"]
     time_open  = int(params.get("time_open",  708))
     time_close = int(params.get("time_close", 900))
+    time_limit = int(params.get("time_limit", 900))
     qty        = int(params.get("qty", 1))
 
     def _nan(v):
@@ -202,7 +214,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
         return {"action": None}
 
     # ENTRY
-    if not (time_open < time_min < 900):
+    if not (time_open < time_min < time_limit):
         return {"action": None}
     if date_int in _EXCLUDE_DATES:
         return {"action": None}

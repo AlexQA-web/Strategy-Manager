@@ -21,10 +21,10 @@
   },
   "broker_transaq": {
     "futures_rub": {
-      "currency_futures": 1.00,
+      "currency_futures": 1.0,
       "equity_futures": 0.45,
       "index_futures": 0.87,
-      "commodity_futures": 2.10
+      "commodity_futures": 2.1
     },
     "stock_pct": 0.04,
     "bond_pct": 0.015,
@@ -32,10 +32,10 @@
   },
   "broker_quik": {
     "futures_rub": {
-      "currency_futures": 1.00,
+      "currency_futures": 1.0,
       "equity_futures": 0.45,
       "index_futures": 0.87,
-      "commodity_futures": 2.10
+      "commodity_futures": 2.1
     },
     "stock_pct": 0.04,
     "bond_pct": 0.015,
