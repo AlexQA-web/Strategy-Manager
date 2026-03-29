@@ -62,22 +62,32 @@ def main():
     window = MainWindow()
     window.show()
 
-    from core.autostart import autoconnect_connectors, autostart_strategies
+    from core.autostart import autoconnect_connectors, autostart_strategies, start_engine_watchdog
     autoconnect_connectors()
     autostart_strategies()
+    # Watchdog: автоматически запускает/останавливает движки при изменении состояния коннекторов.
+    # Проверяет каждые 15 секунд — при подключении коннектора стартует движки активных стратегий,
+    # при отключении — останавливает. Работает вместе с расписанием.
+    start_engine_watchdog(interval_sec=15)
 
     try:
-         exit_code = app.exec()
+        exit_code = app.exec()
     except Exception as e:
-         logger.exception(f"Ошибка во время выполнения приложения: {e}")
-         exit_code = 1
+        logger.exception(f"Ошибка во время выполнения приложения: {e}")
+        exit_code = 1
     finally:
-         # Сброс equity на диск перед выходом
-         try:
-             from core.equity_tracker import flush_all
-             flush_all()
-         except Exception:
-             pass
+        # Сброс equity на диск перед выходом
+        try:
+            from core.equity_tracker import flush_all
+            flush_all()
+        except Exception:
+            pass
+        # Останавливаем watchdog
+        try:
+            from core.autostart import stop_engine_watchdog
+            stop_engine_watchdog()
+        except Exception:
+            pass
 
     logger.info(f"{APP_NAME} — завершение работы")
     sys.exit(exit_code)

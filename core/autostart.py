@@ -1,6 +1,7 @@
 # core/autostart.py
 
 import threading
+import time
 from loguru import logger
 
 
@@ -10,7 +11,7 @@ def autoconnect_connectors():
     from core.connector_manager import connector_manager, register_connectors
     from core.scheduler import strategy_scheduler
     from datetime import datetime, time as dtime
-    
+
     # Регистрируем коннекторы (отложенная инициализация)
     register_connectors()
     # Планировщик мог стартовать до регистрации коннекторов,
@@ -70,7 +71,7 @@ def get_live_engines() -> dict:
 
 def stop_live_engine(strategy_id: str) -> bool:
     """Останавливает LiveEngine стратегии и удаляет из реестра.
-    
+
     Returns:
         True если engine был найден и остановлен, False если не найден.
     """
@@ -99,7 +100,6 @@ def stop_live_engine(strategy_id: str) -> bool:
 
     logger.info(f"[autostart] LiveEngine стратегии '{strategy_id}' остановлен и удалён")
     return True
-
 
 
 def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> bool:
@@ -141,7 +141,6 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
 
     def _wait_for_connector(conn, timeout=120):
         """Ждёт подключения коннектора с таймаутом."""
-        import time
         deadline = time.time() + timeout
         while time.time() < deadline:
             if conn.is_connected():
@@ -201,16 +200,11 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
 def autostart_strategies():
     """Автозапуск активных стратегий (вызывается в фоновом потоке)."""
     from core.storage import get_bool_setting, get_all_strategies
-    from core.strategy_loader import strategy_loader
-    from core.connector_manager import connector_manager
-    from core.live_engine import LiveEngine
-    from core.scheduler import is_in_schedule
 
     if not get_bool_setting("autostart_strategies"):
         return
 
     def _run():
-        import time
         time.sleep(3)  # Даём время на инициализацию
 
         strategies = get_all_strategies()
@@ -234,3 +228,147 @@ def autostart_strategies():
         logger.info(f"Автозапуск: запущено стратегий: {started}")
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watchdog: автоматическая синхронизация движков с состоянием коннекторов
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Кэш последних известных состояний коннекторов {connector_id: bool}
+# Нужен чтобы реагировать только на ИЗМЕНЕНИЕ состояния, а не опрашивать постоянно
+_connector_states: dict[str, bool] = {}
+_connector_states_lock = threading.Lock()
+
+_watchdog_stop_event = threading.Event()
+
+
+def _sync_engines_with_connectors():
+    """
+    Ядро watchdog: синхронизирует запущенные движки с состоянием коннекторов.
+
+    Логика:
+    - Если коннектор только что ПОДКЛЮЧИЛСЯ (был False → стал True):
+        для всех активных стратегий этого коннектора, у которых нет движка → запускаем.
+    - Если коннектор только что ОТКЛЮЧИЛСЯ (был True → стал False):
+        для всех движков этого коннектора → останавливаем.
+    - Если состояние не изменилось — ничего не делаем (тихий опрос).
+    """
+    from core.storage import get_all_strategies, get_bool_setting
+    from core.connector_manager import connector_manager
+    from core.scheduler import is_in_schedule
+
+    if not get_bool_setting("autostart_strategies"):
+        return
+
+    # Снимаем текущий статус всех зарегистрированных коннекторов
+    current_states: dict[str, bool] = {}
+    for cid, conn in connector_manager.all().items():
+        try:
+            current_states[cid] = conn.is_connected()
+        except Exception:
+            current_states[cid] = False
+
+    # Определяем что изменилось
+    just_connected: set[str] = set()
+    just_disconnected: set[str] = set()
+
+    with _connector_states_lock:
+        for cid, is_conn in current_states.items():
+            prev = _connector_states.get(cid)
+            if prev is None:
+                # Первый опрос — запоминаем состояние, не запускаем/останавливаем
+                _connector_states[cid] = is_conn
+                continue
+            if prev is False and is_conn is True:
+                just_connected.add(cid)
+            elif prev is True and is_conn is False:
+                just_disconnected.add(cid)
+            _connector_states[cid] = is_conn
+
+    # ── Коннектор подключился → запускаем движки ─────────────────────────────
+    if just_connected:
+        strategies = get_all_strategies()
+        engines = get_live_engines()
+
+        for cid in just_connected:
+            logger.info(f"[Watchdog] Коннектор [{cid}] подключился — проверяем стратегии")
+
+            if not is_in_schedule(cid):
+                logger.info(f"[Watchdog] [{cid}] вне окна расписания — движки не запускаем")
+                continue
+
+            for sid, data in strategies.items():
+                if not (data.get("status") == "active" and data.get("is_enabled", True)):
+                    continue
+                sid_connector = data.get("connector_id") or data.get("connector") or "finam"
+                if sid_connector != cid:
+                    continue
+                if sid in engines:
+                    continue  # уже запущен
+
+                file_path = data.get("file_path") or data.get("file", "")
+                if not file_path:
+                    continue
+
+                try:
+                    logger.info(f"[Watchdog] Запускаем [{sid}] — коннектор [{cid}] подключился")
+                    start_live_engine(sid, wait_for_connection=False)
+                except Exception as e:
+                    logger.error(f"[Watchdog] Ошибка запуска [{sid}]: {e}")
+
+    # ── Коннектор отключился → останавливаем движки ───────────────────────────
+    if just_disconnected:
+        engines = get_live_engines()
+        strategies = get_all_strategies()
+
+        for cid in just_disconnected:
+            logger.info(f"[Watchdog] Коннектор [{cid}] отключился — останавливаем движки")
+
+            for sid, engine in engines.items():
+                data = strategies.get(sid, {})
+                sid_connector = data.get("connector_id") or data.get("connector") or "finam"
+                if sid_connector != cid:
+                    continue
+                try:
+                    logger.info(f"[Watchdog] Останавливаем [{sid}] — коннектор [{cid}] отключился")
+                    stop_live_engine(sid)
+                except Exception as e:
+                    logger.error(f"[Watchdog] Ошибка остановки [{sid}]: {e}")
+
+
+def start_engine_watchdog(interval_sec: int = 15):
+    """
+    Запускает фоновый поток watchdog, который следит за состоянием коннекторов
+    и автоматически запускает/останавливает движки стратегий.
+
+    Вызывать один раз при старте приложения (после autostart_strategies).
+
+    Args:
+        interval_sec: Как часто проверять состояние коннекторов (по умолчанию 15 сек).
+    """
+    _watchdog_stop_event.clear()
+
+    def _loop():
+        # Первый опрос — только запоминаем начальное состояние, без действий
+        time.sleep(5)
+        _sync_engines_with_connectors()  # инициализирует _connector_states
+
+        logger.info(f"[Watchdog] Запущен (интервал {interval_sec}с)")
+
+        while not _watchdog_stop_event.is_set():
+            _watchdog_stop_event.wait(timeout=interval_sec)
+            if _watchdog_stop_event.is_set():
+                break
+            try:
+                _sync_engines_with_connectors()
+            except Exception as e:
+                logger.error(f"[Watchdog] Ошибка в цикле: {e}")
+
+        logger.info("[Watchdog] Остановлен")
+
+    threading.Thread(target=_loop, daemon=True, name="EngineWatchdog").start()
+
+
+def stop_engine_watchdog():
+    """Останавливает watchdog (вызывать при завершении приложения)."""
+    _watchdog_stop_event.set()
