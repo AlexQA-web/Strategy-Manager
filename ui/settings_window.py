@@ -1178,13 +1178,13 @@ class _SettingsMixin:
         )
 
     def _export_settings(self):
-        """Сохраняет публичные настройки приложения в выбранный пользователем JSON-файл.
+        """Сохраняет все настройки приложения (включая чувствительные данные) в выбранный пользователем JSON-файл.
 
         Бизнес-логика:
-          - Собирает settings.json без секретов + schedules.json + commission_config.json.
+          - Собирает settings.json (включая секреты) + schedules.json + commission_config.json + strategies.json.
           - Открывает QFileDialog для выбора пути сохранения.
           - Записывает файл с отступами (indent=2) в UTF-8.
-          - Не экспортирует токены, пароли, логины и идентификаторы счетов.
+          - Экспортирует токены, пароли, логины и идентификаторы счетов.
 
         Вызывается: кнопкой "Сохранить в файл" в панели кнопок _build_ui.
         """
@@ -1193,19 +1193,19 @@ class _SettingsMixin:
         from core.commission_manager import commission_manager
         from core.instrument_classifier import instrument_classifier
 
-        from core.storage import get_all_strategies
+        from core.storage import get_all_strategies, get_settings
         commission_data = dict(commission_manager.config)
         commission_data['prefix_rules'] = dict(instrument_classifier.prefix_rules)
         commission_data['manual_mapping'] = dict(instrument_classifier.manual_mapping)
 
         export_data = {
-            'settings':   get_exportable_settings(),
+            'settings':   get_settings(),
             'schedules':  get_all_schedules(),
             'commissions': commission_data,
             'strategies': get_all_strategies(),
         }
 
-        default_path = str(APP_PROFILE_DIR / 'trading_manager_settings.public.json')
+        default_path = str(APP_PROFILE_DIR / 'trading_manager_settings.full.json')
         path, _ = QFileDialog.getSaveFileName(
             self,
             'Сохранить настройки в файл',
@@ -1218,11 +1218,12 @@ class _SettingsMixin:
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 _json.dump(export_data, f, ensure_ascii=False, indent=2)
-            logger.info(f'Публичные настройки экспортированы в {path}')
+            logger.info(f'Все настройки (включая чувствительные) экспортированы в {path}')
             QMessageBox.information(
                 self,
                 'Экспорт настроек',
-                f'Публичные настройки сохранены в файл:\n{path}\n\nСекреты в экспорт не включаются.',
+                f'Все настройки (включая чувствительные данные) сохранены в файл:\n{path}\n\n'
+                'ВНИМАНИЕ: Файл содержит логины, пароли и другие чувствительные данные!',
             )
         except OSError as e:
             logger.error(f'Ошибка экспорта настроек: {e}')
