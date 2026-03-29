@@ -442,6 +442,22 @@ class StrategyWindow(QDialog):
         self._refresh_accounts()
         trade_form.addRow("Счёт:", self.cmb_account)
 
+        # Таймфрейм
+        self.cmb_timeframe = QComboBox()
+        for label, value in [
+            ("1 мин",  "1"),
+            ("5 мин",  "5"),
+            ("15 мин", "15"),
+            ("30 мин", "30"),
+            ("1 час",  "60"),
+        ]:
+            self.cmb_timeframe.addItem(label, value)
+        current_tf = str(self.data.get("timeframe", "5"))
+        idx = self.cmb_timeframe.findData(current_tf)
+        if idx >= 0:
+            self.cmb_timeframe.setCurrentIndex(idx)
+        trade_form.addRow("Таймфрейм:", self.cmb_timeframe)
+
         layout.addWidget(trade_group)
 
         layout.addStretch()
@@ -1008,6 +1024,7 @@ class StrategyWindow(QDialog):
         self.data["name"] = self.edit_agent_name.text().strip() or self.sid
         self.data["connector"] = self.cmb_connector.currentData()
         self.data["finam_account"] = self.cmb_account.currentData() or ""
+        self.data["timeframe"] = self.cmb_timeframe.currentData()
         # Тикер/борд больше не сохраняются из вкладки Обзор
         # Они должны сохраняться из вкладки Параметры
         save_strategy(self.sid, self.data)

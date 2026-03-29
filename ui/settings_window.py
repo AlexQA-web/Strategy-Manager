@@ -1105,10 +1105,15 @@ class _SettingsMixin:
             )
             return
 
+        has_strategies = bool(data.get("strategies"))
+        strategies_note = (
+            f"\nТакже будет импортировано стратегий: {len(data['strategies'])}"
+            if has_strategies else ""
+        )
         reply = QMessageBox.question(
             self, "Загрузить настройки",
             f"Загрузить настройки из файла?\n{path}\n\n"
-            "Текущие настройки будут перезаписаны.",
+            f"Текущие настройки будут перезаписаны.{strategies_note}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1135,6 +1140,14 @@ class _SettingsMixin:
                     instrument_classifier.manual_mapping = comm_data["manual_mapping"]
                 instrument_classifier.save_config()
 
+            # Восстанавливаем стратегии
+            if "strategies" in data and isinstance(data["strategies"], dict):
+                from core.storage import STRATEGIES_FILE, _write
+                strategies_data = data["strategies"]
+                if strategies_data:
+                    _write(STRATEGIES_FILE, strategies_data)
+                    logger.info(f"Импортировано стратегий: {len(strategies_data)}")
+
             logger.info(f"Настройки импортированы из {path}")
         except OSError as e:
             logger.error(f"Ошибка записи настроек при импорте: {e}")
@@ -1150,6 +1163,14 @@ class _SettingsMixin:
 
         # Обновляем все виджеты UI
         self._reload_ui_from_disk()
+
+        # Обновляем таблицу агентов если стратегии были импортированы
+        if data.get("strategies"):
+            try:
+                from ui.main_window import ui_signals
+                ui_signals.strategies_changed.emit()
+            except Exception:
+                pass
 
         QMessageBox.information(
             self, "Настройки загружены",
@@ -1172,14 +1193,16 @@ class _SettingsMixin:
         from core.commission_manager import commission_manager
         from core.instrument_classifier import instrument_classifier
 
+        from core.storage import get_all_strategies
         commission_data = dict(commission_manager.config)
         commission_data['prefix_rules'] = dict(instrument_classifier.prefix_rules)
         commission_data['manual_mapping'] = dict(instrument_classifier.manual_mapping)
 
         export_data = {
-            'settings': get_exportable_settings(),
-            'schedules': get_all_schedules(),
+            'settings':   get_exportable_settings(),
+            'schedules':  get_all_schedules(),
             'commissions': commission_data,
+            'strategies': get_all_strategies(),
         }
 
         default_path = str(APP_PROFILE_DIR / 'trading_manager_settings.public.json')
