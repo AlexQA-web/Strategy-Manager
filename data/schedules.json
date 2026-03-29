@@ -3,10 +3,11 @@
     "connect_time": "06:50",
     "disconnect_time": "00:01",
     "days": [
+      0,
+      1,
+      2,
       3,
-      4,
-      5,
-      6
+      4
     ],
     "is_active": true
   },
@@ -14,10 +15,11 @@
     "connect_time": "06:55",
     "disconnect_time": "00:01",
     "days": [
+      0,
+      1,
+      2,
       3,
-      4,
-      5,
-      6
+      4
     ],
     "is_active": true
   }

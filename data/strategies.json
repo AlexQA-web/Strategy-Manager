@@ -44,7 +44,7 @@
       "qty": 1,
       "time_start": 605,
       "time_end": 1080,
-      "commission": 7.0
+      "commission": "auto"
     },
     "connector": "finam",
     "ticker": "SiM6",

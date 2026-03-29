@@ -275,7 +275,7 @@ class FinamConnector(BaseConnector):
     def _has_security_in_cache(self, ticker: str, board: str) -> bool:
         """Проверяет, есть ли инструмент в уже загруженном кеше securities."""
         market = self._BOARD_TO_MARKET.get(board, "1")
-        ticker = (ticker or '').strip().upper()
+        ticker = (ticker or '').strip()
         board = (board or '').strip().upper()
         for sec in self._securities:
             sec_ticker = str(sec.get('ticker', '')).strip().upper()
@@ -288,11 +288,11 @@ class FinamConnector(BaseConnector):
         return False
 
     def _remember_sec_info_failure(self, ticker: str, board: str):
-        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        key = ((ticker or '').strip(), (board or '').strip().upper())
         self._sec_info_failures[key] = time.monotonic()
 
     def _has_recent_sec_info_failure(self, ticker: str, board: str) -> bool:
-        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        key = ((ticker or '').strip(), (board or '').strip().upper())
         ts = self._sec_info_failures.get(key)
         if ts is None:
             return False
@@ -302,7 +302,7 @@ class FinamConnector(BaseConnector):
         return False
 
     def _clear_sec_info_failure(self, ticker: str, board: str):
-        key = ((ticker or '').strip().upper(), (board or '').strip().upper())
+        key = ((ticker or '').strip(), (board or '').strip().upper())
         self._sec_info_failures.pop(key, None)
 
     def _should_emit_error(self, err_text: str) -> bool:
@@ -570,7 +570,7 @@ class FinamConnector(BaseConnector):
         TRANSAQ DLL часто возвращает некорректные данные (особенно point_cost и lotsize),
         поэтому MOEX данные используются как основной источник.
         """
-        ticker = (ticker or '').strip().upper()
+        ticker = (ticker or '').strip()
         board = (board or 'TQBR').strip().upper()
         if not ticker:
             return None

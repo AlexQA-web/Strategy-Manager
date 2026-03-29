@@ -507,6 +507,10 @@ class MainWindow(QMainWindow):
         from ui.tray import TrayIcon
         self._tray = TrayIcon(self)
         ui_signals.connector_changed.connect(self._tray.set_connected)
+        
+        # Регистрация коннекторов после инициализации UI
+        from core.connector_manager import register_connectors
+        register_connectors()
 
     # ─────────────────────────────────────────────
     # Backend
