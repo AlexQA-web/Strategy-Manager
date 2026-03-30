@@ -106,6 +106,10 @@ class LiveEngine:
 
         self._period_str = TIMEFRAME_TO_PERIOD.get(timeframe, "5m")
         self._poll_interval = TIMEFRAME_TO_POLL_SEC.get(timeframe, 30)
+        # Fast-poll параметры
+        self._fast_poll_interval = float(params.get("fast_poll_interval", 0.5))  # сек
+        self._fast_poll_window = float(params.get("fast_poll_window", 10.0))      # сек после сигнала/ордера
+        self._last_signal_ts = 0.0
 
         self._bars: list[dict] = []
         self._bars_lock = threading.Lock()
@@ -245,36 +249,31 @@ class LiveEngine:
     def _load_point_cost(self):
         """Загружает стоимость пункта из коннектора.
 
-        TRANSAQ семантика (документация, раздел 4.6):
-          point_cost = стоимость изменения цены на 1.0 (один пункт) за 1 контракт, руб.
-          step_cost  = point_cost * minstep  (стоимость минимального шага цены)
+        Приоритет источников:
+          1. MOEX API через коннектор (если get_moex_info доступен)
+          2. point_cost из get_sec_info коннектора
 
-        Формула PnL: (price - entry_price) * qty * point_cost
-        Это корректно, т.к. (price - entry_price) уже выражено в пунктах.
-
-        Приоритет:
-          1. Если коннектор поддерживает get_moex_info — пробуем получить точное значение с MOEX API.
-          2. Иначе — берём point_cost напрямую от коннектора.
-         """
+        Требование: point_cost и lot_size должны быть >0, иначе старт запрещён.
+        """
         try:
             if hasattr(self._connector, 'get_sec_info'):
                sec_info = self._connector.get_sec_info(self._ticker, self._board)
                if sec_info:
                     minstep = sec_info.get('minstep')
-                    pc_from_connector = float(sec_info.get('point_cost') or 1.0)
-                    lot_size = sec_info.get('lotsize') or sec_info.get('lot_size') or 1
+                    pc_from_connector = float(sec_info.get('point_cost') or 0.0)
+                    lot_size = sec_info.get('lotsize') or sec_info.get('lot_size') or 0
                     try:
                         self._lot_size = max(int(lot_size), 1)
                     except (TypeError, ValueError):
-                        self._lot_size = 1
+                        self._lot_size = 0
 
-                    # Приоритет 1: попробуем получить точное значение с MOEX API
+                    # Приоритет 1: MOEX API
                     if hasattr(self._connector, 'get_moex_info'):
                         moex_sec_type = 'futures' if self._is_futures(self._ticker) else 'stock'
                         moex_info = self._connector.get_moex_info(self._ticker, sec_type=moex_sec_type)
                         if moex_info:
                             if moex_info.get('point_cost'):
-                                self._point_cost = moex_info['point_cost']
+                                self._point_cost = float(moex_info['point_cost'])
                             if moex_info.get('lot_size'):
                                 self._lot_size = max(int(moex_info['lot_size']), 1)
                             logger.info(
@@ -286,14 +285,22 @@ class LiveEngine:
                     # Приоритет 2: point_cost от коннектора
                     if pc_from_connector > 0:
                         self._point_cost = pc_from_connector
+                        if self._lot_size <= 0:
+                            self._lot_size = 1
                         logger.info(
                             f'[LiveEngine:{self._strategy_id}] point_cost={pc_from_connector}'
                             f' minstep={minstep}'
                             f' lot_size={self._lot_size}'
                             f" step_cost={round(pc_from_connector * float(minstep), 6) if minstep else 'n/a'}"
                         )
+                        return
+
+            # Если сюда дошли — point_cost не найден
+            logger.error(f"[LiveEngine:{self._strategy_id}] point_cost не получен — старт запрещён")
+            self._point_cost = 0.0
         except Exception as e:
            logger.warning(f"[LiveEngine:{self._strategy_id}] point_cost error: {e}")
+           self._point_cost = 0.0
 
     @property
     def is_running(self) -> bool:
@@ -535,6 +542,12 @@ class LiveEngine:
                            f"Не удалось определить позицию: {e}")
             with self._position_lock:
                 self._position = 0
+                self._position_qty = 0
+                self._entry_price = 0.0
+                self._last_price = 0.0
+                self._state = "error"
+            # Требуем reconcile перед дальнейшей торговлей
+            raise RuntimeError("Position detection failed — reconcile required")
 
     def _get_entry_price_from_history(self) -> float:
         """Берёт цену входа из последней незакрытой пары ордеров."""
@@ -631,7 +644,10 @@ class LiveEngine:
         return 300
 
     def _poll_loop(self):
-        """Основной цикл: загрузка истории → поллинг новых баров."""
+        """Основной цикл: загрузка истории → поллинг новых баров.
+
+        Поддерживает fast-poll окном после сигнала/ордера.
+        """
         # Первая загрузка истории
         self._load_and_update()
         # Определяем позицию после подключения коннектора (данные уже пришли)
@@ -639,7 +655,12 @@ class LiveEngine:
             self._detect_position()
 
         while not self._stop_event.is_set():
-            self._stop_event.wait(self._poll_interval)
+            now = time.monotonic()
+            interval = self._poll_interval
+            if now - self._last_signal_ts <= self._fast_poll_window:
+                interval = min(interval, self._fast_poll_interval)
+
+            self._stop_event.wait(interval)
             if self._stop_event.is_set():
                 break
             if not self._connector.is_connected():
@@ -664,6 +685,15 @@ class LiveEngine:
         if self._stop_event.is_set():
             return
 
+        # Перед первым poll или после реконнекта очищаем кеш истории по тикеру/борду,
+        # чтобы не брать устаревшие бары другого инструмента.
+        if self._last_bar_dt is None:
+            try:
+                if hasattr(self._connector, "clear_history_cache"):
+                    self._connector.clear_history_cache(self._ticker, self._board)
+            except Exception:
+                pass
+
         # Используем thread для get_history с timeout, чтобы не блокировать poll_loop
         result = {'df': None, 'error': None}
         
@@ -687,12 +717,12 @@ class LiveEngine:
         fetch_thread.join(timeout=timeout)
         
         if fetch_thread.is_alive():
-            # Таймаут - не блокируем poll_loop, записываем в лог
+            # Таймаут — пытаемся прервать и уведомить вызывающий поток
             logger.warning(
-                f"[LiveEngine:{self._strategy_id}] get_history завис (>{timeout} сек), "
-                f"пропускаем тик"
+                f"[LiveEngine:{self._strategy_id}] get_history завис (>{timeout} сек), устанавливаем stop_flag"
             )
-            return
+            self._stop_event.set()
+            raise TimeoutError(f"get_history timeout > {timeout}s for {self._ticker} {self._board}")
         
         if result['error']:
             logger.error(
@@ -713,6 +743,12 @@ class LiveEngine:
         if not bars:
             return
 
+        # Обязательная валидация даты последнего бара: если время сильно отстаёт
+        # (кеш старый), не генерируем сигнал, а пробуем перезапросить на следующей итерации.
+        newest_dt = bars[-1]["dt"]
+        if self._last_bar_dt and newest_dt <= self._last_bar_dt:
+            return
+
         # Обновляем последнюю цену при каждом поллинге
         self._last_price = bars[-1]["close"]
 
@@ -726,7 +762,7 @@ class LiveEngine:
         new_bar_dt = bars[-1]["dt"]
 
         if self._last_bar_dt is None:
-            # Первая загрузка — сохраняем историю, не вызываем on_bar
+            # Первая загрузка — сохраняем историю, не вызываем on_bar (нет сигнала без свежих баров)
             with self._bars_lock:
                 self._bars = bars
                 self._last_bar_dt = new_bar_dt
@@ -780,6 +816,12 @@ class LiveEngine:
                          f"{traceback.format_exc()}")
             return
 
+        # Если после загрузки количество баров меньше lookback (недостаточно свежей истории),
+        # не генерируем сигнал до следующего успешного обновления.
+        if len(processed_bars) < min(10, self._get_lookback()):
+            logger.warning(f"[LiveEngine:{self._strategy_id}] Истории недостаточно (bars={len(processed_bars)}), сигнал пропущен")
+            return
+
         # Читаем позицию под блокировкой для защиты от race condition
         with self._position_lock:
             current_position = self._position
@@ -788,6 +830,7 @@ class LiveEngine:
 
         action = signal.get("action") if signal else None
         if action:
+            self._last_signal_ts = time.monotonic()
             # Защита от двойного входа: проверяем позицию перед обработкой любого сигнала
             if action in ("buy", "sell"):
                 with self._position_lock:
@@ -895,13 +938,12 @@ class LiveEngine:
         # Для ФЬЮЧЕРСОВ: используем ГО
         denom = effective_dd + go
         if denom <= 0:
-            # Fallback: статический лот
-            return int(self._lot_sizing.get("lot", 1)) or 1
+            return None
 
         qty = math.floor((free_money / denom) / instances)
         # qty >= 1: можем купить хотя бы 1 контракт → возвращаем qty
-        # qty < 1: денег не хватает даже на 1 контракт → fallback на статический лот
-        return qty if qty >= 1 else int(self._lot_sizing.get("lot", 1)) or 1
+        # qty < 1: денег не хватает даже на 1 контракт → отклоняем сигнал
+        return qty if qty >= 1 else None
 
     def _execute_signal(self, signal: dict):
         """Исполняет торговый сигнал через коннектор.
@@ -956,14 +998,16 @@ class LiveEngine:
                         )
                         return
 
-                    if self._order_mode in ('limit', 'limit_price'):
-                        if self._order_in_flight:
-                            logger.warning(
-                                f'[LiveEngine:{self._strategy_id}] Лимитный ордер уже в работе, '
-                                f'игнорируем {action.upper()} цена~{fill_price_text}'
-                            )
-                            return
-                        self._order_in_flight = True
+                    if self._order_in_flight:
+                        logger.warning(
+                            f'[LiveEngine:{self._strategy_id}] Ордер уже в работе, '
+                            f'игнорируем {action.upper()} цена~{fill_price_text}'
+                        )
+                        return
+
+                    # Для market/limit/limit_price: устанавливаем флаг под локом, чтобы
+                    # исключить двойной вход по двум быстрым сигналам.
+                    self._order_in_flight = True
 
                 if self._order_mode == "limit":
                     self._execute_chase(action, qty, comment)
@@ -1002,17 +1046,8 @@ class LiveEngine:
                 else:
                     self._execute_market_close(close_side, close_qty, comment, fill_price)
 
-            # ORDER_PLACED только для не-chase режимов — для chase уведомление после исполнения
-            if self._order_mode != "limit":
-                try:
-                    notifier.send(
-                        EventCode.ORDER_PLACED,
-                        agent=self._strategy_id,
-                        description=f"{action.upper()} {self._ticker} x{qty} "
-                                    f"[{self._order_mode}] | {comment}",
-                    )
-                except Exception:
-                    pass
+            # ORDER_PLACED отправляем только после успешного размещения (tid получен)
+            # — само уведомление перенесено в _execute_market/_execute_limit_price/_execute_chase.
 
         except Exception as e:
             if self._order_mode in ("limit", "limit_price"):
@@ -1047,10 +1082,15 @@ class LiveEngine:
         )
         
         try:
-            exec_key = (
-                f"engine:{self._strategy_id}:{order_type}:{order_ref}:{side}:{abs(int(qty))}:{round(float(price), 8)}"
-                if order_ref else ""
-            )
+            # execution_id из коннектора — единый источник правды. Без него не пишем ордер.
+            exec_id = order_ref or ""
+            if not exec_id:
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] Пропускаем запись сделки без execution_id: "
+                    f"{side.upper()} {self._ticker} x{qty} @ {price} ({order_type})"
+                )
+                return
+
             order = make_order(
                 strategy_id=self._strategy_id,
                 ticker=self._ticker,
@@ -1062,8 +1102,8 @@ class LiveEngine:
                 commission=commission_per_lot,
                 commission_total=commission_rub,
                 point_cost=self._point_cost,
-                exec_key=exec_key,
-                source="live_engine",
+                exec_key=exec_id,
+                source="connector",
             )
             save_order(order)
         except Exception as e:
@@ -1082,6 +1122,7 @@ class LiveEngine:
                 "order_type": order_type,
                 "comment": comment,
                 "dt": datetime.now().isoformat(),
+                "execution_id": exec_id,
             }
             append_trade(trade)
         except Exception as e:
@@ -1143,6 +1184,9 @@ class LiveEngine:
                 f"сторона={side.upper()} qty={qty} цена={fill_price} "
                 f"вид=market | {comment}"
             )
+            with self._position_lock:
+                # Сбрасываем флаг, чтобы не блокировать последующие сигналы после неуспеха
+                self._order_in_flight = False
 
     def _execute_market_close(self, close_side: str, close_qty: int, comment: str, fill_price: float):
         """Рыночное закрытие позиции.
@@ -1166,6 +1210,13 @@ class LiveEngine:
                 logger.warning(
                     f'[LiveEngine:{self._strategy_id}] close_position error: {e}, '
                     f'цена~{fill_price:.4f}'
+                )
+                tid_or_ok = False
+
+            if tid_or_ok is True:
+                logger.error(
+                    f"[LiveEngine:{self._strategy_id}] close_position вернул True без transaction id; "
+                    f"fallback на market. {close_side.upper()} {self._ticker} x{close_qty} @ {fill_price:.4f}"
                 )
                 tid_or_ok = False
 
@@ -1205,29 +1256,14 @@ class LiveEngine:
                 )
                 return
 
-        # close_position вернул True без tid:
-        # не обновляем позицию оптимистично, т.к. нет подтверждения исполнения.
-        if tid_or_ok is True:
-            logger.warning(
-                f"[LiveEngine:{self._strategy_id}] close_position вернул True без transaction id; "
-                f"позиция не обновлена без подтверждения. "
-                f"{close_side.upper()} {self._ticker} x{close_qty} @ {fill_price:.4f}"
-            )
-        elif tid_or_ok:  # это tid - запускаем мониторинг
-            t = threading.Thread(
-                target=self._monitor_market_order,
-                args=(tid_or_ok, close_side, close_qty, fill_price, comment, True),
-                daemon=True,
-                name=f"market-close-monitor-{self._strategy_id}-{tid_or_ok}",
-            )
-            t.start()
-        else:
-            logger.error(
-                f"[LiveEngine:{self._strategy_id}] ОШИБКА закрытия: "
-                f"агент={self._strategy_id} тикер={self._ticker} "
-                f"сторона={close_side.upper()} qty={close_qty} цена={fill_price} "
-                f"вид=market(close) | {comment}"
-            )
+        # close_position вернул tid - запускаем мониторинг
+        t = threading.Thread(
+            target=self._monitor_market_order,
+            args=(tid_or_ok, close_side, close_qty, fill_price, comment, True),
+            daemon=True,
+            name=f"market-close-monitor-{self._strategy_id}-{tid_or_ok}",
+        )
+        t.start()
 
     def _execute_limit_price(self, side: str, qty: int, comment: str, price: float, is_close: bool = False):
         """Лимитная заявка по фиксированной цене из сигнала.
@@ -1398,9 +1434,12 @@ class LiveEngine:
         False если не исполнен или отклонён.
 
         Позиция обновляется только после подтверждения исполнения.
+
+        Fast-poll окно учитывается через _last_signal_ts: при выставлении ордера
+        мы обновляем timestamp, чтобы _poll_loop ускорил опрос цен/стакана.
         """
         _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
-        TIMEOUT_SEC = 30  # Таймаут ожидания исполнения market-ордера
+        TIMEOUT_SEC = getattr(self, "_market_timeout_sec", 45)  # Таймаут ожидания исполнения market-ордера
 
         filled = 0
         confirmed = False
@@ -1409,6 +1448,7 @@ class LiveEngine:
                      f'Мониторинг MARKET tid={tid} {side.upper()} x{qty} @ {price:.4f}')
 
         deadline = time.monotonic() + TIMEOUT_SEC
+        timeout_reached = False
 
         while self._running and time.monotonic() < deadline:
             try:
@@ -1422,10 +1462,17 @@ class LiveEngine:
                 status = info.get("status", "")
                 balance = info.get("balance")
                 quantity_field = info.get("quantity")
+                avg_price = info.get("avg_price") or info.get("price")
 
                 # Считаем фактически исполненный объём
                 if balance is not None and quantity_field is not None:
                     filled = int(quantity_field) - int(balance)
+
+                if avg_price:
+                    try:
+                        price = float(avg_price)
+                    except Exception:
+                        pass
 
                 if status == 'matched':
                     confirmed = True
@@ -1439,7 +1486,15 @@ class LiveEngine:
 
             time.sleep(0.5)
 
-        # Обновляем позицию по фактически исполненному объёму (под блокировкой)
+        if not confirmed and time.monotonic() >= deadline:
+            timeout_reached = True
+
+        trade_to_record: tuple | None = None
+        partial_trade: tuple | None = None
+        notify_payload: tuple | None = None
+        timeout_local = timeout_reached
+
+        # Под локом только обновление состояния
         with self._position_lock:
             if filled > 0 and confirmed:
                 if is_close:
@@ -1462,25 +1517,12 @@ class LiveEngine:
                         self._position_qty = -filled
                     self._entry_price = price
 
-                self._record_trade(side, filled, price, comment, order_type="market", order_ref=str(tid))
-                logger.info(f"[LiveEngine:{self._strategy_id}] "
-                            f"MARKET подтверждено: {side.upper()} filled={filled}/{qty} @ {price}")
-
-                # Уведомление об исполнении
-                try:
-                    notifier.send(
-                        EventCode.ORDER_FILLED,
-                        agent=self._strategy_id,
-                        description=f"{side.upper()} {self._ticker} x{filled} @ {price} "
-                                    f"[market] | {comment}",
-                    )
-                except Exception:
-                    pass
-
-                return True
+                trade_to_record = (side, filled, price, comment, str(tid))
+                notify_payload = (side, filled, qty, price, comment)
+                self._order_in_flight = False
+                success = True
             else:
                 if filled > 0:
-                    # Частичное исполнение без статуса matched - тоже учитываем
                     if is_close:
                         if filled >= qty:
                             self._position = 0
@@ -1497,13 +1539,46 @@ class LiveEngine:
                             self._position = -1
                             self._position_qty = -filled
                         self._entry_price = price
-                    self._record_trade(side, filled, price, comment, order_type='market', order_ref=str(tid))
-                    logger.info(f'[LiveEngine:{self._strategy_id}] '
-                                f'MARKET частично: {side.upper()} filled={filled}/{qty} @ {price:.4f}')
-                    return True
-                logger.warning(f'[LiveEngine:{self._strategy_id}] '
-                               f'MARKET tid={tid} не исполнен за {TIMEOUT_SEC} сек @ {price:.4f}')
-                return False
+                    partial_trade = (side, filled, price, comment, str(tid))
+                self._order_in_flight = False
+                success = False
+
+        # Вне лока: запись сделок и уведомления
+        if trade_to_record:
+            side_r, filled_r, price_r, comment_r, tid_r = trade_to_record
+            self._record_trade(side_r, filled_r, price_r, comment_r, order_type="market", order_ref=tid_r)
+            logger.info(
+                f"[LiveEngine:{self._strategy_id}] MARKET подтверждено: {side_r.upper()} filled={filled_r}/{qty} @ {price_r}"
+            )
+            if notify_payload:
+                try:
+                    notifier.send(
+                        EventCode.ORDER_FILLED,
+                        agent=self._strategy_id,
+                        description=f"{side_r.upper()} {self._ticker} x{filled_r} @ {price_r} "
+                                    f"[market] | {comment_r}",
+                    )
+                except Exception:
+                    pass
+            return True
+
+        if partial_trade:
+            side_p, filled_p, price_p, comment_p, tid_p = partial_trade
+            self._record_trade(side_p, filled_p, price_p, comment_p, order_type='market', order_ref=tid_p)
+            logger.info(
+                f'[LiveEngine:{self._strategy_id}] MARKET частично: {side_p.upper()} filled={filled_p}/{qty} @ {price_p:.4f}'
+            )
+            return True
+
+        if timeout_local:
+            logger.warning(
+                f'[LiveEngine:{self._strategy_id}] MARKET tid={tid} таймаут {TIMEOUT_SEC} сек, reconcile...'
+            )
+            try:
+                self._detect_position()
+            except Exception as e:
+                logger.warning(f"[LiveEngine:{self._strategy_id}] reconcile position after timeout error: {e}")
+        return success
 
     def _execute_chase(self, side: str, qty: int, comment: str, is_close: bool = False):
         """Лимитная заявка через ChaseOrder (стакан).

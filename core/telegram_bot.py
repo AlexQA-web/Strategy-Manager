@@ -236,7 +236,8 @@ class TelegramNotifier:
         self._loop.run_forever()
 
     def configure(self, token: str, chat_id: str,
-                  level: str = NotificationLevel.ALL):
+                  level: str = NotificationLevel.ALL,
+                  enabled: bool = True):
         """Настраивает бота. Вызывается при сохранении настроек."""
         if not TELEGRAM_AVAILABLE:
             logger.warning("Telegram недоступен — пакет не установлен")
@@ -246,19 +247,21 @@ class TelegramNotifier:
         self._chat_id = chat_id.strip()
         self._level = level
         self._bot = Bot(token=self._token)
-        self._enabled = True
-        logger.info(f"Telegram настроен. Уровень уведомлений: {level}")
+        self._enabled = bool(enabled)
+        logger.info(f"Telegram настроен. Уровень уведомлений: {level}, enabled={self._enabled}")
 
     def load_from_settings(self):
         """Загружает конфигурацию из settings.json."""
         token = get_setting("telegram_token")
         chat_id = get_setting("telegram_chat_id")
         level = get_setting("telegram_level", NotificationLevel.ALL)
+        tg_enabled = str(get_setting("telegram_enabled", "false")).lower() == "true"
 
-        if token and chat_id:
-            self.configure(token, chat_id, level)
+        if token and chat_id and tg_enabled:
+            self.configure(token, chat_id, level, enabled=True)
         else:
-            logger.info("Telegram не настроен (нет токена или chat_id в settings.json)")
+            self._enabled = False
+            logger.info("Telegram выключен или не настроен (нет токена/chat_id или disabled)")
         
         # Загружаем настройки для NTFY
         ntfy_notifier.load_from_settings()
@@ -408,8 +411,11 @@ class TelegramNotifier:
         ntfy_notify = get_setting(ntfy_key)
         
         # Если для какого-то канала настройка явно указана, используем её
-        telegram_enabled = self._enabled and (telegram_notify is None or str(telegram_notify).lower() == "true")
-        ntfy_enabled = self._ntfy_enabled() and (ntfy_notify is None or str(ntfy_notify).lower() == "true")
+        tg_global_enabled = str(get_setting("telegram_enabled", "false")).lower() == "true"
+        ntfy_global_enabled = str(get_setting("ntfy_enabled", "false")).lower() == "true"
+
+        telegram_enabled = self._enabled and tg_global_enabled and (telegram_notify is None or str(telegram_notify).lower() == "true")
+        ntfy_enabled = ntfy_global_enabled and self._ntfy_enabled() and (ntfy_notify is None or str(ntfy_notify).lower() == "true")
         
         # Отправляем, если хотя бы в одном канале разрешено
         if telegram_enabled or ntfy_enabled:
@@ -419,6 +425,8 @@ class TelegramNotifier:
                 return event_code in _CRITICAL_CODES
             if level == NotificationLevel.ERRORS_ONLY:
                 return event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
+            if level == "off":
+                return False
             return True
         
         return False

@@ -17,23 +17,25 @@ class NtfyNotifier:
         self._topic: Optional[str] = None
         self._enabled: bool = False
 
-    def configure(self, server_url: str, topic: str):
+    def configure(self, server_url: str, topic: str, enabled: bool = True):
         """
         Настраивает NTFY уведомления.
         
         Args:
             server_url: URL сервера NTFY (например, https://ntfy.sh)
             topic: Название топика для отправки уведомлений
+            enabled: глобальный флаг включения
         """
-        self._server_url = server_url.strip().rstrip('/')
-        self._topic = topic.strip()
+        self._server_url = server_url.strip().rstrip('/') if server_url else None
+        self._topic = topic.strip() if topic else None
         
-        # Проверяем, что все необходимые параметры заданы
-        if self._server_url and self._topic:
+        # Проверяем, что все необходимые параметры заданы и разрешены
+        if enabled and self._server_url and self._topic:
             self._enabled = True
             logger.info(f"NTFY настроен. Сервер: {self._server_url}, топик: {self._topic}")
         else:
-            logger.warning("NTFY не настроен: отсутствует URL сервера или название топика")
+            self._enabled = False
+            logger.warning("NTFY выключен или не настроен: отсутствует URL/топик или disabled")
 
     def load_from_settings(self):
         """
@@ -41,11 +43,13 @@ class NtfyNotifier:
         """
         server_url = get_setting("ntfy_server_url")
         topic = get_setting("ntfy_topic")
+        enabled = str(get_setting("ntfy_enabled", "false")).lower() == "true"
 
-        if server_url and topic:
-            self.configure(server_url, topic)
+        if server_url and topic and enabled:
+            self.configure(server_url, topic, enabled=True)
         else:
-            logger.info("NTFY не настроен (нет server_url или topic в settings.json)")
+            self._enabled = False
+            logger.info("NTFY выключен или не настроен (нет server_url/topic или disabled)")
 
     def send(self, message: str, title: str = "Trading Manager", priority: str = "default", tags: list = None) -> bool:
         """

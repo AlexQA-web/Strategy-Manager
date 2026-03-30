@@ -87,6 +87,18 @@ def _save(data: dict):
     write_json(ORDERS_FILE, data)
 
 
+# Ключ FIFO: (strategy_id, ticker, board)
+FIFO_KEY_FIELDS = ("strategy_id", "ticker", "board")
+
+
+def _key(order: dict) -> tuple[str, str, str]:
+    return (
+        str(order.get("strategy_id", "")),
+        str(order.get("ticker", "")).upper(),
+        str(order.get("board", "")).upper(),
+    )
+
+
 def save_order(order: dict):
     """Сохраняет ордер в историю. Защищено от race condition через _orders_lock."""
     with _orders_lock:
@@ -100,6 +112,9 @@ def save_order(order: dict):
                 if str(existing.get("exec_key", "") or "") == exec_key:
                     logger.debug(f"[{strategy_id}] duplicate execution ignored: exec_key={exec_key}")
                     return
+        else:
+            logger.warning(f"[{strategy_id}] save_order: нет exec_key, запись пропущена")
+            return
         data[strategy_id].append(order)
         _save(data)
     logger.debug(
@@ -158,9 +173,12 @@ def get_order_commission_total(order: dict) -> float:
 def get_order_pnl_multiplier(order: dict) -> float:
     """Возвращает денежный множитель для расчёта PnL по ордеру.
 
-    Для фьючерсов это point_cost, для акций/ETF/облигаций — lot_size.
-    Сначала используем явно сохранённый pnl_multiplier, затем пробуем
-    восстановить значение через MOEX API.
+    Приоритет:
+    1) Явный pnl_multiplier в ордере.
+    2) MOEX API по типу инструмента: фьючерсы — point_cost, акции — lot_size,
+       облигации — facevalue * minstep (если minstep нет, используем 0.01).
+    3) point_cost из ордера.
+    4) Fallback 1.0
     """
     try:
         explicit = float(order.get('pnl_multiplier', 0.0) or 0.0)
@@ -172,12 +190,26 @@ def get_order_pnl_multiplier(order: dict) -> float:
     board = str(order.get('board', '') or '').upper()
     ticker = str(order.get('ticker', '') or '').strip().upper()
 
+    def _is_futures(b: str) -> bool:
+        return 'FUT' in b or b == 'OPT'
+
+    def _is_bond(b: str) -> bool:
+        return b.startswith('TQO') or b.startswith('TQCB') or b in {'TQOD', 'TQOB', 'TQCB', 'TQCBP', 'TQOBP'}
+
     if ticker:
         try:
-            if 'FUT' in board or board == 'OPT':
+            if _is_futures(board):
                 info = MOEXClient.get_instrument_info(ticker, sec_type='futures')
                 if info and float(info.get('point_cost') or 0.0) > 0:
                     return float(info['point_cost'])
+            elif _is_bond(board):
+                info = MOEXClient.get_instrument_info(ticker, sec_type='bond')
+                if info:
+                    facevalue = float(info.get('facevalue') or 0.0)
+                    minstep = float(info.get('minstep') or 0.0)
+                    if facevalue > 0:
+                        step = minstep if minstep > 0 else 0.01
+                        return facevalue * step
             else:
                 info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
                 if info and int(info.get('lot_size') or 0) > 0:
@@ -226,6 +258,9 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
     Сопоставляет ордера в пары (открытие + закрытие) по FIFO.
     Возвращает список пар с рассчитанным П/У.
 
+    Очереди ведутся отдельно по ключу (strategy_id, ticker, board),
+    чтобы исключить матчинг разных инструментов.
+
     Пара:
     {
         "open":   {...ордер открытия...},
@@ -233,9 +268,8 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
         "pnl":    float или None,
         "is_long": bool,
     }
-    
-    NOTE: Защищено от race condition через _orders_lock, так как ранее
-    get_orders() освобождала lock до окончания долгой обработки FIFO-цикла.
+
+    NOTE: Защищено от race condition через _orders_lock.
     """
     def _slice_commission(total_commission: float, slice_qty: int, source_qty: int) -> float:
         if total_commission <= 0 or slice_qty <= 0 or source_qty <= 0:
@@ -248,18 +282,20 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
         orders = data.get(strategy_id, [])
         orders = sorted(orders, key=lambda o: o["timestamp"])
 
-        pairs = []
-        # FIFO очередь незакрытых ордеров (индекс 0 - самый старый)
-        open_queue: list[dict] = []
+        pairs: list[dict] = []
+        open_queues: dict[tuple[str, str, str], list[dict]] = {}
 
         for order in orders:
+            key = _key(order)
+            queue = open_queues.setdefault(key, [])
+
             side = order["side"]
             qty = int(order["quantity"])
             remaining_qty = qty
             remaining_commission_total = get_order_commission_total(order)
 
-            while remaining_qty > 0 and open_queue:
-                open_order = open_queue[0]  # Берём самый старый ордер (FIFO)
+            while remaining_qty > 0 and queue:
+                open_order = queue[0]  # Берём самый старый ордер (FIFO) в своей паре
                 open_qty = int(open_order["quantity"])
 
                 if side == open_order["side"]:
@@ -316,12 +352,12 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
                 remaining_commission_total -= exit_commission
                 if close_qty >= open_qty:
                     # Открывающий ордер полностью закрыт
-                    open_queue.pop(0)
+                    queue.pop(0)
                 else:
                     # Частичное закрытие — обновляем количество и остаток комиссии
                     open_remaining_qty = open_qty - close_qty
                     open_remaining_commission = open_commission_total - entry_commission
-                    open_queue[0] = {
+                    queue[0] = {
                         **open_order,
                         "quantity": open_remaining_qty,
                         "commission_total": open_remaining_commission,
@@ -331,11 +367,11 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
                         ),
                     }
 
-            # Если остаток не закрыт — добавляем в очередь
+            # Если остаток не закрыт — добавляем в очередь своей пары
             if remaining_qty > 0:
                 if remaining_qty < qty:
                     # Частично закрыт другими ордерами — создаём новую запись с остатком
-                    open_queue.append({
+                    queue.append({
                         **order,
                         "quantity": remaining_qty,
                         "commission_total": remaining_commission_total,
@@ -351,16 +387,17 @@ def get_order_pairs(strategy_id: str) -> list[dict]:
                             **order,
                             "commission_total": remaining_commission_total,
                         }
-                    open_queue.append(order)
+                    queue.append(order)
 
-        # Незакрытые позиции
-        for open_order in open_queue:
-            pairs.append({
-                "open": open_order,
-                "close": None,
-                "pnl": None,
-                "is_long": open_order["side"] == "buy",
-            })
+        # Незакрытые позиции по всем ключам
+        for queue in open_queues.values():
+            for open_order in queue:
+                pairs.append({
+                    "open": open_order,
+                    "close": None,
+                    "pnl": None,
+                    "is_long": open_order["side"] == "buy",
+                })
 
         return pairs
 

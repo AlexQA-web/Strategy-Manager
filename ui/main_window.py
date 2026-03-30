@@ -1440,15 +1440,27 @@ class MainWindow(QMainWindow):
 
         data = get_strategy(sid)
         if data:
+            # Проверяем подключение коннектора до смены статуса
+            from core.connector_manager import get_connector
+            connector = get_connector(data.get("connector", ""))
+            if not connector or not connector.is_connected():
+                self._log(
+                    f"Агент [{data['name']}] не запущен: коннектор офлайн",
+                    "error"
+                )
+                return
+
             data["status"] = "active"
             save_strategy(sid, data)
-            if start_live_engine(sid, wait_for_connection=False):
+            if start_live_engine(sid, wait_for_connection=True):
                 self._log(f"Агент [{data['name']}] запущен", "info")
             else:
                 self._log(
-                    f"Агент [{data['name']}] помечен active, но LiveEngine не запущен",
-                    "warning"
+                    f"Агент [{data['name']}] не запущен: коннектор офлайн",
+                    "error"
                 )
+                data["status"] = "stopped"
+                save_strategy(sid, data)
             ui_signals.strategies_changed.emit()
 
     def _stop_agent(self, sid: str):

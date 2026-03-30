@@ -817,6 +817,8 @@ class _SettingsMixin:
         save_setting("telegram_token",   self.tg_token.text().strip())
         save_setting("telegram_chat_id", self.tg_chat_id.text().strip())
         save_setting("telegram_enabled", "true" if self.tg_enabled.isChecked() else "false")
+        # Обновляем состояние нотификатора сразу после сохранения
+        notifier.load_from_settings()
         
         # NTFY
         save_setting("ntfy_server_url", self.ntfy_server_url.text().strip())
@@ -828,6 +830,9 @@ class _SettingsMixin:
             save_setting(key, "true" if cb.isChecked() else "false")
         for key, cb in self._notify_ntfy_checks.items():
             save_setting(key, "true" if cb.isChecked() else "false")
+
+        # Применяем настройки после сохранения (обновление ntfy/telegram)
+        notifier.load_from_settings()
 
         # Общие
         save_setting("autoconnect",           "true" if self.chk_autoconnect.isChecked()       else "false")

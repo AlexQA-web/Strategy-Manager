@@ -207,14 +207,14 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
         return {"action": None}
 
     # EXIT — приоритет над входом
-    if position != 0 and time_min == time_close and weekday not in (6, 7):
+    if position != 0 and _in_close_window(time_min, time_close) and weekday not in (6, 7):
         return {"action": "close", "qty": qty, "comment": "Close EOD"}
 
     if position != 0:
         return {"action": None}
 
-    # ENTRY
-    if not (time_open < time_min < time_limit):
+    # ENTRY (поддержка overnight: окно может быть через полночь)
+    if not _in_open_window(time_min, time_open, time_limit):
         return {"action": None}
     if date_int in _EXCLUDE_DATES:
         return {"action": None}

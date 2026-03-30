@@ -48,9 +48,9 @@ class FinamConnector(BaseConnector):
         self._sec_info_failure_ttl = 300.0
         self._error_throttle: dict[str, float] = {}  # {message: monotonic_ts}
         self._error_throttle_ttl = 300.0
-        # Для get_history — ожидание свечей из callback
-        self._candles_event = threading.Event()
-        self._candles_buffer: list[dict] = []
+        # Для get_history — пер-запросный контекст
+        self._history_waiters: dict[tuple[str, int], dict] = {}  # key -> {buffer: list, event: Event}
+        self._history_waiters_lock = threading.Lock()
         # Подписка на свечи с callback (для LiveEngine)
         self._candle_callbacks: dict[tuple[str, int], list[Callable]] = {}  # (seccode, period) → [cb]
         self._candle_callbacks_lock = threading.Lock()
@@ -1300,10 +1300,11 @@ class FinamConnector(BaseConnector):
             self._send_command(cmd)
 
     def _on_candles(self, root):
-        """Callback: парсит <candles> и складывает в буфер + вызывает подписчиков."""
+        """Callback: парсит <candles> и раскладывает по per-request буферу + вызывает подписчиков."""
         status = root.get("status", "")
         seccode = root.get("seccode", "?")
         period = int(root.get("period", "0") or "0")
+        key = (seccode, period)
         rows = []
         for c in root.findall("candle"):
             try:
@@ -1323,19 +1324,23 @@ class FinamConnector(BaseConnector):
         # status=2: начало потока данных
         # status=3: нет данных
 
+        waiter = None
+        with self._history_waiters_lock:
+            waiter = self._history_waiters.get(key)
+
         if status == "3":
             logger.warning(f"[Finam] Сервер вернул status=3 (нет данных) для {seccode}")
-            self._candles_buffer = []
-            self._candles_event.set()
+            if waiter:
+                waiter["buffer"] = []
+                waiter["event"].set()
             return
 
-        # For synchronous get_history, keep a copy to avoid callback-side mutation.
-        self._candles_buffer = [dict(r) for r in rows]
-        self._candles_event.set()
+        if waiter is not None and status in {"0", "1", "2"}:
+            waiter["buffer"] = [dict(r) for r in rows]
+            waiter["event"].set()
 
         # Вызываем зарегистрированные callbacks для (seccode, period)
         if rows:
-            key = (seccode, period)
             with self._candle_callbacks_lock:
                 cbs = list(self._candle_callbacks.get(key, []))
             if cbs:
@@ -1360,7 +1365,7 @@ class FinamConnector(BaseConnector):
 
     def get_history(self, ticker: str, board: str,
                     period: str, days: int):
-        """Запрашивает свечи через DLL и возвращает DataFrame."""
+        """Запрашивает свечи через DLL и возвращает DataFrame (per-request буфер)."""
         if not self._connected:
             return None
         try:
@@ -1368,7 +1373,6 @@ class FinamConnector(BaseConnector):
             from datetime import datetime, timedelta
 
             kind = self._PERIOD_TO_CANDLEKIND.get(period, 3)
-            # Кол-во баров по таймфрейму: торговых минут в дне ~840 (фьючерсы)
             bars_per_day = {
                 "1m": 840, "5m": 168, "15m": 56, "30m": 28,
                 "1h": 14, "4h": 4, "1d": 1,
@@ -1376,29 +1380,114 @@ class FinamConnector(BaseConnector):
             bpd = bars_per_day.get(period, 56)
             count = days * bpd
 
-            # Пробуем gethistorydata, при ошибке/таймауте — fallback на subscribe
-            self._candles_event.clear()
-            self._candles_buffer = []
+            key = (ticker, kind)
+            waiter = {"buffer": [], "event": threading.Event()}
+            with self._history_waiters_lock:
+                self._history_waiters[key] = waiter
 
+            try:
+                cmd = (
+                    f'<command id="gethistorydata">'
+                    f'<security><board>{board}</board><seccode>{ticker}</seccode></security>'
+                    f'<period>{kind}</period>'
+                    f'<count>{count}</count>'
+                    f'<reset>true</reset>'
+                    f'</command>'
+                )
+                response = self._send_command(cmd)
+                err = self._parse_error(response)
+                if err:
+                    logger.warning(f"[Finam] get_history error: {err}, пробуем subscribe")
+                    return self._get_history_via_subscribe(ticker, board, kind, days)
+
+                if not waiter["event"].wait(timeout=10):
+                    logger.warning(f"[Finam] get_history: таймаут {ticker}, пробуем subscribe")
+                    return self._get_history_via_subscribe(ticker, board, kind, days)
+
+                rows = waiter["buffer"]
+                if not rows:
+                    return None
+
+                normalized_rows = []
+                for r in rows:
+                    row = dict(r)
+                    dt = self._parse_candle_dt(row)
+                    if dt is None:
+                        continue
+                    row["datetime"] = dt
+                    normalized_rows.append(row)
+
+                if not normalized_rows:
+                    logger.warning(f"[Finam] get_history: no valid candle datetime for {ticker}")
+                    return None
+
+                df = pd.DataFrame(normalized_rows)
+                df.rename(columns={
+                    "open": "Open", "high": "High",
+                    "low": "Low", "close": "Close", "volume": "Volume",
+                }, inplace=True)
+                df.set_index("datetime", inplace=True)
+                df.sort_index(inplace=True)
+
+                cutoff = datetime.now() - timedelta(days=days)
+                df = df[df.index >= cutoff]
+
+                logger.debug(f"[Finam] get_history {ticker} {period}: {len(df)} свечей")
+                return df if not df.empty else None
+
+            finally:
+                with self._history_waiters_lock:
+                    self._history_waiters.pop(key, None)
+
+        except Exception as e:
+            logger.error(f"[Finam] get_history error: {e}")
+            return None
+
+    def _get_history_via_subscribe(self, ticker: str, board: str,
+                                    kind: int, days: int):
+        """Fallback: получает свечи через subscribe (per-request буфер)."""
+        import pandas as pd
+        from datetime import datetime, timedelta
+
+        key = (ticker, kind)
+        waiter = {"buffer": [], "event": threading.Event()}
+        with self._history_waiters_lock:
+            self._history_waiters[key] = waiter
+
+        try:
             cmd = (
-                f'<command id="gethistorydata">'
-                f'<security><board>{board}</board><seccode>{ticker}</seccode></security>'
-                f'<period>{kind}</period>'
-                f'<count>{count}</count>'
-                f'<reset>true</reset>'
-                f'</command>'
+                f'<command id="subscribe">'
+                f'<candles><security><board>{board}</board>'
+                f'<seccode>{ticker}</seccode></security>'
+                f'<period>{kind}</period><count>{days * 500}</count>'
+                f'</candles></command>'
             )
             response = self._send_command(cmd)
             err = self._parse_error(response)
             if err:
-                logger.warning(f"[Finam] get_history error: {err}, пробуем subscribe")
-                return self._get_history_via_subscribe(ticker, board, kind, days)
+                logger.warning(f"[Finam] subscribe candles error: {err}")
+                return None
 
-            if not self._candles_event.wait(timeout=10):
-                logger.warning(f"[Finam] get_history: таймаут {ticker}, пробуем subscribe")
-                return self._get_history_via_subscribe(ticker, board, kind, days)
+            if not waiter["event"].wait(timeout=15):
+                logger.warning(f"[Finam] subscribe candles: таймаут {ticker}")
+                unsub = (
+                    f'<command id="unsubscribe">'
+                    f'<candles><security><board>{board}</board>'
+                    f'<seccode>{ticker}</seccode></security>'
+                    f'<period>{kind}</period></candles></command>'
+                )
+                self._send_command(unsub)
+                return None
 
-            rows = self._candles_buffer
+            unsub = (
+                f'<command id="unsubscribe">'
+                f'<candles><security><board>{board}</board>'
+                f'<seccode>{ticker}</seccode></security>'
+                f'<period>{kind}</period></candles></command>'
+            )
+            self._send_command(unsub)
+
+            rows = waiter["buffer"]
             if not rows:
                 return None
 
@@ -1412,7 +1501,7 @@ class FinamConnector(BaseConnector):
                 normalized_rows.append(row)
 
             if not normalized_rows:
-                logger.warning(f"[Finam] get_history: no valid candle datetime for {ticker}")
+                logger.warning(f"[Finam] _get_history_via_subscribe: no valid candle datetime for {ticker}")
                 return None
 
             df = pd.DataFrame(normalized_rows)
@@ -1426,86 +1515,12 @@ class FinamConnector(BaseConnector):
             cutoff = datetime.now() - timedelta(days=days)
             df = df[df.index >= cutoff]
 
-            logger.debug(f"[Finam] get_history {ticker} {period}: {len(df)} свечей")
+            logger.info(f"[Finam] _get_history_via_subscribe {ticker}: {len(df)} свечей")
             return df if not df.empty else None
 
-        except Exception as e:
-            logger.error(f"[Finam] get_history error: {e}")
-            return None
-
-    def _get_history_via_subscribe(self, ticker: str, board: str,
-                                    kind: int, days: int):
-        """Fallback: получает свечи через subscribe вместо gethistorydata."""
-        import pandas as pd
-        from datetime import datetime, timedelta
-
-        self._candles_event.clear()
-        self._candles_buffer = []
-
-        cmd = (
-            f'<command id="subscribe">'
-            f'<candles><security><board>{board}</board>'
-            f'<seccode>{ticker}</seccode></security>'
-            f'<period>{kind}</period><count>{days * 500}</count>'
-            f'</candles></command>'
-        )
-        response = self._send_command(cmd)
-        err = self._parse_error(response)
-        if err:
-            logger.warning(f"[Finam] subscribe candles error: {err}")
-            return None
-
-        if not self._candles_event.wait(timeout=15):
-            logger.warning(f"[Finam] subscribe candles: таймаут {ticker}")
-            # Отписываемся
-            unsub = (
-                f'<command id="unsubscribe">'
-                f'<candles><security><board>{board}</board>'
-                f'<seccode>{ticker}</seccode></security>'
-                f'<period>{kind}</period></candles></command>'
-            )
-            self._send_command(unsub)
-            return None
-
-        # Отписываемся после получения данных
-        unsub = (
-            f'<command id="unsubscribe">'
-            f'<candles><security><board>{board}</board>'
-            f'<seccode>{ticker}</seccode></security>'
-            f'<period>{kind}</period></candles></command>'
-        )
-        self._send_command(unsub)
-
-        rows = self._candles_buffer
-        if not rows:
-            return None
-
-        normalized_rows = []
-        for r in rows:
-            row = dict(r)
-            dt = self._parse_candle_dt(row)
-            if dt is None:
-                continue
-            row["datetime"] = dt
-            normalized_rows.append(row)
-
-        if not normalized_rows:
-            logger.warning(f"[Finam] _get_history_via_subscribe: no valid candle datetime for {ticker}")
-            return None
-
-        df = pd.DataFrame(normalized_rows)
-        df.rename(columns={
-            "open": "Open", "high": "High",
-            "low": "Low", "close": "Close", "volume": "Volume",
-        }, inplace=True)
-        df.set_index("datetime", inplace=True)
-        df.sort_index(inplace=True)
-
-        cutoff = datetime.now() - timedelta(days=days)
-        df = df[df.index >= cutoff]
-
-        logger.info(f"[Finam] _get_history_via_subscribe {ticker}: {len(df)} свечей")
-        return df if not df.empty else None
+        finally:
+            with self._history_waiters_lock:
+                self._history_waiters.pop(key, None)
 
     # ── Chase Order ─────────────────────────────────────────────────────
 

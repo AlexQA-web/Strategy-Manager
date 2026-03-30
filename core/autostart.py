@@ -172,6 +172,12 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
                     f"[autostart] [{strategy_id}] коннектор '{connector_id}' не подключён, LiveEngine не запущен"
                 )
                 return False
+        # Дополнительная валидация перед стартом: отказ если офлайн
+        if not connector.is_connected():
+            logger.warning(
+                f"[autostart] [{strategy_id}] коннектор '{connector_id}' офлайн, запуск отменён"
+            )
+            return False
         try:
             engine = LiveEngine(
                 strategy_id=strategy_id,

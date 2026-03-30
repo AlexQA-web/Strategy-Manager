@@ -49,20 +49,22 @@ class QuikConnector(BaseConnector):
             # Проверяем связь с брокерским сервером
             result = self._client.is_connected()
             if result.get("data") == 1:
+                if not self._is_broker_online():
+                    logger.warning("[QUIK] Lua подключён, но брокерский сервер оффлайн — статус disconnected")
+                    self._connected = False
+                    self._fire(self._on_disconnect)
+                    return False
                 self._connected = True
                 self._stop_reconnect.clear()
-                self.start_reconnect_loop()  # Запускаем мониторинг реконнекта
+                self.start_reconnect_loop()
                 logger.info("[QUIK] ✅ Подключён к серверу брокера")
                 self._fire(self._on_connect)
                 return True
             else:
                 logger.warning("[QUIK] Lua-скрипт работает, но терминал не подключён к серверу брокера")
-                # Соединение с Lua есть — считаем подключённым (торговать нельзя, но работать можно)
-                self._connected = True
-                self._stop_reconnect.clear()
-                self.start_reconnect_loop()  # Запускаем мониторинг реконнекта
-                self._fire(self._on_connect)
-                return True
+                self._connected = False
+                self._fire(self._on_disconnect)
+                return False
 
         except ConnectionRefusedError:
             msg = (f"Не удалось подключиться к {host}:{requests_port}. "
@@ -101,30 +103,40 @@ class QuikConnector(BaseConnector):
         self._fire(self._on_disconnect)
 
     def is_connected(self) -> bool:
-        """Проверяет состояние подключения к QUIK.
-        
-        Использует кэшированное состояние _connected, но также проверяет что
-        _client существует. Реальная проверка соединения (ping) выполняется
-        в фоновом потоке reconnect_loop.
-        """
-        # Проверяем не только флаг, но и что клиент жив
+        """Проверяет состояние подключения к QUIK и брокеру."""
         if not self._connected or self._client is None:
             return False
-        return True
+        return self._is_broker_online()
 
     def ping(self) -> bool:
-        """Реальная проверка соединения через легкий запрос.
-        
-        Используется reconnect_loop для определения реального состояния.
-        """
+        """Реальная проверка соединения через легкий запрос + брокер."""
         if not self._connected or self._client is None:
             return False
         try:
-            # Используем is_connected() — легкий запрос без параметров
             with self._lock:
                 result = self._client.is_connected()
-            return result.get("data") == 1
+            if result.get("data") != 1:
+                return False
+            return self._is_broker_online()
         except Exception:
+            return False
+
+    def _is_broker_online(self) -> bool:
+        """Проверка доступности брокерского сервера через SERVERTIME.
+
+        Если сервер недоступен, QUIK возвращает пустой/нулевой параметр.
+        Метод intentionally лёгкий и вызывается в connect/ping/is_connected.
+        """
+        if not self._client:
+            return False
+        try:
+            with self._lock:
+                result = self._client.get_info_param("SERVERTIME")
+            data = result.get("data", {}) if isinstance(result, dict) else {}
+            value = data.get("param_value")
+            return bool(value)
+        except Exception as e:
+            logger.debug(f"[QUIK] broker_online check error: {e}")
             return False
 
     # ── Ордера ──────────────────────────────────────────────────────────
@@ -401,33 +413,82 @@ class QuikConnector(BaseConnector):
     def get_positions(self, account_id: str) -> list[dict]:
         """Позиции по счёту. account_id может быть client_code (10U9QR) или trdaccid.
         Резолвим оба варианта через _resolve_trade_acc чтобы не терять позиции.
+
+        ВАЖНО: используем реальные таблицы позиций, не depo limits.
+        - Акции: get_portfolio_info_ex + get_client_portfolio_info
+        - Фьючерсы: get_futures_client_holding
         """
         if not self._connected or not self._client:
             return []
         try:
             trade_ids = self._resolve_trade_acc(account_id)
-            with self._lock:
-                result = self._client.get_all_depo_limits()
-            items = result.get("data", [])
-            if not isinstance(items, list):
-                return []
-            positions = []
-            for item in items:
-                item_trd = item.get("trdaccid", "")
-                item_cc  = item.get("client_code", "")
-                if item_trd not in trade_ids and item_cc not in trade_ids:
-                    continue
-                qty = float(item.get("currentbal", 0))
-                if qty == 0:
-                    continue
-                positions.append({
-                    "ticker":        item.get("sec_code", ""),
-                    "board":         item.get("class_code", "TQBR"),
-                    "quantity":      qty,
-                    "avg_price":     float(item.get("awg_position_price", 0)),
-                    "current_price": 0.0,  # получается отдельным запросом
-                    "pnl":           0.0,
-                })
+            positions: list[dict] = []
+
+            # Фьючерсы: get_futures_client_holding
+            try:
+                with self._lock:
+                    fut = self._client.get_futures_client_holding()
+                fut_rows = fut.get("data", []) if fut else []
+                if isinstance(fut_rows, list):
+                    for row in fut_rows:
+                        trd = str(row.get("trdaccid", ""))
+                        if trd not in trade_ids:
+                            continue
+                        qty = float(row.get("totalnet", 0))
+                        if qty == 0:
+                            continue
+                        positions.append({
+                            "ticker":        row.get("sec_code", ""),
+                            "board":         row.get("class_code", "FUT"),
+                            "quantity":      qty,
+                            "avg_price":     float(row.get("avrposnprice", 0)),
+                            "current_price": 0.0,
+                            "pnl":           0.0,
+                        })
+            except Exception as e:
+                logger.debug(f"[QUIK] futures holding error: {e}")
+
+            # Акции: get_portfolio_info_ex и get_client_portfolio_info (остатки T0/T+)
+            try:
+                with self._lock:
+                    p_ex = self._client.get_portfolio_info_ex(account_id)
+                p_items = p_ex.get("data", []) if p_ex else []
+                if isinstance(p_items, list):
+                    for row in p_items:
+                        qty = float(row.get("currentbal", 0))
+                        if qty == 0:
+                            continue
+                        positions.append({
+                            "ticker":        row.get("sec_code", ""),
+                            "board":         row.get("class_code", "TQBR"),
+                            "quantity":      qty,
+                            "avg_price":     float(row.get("awg_position_price", 0)),
+                            "current_price": 0.0,
+                            "pnl":           0.0,
+                        })
+            except Exception as e:
+                logger.debug(f"[QUIK] portfolio_info_ex error: {e}")
+
+            try:
+                with self._lock:
+                    p_cli = self._client.get_client_portfolio_info(account_id)
+                p_items2 = p_cli.get("data", []) if p_cli else []
+                if isinstance(p_items2, list):
+                    for row in p_items2:
+                        qty = float(row.get("currentbalance", 0))
+                        if qty == 0:
+                            continue
+                        positions.append({
+                            "ticker":        row.get("sec_code", ""),
+                            "board":         row.get("class_code", "TQBR"),
+                            "quantity":      qty,
+                            "avg_price":     float(row.get("avgprice", 0)),
+                            "current_price": 0.0,
+                            "pnl":           0.0,
+                        })
+            except Exception as e:
+                logger.debug(f"[QUIK] client_portfolio_info error: {e}")
+
             return positions
         except Exception as e:
             logger.error(f"[QUIK] get_positions error: {e}")

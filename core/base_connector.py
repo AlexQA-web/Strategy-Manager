@@ -14,6 +14,11 @@ class BaseConnector(ABC):
         self._on_reconnect: Optional[Callable] = None
         self._on_error: Optional[Callable] = None
         self._on_positions_update: Optional[Callable] = None
+        self._connect_listeners: list[Callable] = []
+        self._disconnect_listeners: list[Callable] = []
+        self._reconnect_listeners: list[Callable] = []
+        self._error_listeners: list[Callable[[str], None]] = []
+        self._positions_listeners: list[Callable] = []
         self._reconnect_attempts: int  = 5
         self._reconnect_delay:    int  = 5   # базовая задержка (секунд)
         self._stop_reconnect = threading.Event()
@@ -111,13 +116,32 @@ class BaseConnector(ABC):
         self._reconnect_delay    = delay
 
     def _fire(self, cb: Optional[Callable], *args):
-        """Безопасный вызов колбэка."""
+        """Безопасный вызов колбэка + всех подписчиков."""
         if cb:
             try:
                 cb(*args)
             except Exception as e:
                 from loguru import logger
                 logger.error(f"[{self.__class__.__name__}] callback error: {e}")
+        # Вызываем соответствующие списки слушателей
+        listeners: list[Callable] = []
+        if cb is self._on_connect:
+            listeners = list(self._connect_listeners)
+        elif cb is self._on_disconnect:
+            listeners = list(self._disconnect_listeners)
+        elif cb is self._on_reconnect:
+            listeners = list(self._reconnect_listeners)
+        elif cb is self._on_error:
+            listeners = list(self._error_listeners)
+        elif cb is self._on_positions_update:
+            listeners = list(self._positions_listeners)
+
+        for listener in listeners:
+            try:
+                listener(*args)
+            except Exception as e:
+                from loguru import logger
+                logger.error(f"[{self.__class__.__name__}] listener error: {e}")
 
     def on_connect(self, callback: Callable[[], None]):
         self._on_connect = callback
@@ -134,9 +158,46 @@ class BaseConnector(ABC):
     def on_positions_update(self, callback: Callable[[], None]):
         self._on_positions_update = callback
 
+    # Подписки на множественные слушатели
+    def subscribe_connect(self, callback: Callable[[], None]):
+        if callback not in self._connect_listeners:
+            self._connect_listeners.append(callback)
+
+    def unsubscribe_connect(self, callback: Callable[[], None]):
+        self._connect_listeners = [cb for cb in self._connect_listeners if cb is not callback]
+
+    def subscribe_disconnect(self, callback: Callable[[], None]):
+        if callback not in self._disconnect_listeners:
+            self._disconnect_listeners.append(callback)
+
+    def unsubscribe_disconnect(self, callback: Callable[[], None]):
+        self._disconnect_listeners = [cb for cb in self._disconnect_listeners if cb is not callback]
+
+    def subscribe_reconnect(self, callback: Callable[[], None]):
+        if callback not in self._reconnect_listeners:
+            self._reconnect_listeners.append(callback)
+
+    def unsubscribe_reconnect(self, callback: Callable[[], None]):
+        self._reconnect_listeners = [cb for cb in self._reconnect_listeners if cb is not callback]
+
+    def subscribe_error(self, callback: Callable[[str], None]):
+        if callback not in self._error_listeners:
+            self._error_listeners.append(callback)
+
+    def unsubscribe_error(self, callback: Callable[[str], None]):
+        self._error_listeners = [cb for cb in self._error_listeners if cb is not callback]
+
+    def subscribe_positions(self, callback: Callable[[], None]):
+        if callback not in self._positions_listeners:
+            self._positions_listeners.append(callback)
+
+    def unsubscribe_positions(self, callback: Callable[[], None]):
+        self._positions_listeners = [cb for cb in self._positions_listeners if cb is not callback]
+
     def off_positions_update(self):
         """Отписка от обновлений позиций."""
         self._on_positions_update = None
+        self._positions_listeners = []
 
     # ── Авторекконект с экспоненциальным backoff ─────────────────────────
 
