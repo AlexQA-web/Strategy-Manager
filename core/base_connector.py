@@ -96,7 +96,7 @@ class BaseConnector(ABC):
         ticker: str,
         quantity: int = 0,
         agent_name: str = "",
-    ) -> bool: ...
+    ) -> Optional[str]: ...
 
     def chase_order(
         self,

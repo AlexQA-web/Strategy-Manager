@@ -522,16 +522,16 @@ class MainWindow(QMainWindow):
         strategy_scheduler.start()
 
         # Финам
-        finam_connector._on_connect = lambda: ui_signals.connector_changed.emit("finam", True)
-        finam_connector._on_disconnect = lambda: ui_signals.connector_changed.emit("finam", False)
-        finam_connector._on_error = lambda m: ui_signals.log_message.emit(f"[Финам] Ошибка: {m}", "error")
-        finam_connector._on_positions_update = lambda: ui_signals.positions_updated.emit()
+        finam_connector.subscribe_connect(lambda: ui_signals.connector_changed.emit("finam", True))
+        finam_connector.subscribe_disconnect(lambda: ui_signals.connector_changed.emit("finam", False))
+        finam_connector.subscribe_error(lambda m: ui_signals.log_message.emit(f"[Финам] Ошибка: {m}", "error"))
+        finam_connector.subscribe_positions(lambda: ui_signals.positions_updated.emit())
 
         # QUIK
-        quik_connector._on_connect = lambda: ui_signals.connector_changed.emit("quik", True)
-        quik_connector._on_disconnect = lambda: ui_signals.connector_changed.emit("quik", False)
-        quik_connector._on_error = lambda m: ui_signals.log_message.emit(f"[QUIK] Ошибка: {m}", "error")
-        quik_connector._on_positions_update = lambda: ui_signals.positions_updated.emit()
+        quik_connector.subscribe_connect(lambda: ui_signals.connector_changed.emit("quik", True))
+        quik_connector.subscribe_disconnect(lambda: ui_signals.connector_changed.emit("quik", False))
+        quik_connector.subscribe_error(lambda m: ui_signals.log_message.emit(f"[QUIK] Ошибка: {m}", "error"))
+        quik_connector.subscribe_positions(lambda: ui_signals.positions_updated.emit())
 
         logger.add(self._handle_log, level="DEBUG", format="{message}")
         self._preload_strategies()
@@ -1437,15 +1437,15 @@ class MainWindow(QMainWindow):
 
     def _start_agent(self, sid: str):
         from core.autostart import start_live_engine
+        from core.connector_manager import connector_manager
 
         data = get_strategy(sid)
         if data:
-            # Проверяем подключение коннектора до смены статуса
-            from core.connector_manager import get_connector
-            connector = get_connector(data.get("connector", ""))
+            connector_id = data.get("connector", "finam")
+            connector = connector_manager.get(connector_id)
             if not connector or not connector.is_connected():
                 self._log(
-                    f"Агент [{data['name']}] не запущен: коннектор офлайн",
+                    f"Агент [{data['name']}] не запущен: коннектор [{connector_id}] офлайн",
                     "error"
                 )
                 return

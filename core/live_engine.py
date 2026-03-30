@@ -142,6 +142,20 @@ class LiveEngine:
         self._last_reconcile_ts = 0.0
         self._last_reconcile_alert_ts = 0.0
 
+        # Счётчик последовательных тайм-аутов get_history
+        self._consecutive_timeouts: int = 0
+        self._MAX_CONSECUTIVE_TIMEOUTS = 5
+        
+        # Параметры риск-менеджмента
+        self._max_position_size: int = int(
+            params.get("max_position_size", 0) or 0
+        )  # 0 = без ограничений
+        self._daily_loss_limit: float = float(
+            params.get("daily_loss_limit", 0.0) or 0.0
+        )  # 0.0 = без ограничений
+        self._daily_pnl: float = 0.0
+        self._today_date: str = ""
+
     def _record_failure(self):
         """Регистрирует ошибку для circuit breaker."""
         now = time.monotonic()
@@ -154,9 +168,103 @@ class LiveEngine:
         if self._consecutive_failures >= self._CIRCUIT_BREAKER_THRESHOLD:
             logger.error(
                 f"[LiveEngine:{self._strategy_id}] CIRCUIT BREAKER: "
-                f"{self._consecutive_failures} ошибок подряд, стратегия остановлена"
+                f"{self._consecutive_failures} ошибок подряд — аварийное закрытие позиции"
             )
+            self._emergency_close_position()
             self.stop()
+
+    def _check_risk_limits(self, action: str, qty: int) -> tuple[bool, str]:
+        """Проверяет лимиты риска перед исполнением ордера.
+        
+        Returns:
+            (allowed, reason): True если ордер разрешён, причина отказа если нет.
+        """
+        # 1. Лимит размера позиции
+        if self._max_position_size > 0 and action in ("buy", "sell"):
+            if qty > self._max_position_size:
+                return False, (
+                    f"qty={qty} превышает max_position_size={self._max_position_size}"
+                )
+
+        # 2. Дневной лимит убытков
+        if self._daily_loss_limit > 0:
+            from datetime import date
+            today = date.today().isoformat()
+            if today != self._today_date:
+                self._today_date = today
+                self._daily_pnl = 0.0  # сброс в начале нового дня
+
+            # Текущий реализованный PnL за сегодня
+            # (упрощённо — разница от нуля в начале дня)
+            from core.order_history import get_total_pnl
+            realized = get_total_pnl(self._strategy_id) or 0.0
+            if realized < -abs(self._daily_loss_limit):
+                return False, (
+                    f"Дневной лимит убытков достигнут: "
+                    f"realized={realized:.2f}, limit={self._daily_loss_limit:.2f}"
+                )
+
+        return True, ""
+
+    def _emergency_close_position(self):
+        """Экстренное закрытие позиции при circuit breaker.
+        
+        Вызывается из daemon-потока — не блокирует GUI.
+        Не кидает исключений: любая ошибка только логируется.
+        """
+        with self._position_lock:
+            qty = self._position_qty
+            pos = self._position
+
+        if qty == 0 or pos == 0:
+            return  # позиции нет — ничего не делаем
+
+        close_side = "sell" if pos == 1 else "buy"
+        abs_qty = abs(qty)
+        logger.warning(
+            f"[LiveEngine:{self._strategy_id}] "
+            f"АВАРИЙНОЕ ЗАКРЫТИЕ: {close_side.upper()} {self._ticker} x{abs_qty}"
+        )
+        try:
+            tid = self._connector.place_order(
+                account_id=self._account_id,
+                ticker=self._ticker,
+                side=close_side,
+                quantity=abs_qty,
+                order_type="market",
+                board=self._board,
+                agent_name=self._agent_name,
+            )
+            if tid:
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] "
+                    f"Аварийный ордер принят: tid={tid}"
+                )
+            else:
+                logger.error(
+                    f"[LiveEngine:{self._strategy_id}] "
+                    f"Аварийный ордер ОТКЛОНЁН брокером — позиция остаётся открытой!"
+                )
+        except Exception as e:
+            logger.error(
+                f"[LiveEngine:{self._strategy_id}] "
+                f"Ошибка аварийного закрытия: {e} — позиция остаётся открытой!"
+            )
+
+        # Telegram-уведомление о crash — независимо от результата закрытия
+        try:
+            from core.telegram_bot import notifier, EventCode
+            notifier.send(
+                EventCode.STRATEGY_CRASHED,
+                agent=self._strategy_id,
+                description=(
+                    f"Circuit breaker сработал после {self._CIRCUIT_BREAKER_THRESHOLD} ошибок. "
+                    f"Попытка закрыть позицию {close_side.upper()} {self._ticker} x{abs_qty}."
+                ),
+                traceback="",
+            )
+        except Exception:
+            pass
 
     def _record_success(self):
         """Сбрасывает счётчик ошибок при успешной операции."""
@@ -246,7 +354,7 @@ class LiveEngine:
 
         return self._calculate_commission_manual(ticker, abs_qty, price, sec_type)
 
-    def _load_point_cost(self):
+    def _load_point_cost(self) -> bool:
         """Загружает стоимость пункта из коннектора.
 
         Приоритет источников:
@@ -254,6 +362,9 @@ class LiveEngine:
           2. point_cost из get_sec_info коннектора
 
         Требование: point_cost и lot_size должны быть >0, иначе старт запрещён.
+        
+        Returns:
+            True при успехе, False если данные недоступны.
         """
         try:
             if hasattr(self._connector, 'get_sec_info'):
@@ -280,7 +391,7 @@ class LiveEngine:
                                 f'[LiveEngine:{self._strategy_id}] point_cost={self._point_cost} '
                                 f'lot_size={self._lot_size} (из MOEX API для {self._ticker})'
                             )
-                            return
+                            return True
 
                     # Приоритет 2: point_cost от коннектора
                     if pc_from_connector > 0:
@@ -293,14 +404,34 @@ class LiveEngine:
                             f' lot_size={self._lot_size}'
                             f" step_cost={round(pc_from_connector * float(minstep), 6) if minstep else 'n/a'}"
                         )
-                        return
+                        return True
 
             # Если сюда дошли — point_cost не найден
             logger.error(f"[LiveEngine:{self._strategy_id}] point_cost не получен — старт запрещён")
             self._point_cost = 0.0
+
+            # Финальный fallback: попробовать получить lot_size из MOEX API
+            # чтобы комиссия рассчитывалась корректно даже при недоступности брокерских данных
+            if not self._is_futures(self._ticker):  # только для акций — для фьючерсов point_cost критичен
+                try:
+                    from core.moex_api import MOEXClient
+                    moex_info = MOEXClient.get_instrument_info(self._ticker, sec_type='stock')
+                    if moex_info and moex_info.get('lot_size'):
+                        self._lot_size = max(int(moex_info['lot_size']), 1)
+                        self._point_cost = 1.0   # для акций point_cost = 1 руб./пункт
+                        logger.info(
+                            f"[LiveEngine:{self._strategy_id}] "
+                            f"lot_size={self._lot_size} из MOEX API (брокер недоступен)"
+                        )
+                        return True
+                except Exception as e:
+                    logger.debug(f"[LiveEngine:{self._strategy_id}] MOEX fallback error: {e}")
+
+            return False
         except Exception as e:
            logger.warning(f"[LiveEngine:{self._strategy_id}] point_cost error: {e}")
            self._point_cost = 0.0
+           return False
 
     @property
     def is_running(self) -> bool:
@@ -419,8 +550,36 @@ class LiveEngine:
                      f"tf={self._timeframe} board={self._board} poll={self._poll_interval}s")
 
         self._subscribe_quotes()
-        self._load_point_cost()
-        
+        point_cost_ok = self._load_point_cost()
+
+        # Для фьючерсов point_cost обязателен — без него PnL будет нулевым
+        is_fut = instrument_classifier.is_futures(self._ticker, self._board)
+        if is_fut and not point_cost_ok:
+            logger.error(
+                f"[LiveEngine:{self._strategy_id}] "
+                f"Запуск ОТМЕНЁН: не удалось получить point_cost для фьючерса "
+                f"{self._ticker} ({self._board}). "
+                f"Проверьте подключение к брокеру и корректность тикера."
+            )
+            try:
+                from core.telegram_bot import notifier, EventCode
+                notifier.send(
+                    EventCode.STRATEGY_ERROR,
+                    agent=self._strategy_id,
+                    description=f"Не удалось получить point_cost для {self._ticker}. Запуск отменён.",
+                )
+            except Exception:
+                pass
+            return
+
+        # Для акций point_cost = 1.0 приемлем (PnL в штуках, не в пунктах)
+        if not point_cost_ok and not is_fut:
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] "
+                f"point_cost не загружен для {self._ticker}, используется 1.0"
+            )
+            self._point_cost = 1.0
+
         # Подписываемся на событие переподключения
         self._connector.on_reconnect(self._on_connector_reconnect)
         
@@ -431,10 +590,36 @@ class LiveEngine:
         self._thread.start()
         logger.info(f"[LiveEngine:{self._strategy_id}] Запущен, позиция={self._position}")
 
-    def stop(self):
-        """Останавливает поток поллинга и выполняет graceful shutdown."""
+    def stop(self, close_position: bool = None):
+        """Останавливает поток поллинга и выполняет graceful shutdown.
+        
+        Args:
+            close_position: Если True — закрыть позицию перед остановкой.
+                            Если None — использовать настройку агента (close_position_on_stop).
+                            Если False — не закрывать (circuit breaker сам решает).
+        """
         if not self._running:
             return
+
+        # Определяем нужно ли закрывать позицию
+        should_close = close_position
+        if should_close is None:
+            # Читаем из конфига стратегии
+            from core.storage import get_strategy
+            data = get_strategy(self._strategy_id) or {}
+            should_close = data.get("close_position_on_stop", False)
+
+        if should_close:
+            with self._position_lock:
+                qty = self._position_qty
+                pos = self._position
+            if qty != 0 and pos != 0:
+                logger.info(
+                    f"[LiveEngine:{self._strategy_id}] "
+                    f"Закрытие позиции перед остановкой (close_position_on_stop=True)"
+                )
+                self._emergency_close_position()
+
         self._running = False
         self._stop_event.set()
 
@@ -717,12 +902,21 @@ class LiveEngine:
         fetch_thread.join(timeout=timeout)
         
         if fetch_thread.is_alive():
-            # Таймаут — пытаемся прервать и уведомить вызывающий поток
+            self._consecutive_timeouts += 1
             logger.warning(
-                f"[LiveEngine:{self._strategy_id}] get_history завис (>{timeout} сек), устанавливаем stop_flag"
+                f"[LiveEngine:{self._strategy_id}] get_history тайм-аут "
+                f"({self._consecutive_timeouts}/{self._MAX_CONSECUTIVE_TIMEOUTS}), пропускаем тик"
             )
-            self._stop_event.set()
-            raise TimeoutError(f"get_history timeout > {timeout}s for {self._ticker} {self._board}")
+            if self._consecutive_timeouts >= self._MAX_CONSECUTIVE_TIMEOUTS:
+                logger.error(
+                    f"[LiveEngine:{self._strategy_id}] {self._MAX_CONSECUTIVE_TIMEOUTS} "
+                    f"тайм-аутов подряд — остановка стратегии"
+                )
+                self._emergency_close_position()
+                self.stop()
+            return
+        else:
+            self._consecutive_timeouts = 0   # сбрасываем при успешном получении
         
         if result['error']:
             logger.error(
@@ -976,8 +1170,13 @@ class LiveEngine:
                 qty = dyn_qty
                 logger.info(f"[LiveEngine:{self._strategy_id}] Динамический лот: {qty}")
             else:
-                logger.error(f"[{self._strategy_id}] Недостаточно средств для {action}, сигнал отклонён")
-                self._record_failure()
+                # Недостаточно средств — это не ошибка коннектора, просто пропускаем сигнал.
+                # _record_failure НЕ вызываем, чтобы не триггерить circuit breaker.
+                logger.warning(
+                    f"[{self._strategy_id}] Недостаточно средств для {action} "
+                    f"(свободных средств: {self._connector.get_free_money(self._account_id)}), "
+                    f"сигнал пропущен"
+                )
                 return
 
         fill_price = self._last_price
@@ -985,6 +1184,15 @@ class LiveEngine:
 
         try:
             if action in ('buy', 'sell'):
+                # Проверяем лимиты риска перед исполнением сигнала на вход
+                allowed, reason = self._check_risk_limits(action, qty)
+                if not allowed:
+                    logger.warning(
+                        f"[LiveEngine:{self._strategy_id}] "
+                        f"Ордер заблокирован риск-менеджером: {reason}"
+                    )
+                    return
+
                 # Атомарная проверка позиции и флага in-flight под одной блокировкой
                 # для предотвращения race condition при одновременных сигналах.
                 # Используем единую блокировку _position_lock для избежания deadlock
@@ -1195,8 +1403,8 @@ class LiveEngine:
         Позиция обновляется только после подтверждения исполнения ордера.
         """
         # Пробуем close_position (коннектор сам определяет qty из позиции)
-        # close_position может вернуть tid для мониторинга или True/False
-        tid_or_ok = False
+        # close_position возвращает tid (str) при успехе или None при неудаче
+        tid_or_ok = None
         use_close_position = hasattr(self._connector, "close_position")
 
         if use_close_position:
@@ -1208,17 +1416,10 @@ class LiveEngine:
                 )
             except Exception as e:
                 logger.warning(
-                    f'[LiveEngine:{self._strategy_id}] close_position error: {e}, '
+                    f'[LiveEngine:{self._strategy_id}] ошибка закрытия позиции: {e}, '
                     f'цена~{fill_price:.4f}'
                 )
-                tid_or_ok = False
-
-            if tid_or_ok is True:
-                logger.error(
-                    f"[LiveEngine:{self._strategy_id}] close_position вернул True без transaction id; "
-                    f"fallback на market. {close_side.upper()} {self._ticker} x{close_qty} @ {fill_price:.4f}"
-                )
-                tid_or_ok = False
+                tid_or_ok = None
 
         # Fallback: рыночный ордер напрямую
         if not tid_or_ok:
@@ -1590,6 +1791,10 @@ class LiveEngine:
         # Флаг _order_in_flight уже установлен в _execute_signal() под блокировкой
         # Здесь только запускаем chase-поток
 
+        # Генерируем уникальный идентификатор для этого chase-ордера
+        import time as _time
+        chase_ref = f"chase:{self._strategy_id}:{self._ticker}:{side}:{int(_time.time() * 1000)}"
+
         chase_price = self._last_price or 0.0
         chase_price_text = f'{chase_price:.4f}' if chase_price else 'bid/offer'
         logger.info(f'[LiveEngine:{self._strategy_id}] '
@@ -1638,7 +1843,8 @@ class LiveEngine:
                 if not chase.is_done:
                     chase.cancel()
 
-                self._on_chase_done(chase, side, qty, comment, is_close)
+                # Передаём chase_ref чтобы сделка была сохранена
+                self._on_chase_done(chase, side, qty, comment, is_close, chase_ref)
 
         t = threading.Thread(
             target=_run,
@@ -1648,7 +1854,7 @@ class LiveEngine:
         t.start()
 
     def _on_chase_done(self, chase, side: str, qty: int,
-                       comment: str, is_close: bool):
+                       comment: str, is_close: bool, chase_ref: str = ""):
         """Вызывается из фонового потока после завершения ChaseOrder.
         Обновляет позицию и записывает сделку под _position_lock.
         """
@@ -1690,7 +1896,9 @@ class LiveEngine:
             # Сбрасываем флаг под той же блокировкой, под которой он устанавливался
             self._order_in_flight = False
 
-        self._record_trade(side, filled, avg_px, comment, order_type="chase")
+        # Передаём chase_ref как order_ref чтобы сделка была сохранена
+        self._record_trade(side, filled, avg_px, comment, order_type="chase",
+                           order_ref=chase_ref)
         self._record_success()
 
         logger.info(

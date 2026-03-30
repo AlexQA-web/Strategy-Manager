@@ -40,6 +40,28 @@ class QuikConnector(BaseConnector):
         logger.info(f"[QUIK] Подключение → {host}:{requests_port}")
         try:
             from QuikPy import QuikPy
+
+            # Явно закрываем предыдущее соединение перед созданием нового
+            with self._lock:
+                old_client = self._client
+                self._client = None   # обнуляем до попытки закрытия
+
+            if old_client is not None:
+                try:
+                    old_client.close_connection_and_thread()
+                    logger.debug("[QUIK] Предыдущее соединение закрыто")
+                except Exception as e:
+                    logger.warning(f"[QUIK] Ошибка закрытия предыдущего соединения: {e}")
+                    # Принудительно закрываем сокеты
+                    try:
+                        old_client.socket_requests.close()
+                    except Exception:
+                        pass
+                    try:
+                        old_client.callback_exit_event.set()
+                    except Exception:
+                        pass
+
             with self._lock:
                 self._client = QuikPy(
                     host=host,
@@ -370,16 +392,16 @@ class QuikConnector(BaseConnector):
         ticker: str,
         quantity: int = 0,
         agent_name: str = "",
-    ) -> bool:
+    ) -> Optional[str]:
         positions = self.get_positions(account_id)
         pos = next((p for p in positions if p.get("ticker") == ticker), None)
         if not pos:
-            return False
+            return None
         pos_qty = int(pos.get("quantity", 0))
         # Если quantity = 0, закрываем всю позицию, иначе - частично
         close_qty = abs(quantity) if quantity != 0 else abs(pos_qty)
         side = "sell" if pos_qty > 0 else "buy"
-        result = self.place_order(
+        tid = self.place_order(
             account_id=account_id,
             ticker=ticker,
             side=side,
@@ -388,7 +410,7 @@ class QuikConnector(BaseConnector):
             board=pos.get("board", "TQBR"),
             agent_name=agent_name,
         )
-        return result is not None
+        return tid
 
     # ── Позиции / счета ─────────────────────────────────────────────────
 

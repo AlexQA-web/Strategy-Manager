@@ -20,24 +20,41 @@ from loguru import logger
 import threading
 _state_lock = threading.Lock()
 
-_reference_prices: dict[str, float] = {}
-_positions: dict[str, dict] = {}   # {ticker: {side, qty, board, status: "opening"|"open"|"closing"}}
-_pending_orders: dict[str, dict] = {}  # {ticker: {side, qty, board, status, mode, is_close}}
-_snapshot_done: bool = False
-_signal_done: bool = False
-_close_done: bool = False
+# Реестр состояний: {strategy_id: {...}}
+_agent_states: dict[str, dict] = {}
+_agent_states_lock = threading.Lock()
 
 
-def reset_state():
-    """Сбрасывает состояние стратегии. Вызывать при каждом перезапуске LiveEngine."""
-    global _reference_prices, _positions, _pending_orders, _snapshot_done, _signal_done, _close_done
-    with _state_lock:
-        _reference_prices = {}
-        _positions = {}
-        _pending_orders = {}
-        _snapshot_done = False
-        _signal_done = False
-        _close_done = False
+def _get_state(strategy_id: str) -> dict:
+    """Возвращает состояние конкретного агента."""
+    with _agent_states_lock:
+        if strategy_id not in _agent_states:
+            _agent_states[strategy_id] = {
+                "reference_prices": {},
+                "positions": {},
+                "pending_orders": {},
+                "snapshot_done": False,
+                "signal_done": False,
+                "close_done": False,
+            }
+        return _agent_states[strategy_id]
+
+
+def reset_state(strategy_id: str = ""):
+    """Сбрасывает состояние конкретного агента."""
+    with _agent_states_lock:
+        if strategy_id:
+            _agent_states[strategy_id] = {
+                "reference_prices": {},
+                "positions": {},
+                "pending_orders": {},
+                "snapshot_done": False,
+                "signal_done": False,
+                "close_done": False,
+            }
+        else:
+            # Обратная совместимость — если strategy_id не передан, очищаем всё
+            _agent_states.clear()
 
 
 def get_info() -> dict:
@@ -136,8 +153,9 @@ def get_params() -> dict:
 
 
 def on_start(params: dict, connector) -> None:
-    reset_state()  # Сбрасывает все глобальные переменные
-    logger.info("[Achilles] Запуск")
+    strategy_id = params.get("_strategy_id", "default")
+    reset_state(strategy_id)    # Сбрасываем только своё состояние
+    logger.info(f"[Achilles:{strategy_id}] Запуск")
 
 
 def on_stop(params: dict, connector) -> None:
@@ -151,7 +169,8 @@ def on_tick(tick_data: dict, params: dict, connector) -> None:
 # ── on_bar — только логика времени, без исполнения ───────────────────────────
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:
-    global _snapshot_done, _signal_done, _close_done
+    strategy_id = params.get("_strategy_id", "default")
+    state = _get_state(strategy_id)
 
     if not bars:
         return {"action": None}
@@ -171,21 +190,21 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     with _state_lock:
         # Сброс флагов в начале нового дня
         if time_min < time_snapshot:
-            _snapshot_done = False
-            _signal_done   = False
-            _close_done    = False
+            state["snapshot_done"] = False
+            state["signal_done"]   = False
+            state["close_done"]    = False
 
-        if time_min >= time_snapshot and not _snapshot_done:
-            _snapshot_done = True
+        if time_min >= time_snapshot and not state["snapshot_done"]:
+            state["snapshot_done"] = True
             return {"action": "snapshot"}
 
-        if time_min >= time_signal and not _signal_done and _snapshot_done:
-            _signal_done = True
+        if time_min >= time_signal and not state["signal_done"] and state["snapshot_done"]:
+            state["signal_done"] = True
             return {"action": "signal"}
 
-        has_open_positions = any(pos.get("status", "open") == "open" for pos in _positions.values())
+        has_open_positions = any(pos.get("status", "open") == "open" for pos in state["positions"].values())
 
-        if time_min >= time_close and not _close_done and has_open_positions:
+        if time_min >= time_close and not state["close_done"] and has_open_positions:
             return {"action": "close_limit"}
 
         if time_min >= time_emergency and has_open_positions:
@@ -197,18 +216,19 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
 # ── execute_signal — вызывается LiveEngine вместо _execute_signal ─────────────
 
 def execute_signal(signal: dict, connector, params: dict, account_id: str):
-    global _close_done
+    strategy_id = params.get("_strategy_id", "default")
+    state = _get_state(strategy_id)
     action = signal.get("action")
     if action == "snapshot":
-        _do_snapshot(connector, params)
+        _do_snapshot(connector, params, strategy_id)
     elif action == "signal":
-        _do_signal(connector, params, account_id)
+        _do_signal(connector, params, account_id, strategy_id)
     elif action == "close_limit":
-        _do_close_limit(connector, params, account_id)
+        _do_close_limit(connector, params, account_id, strategy_id)
         with _state_lock:
-            _close_done = True
+            state["close_done"] = True
     elif action == "close_market":
-        _do_close_market(connector, params, account_id)
+        _do_close_market(connector, params, account_id, strategy_id)
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────────
@@ -364,6 +384,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
       - "limit_book"  — лимитка по bid/offer ± spread_offset (ChaseOrder с автоперестановкой)
       - "limit_price" — лимитка по last price; мониторится до исполнения или 23:45
     """
+    state = _get_state(strategy_id) if strategy_id else None
     try:
         if order_mode == "market":
             tid = connector.place_order(
@@ -401,45 +422,45 @@ def _place(connector, account_id: str, board: str, ticker: str,
             from core.chase_order import ChaseOrder
 
             with _state_lock:
-                pending = _pending_orders.get(ticker)
-                if pending is not None:
-                    logger.warning(
-                        f"[Achilles] {ticker}: уже есть активный лимитный ордер "
-                        f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
-                    )
-                    return False
+                if state is not None:
+                    pending = state["pending_orders"].get(ticker)
+                    if pending is not None:
+                        logger.warning(
+                            f"[Achilles] {ticker}: уже есть активный лимитный ордер "
+                            f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
+                        )
+                        return False
 
-                if is_close:
-                    current = _positions.get(ticker)
-                    if current is None:
-                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
-                        return False
-                    if current.get("status") == "closing":
-                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
-                        return False
-                    current["status"] = "closing"
-                else:
-                    if ticker in _positions:
-                        logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
-                        return False
-                    _positions[ticker] = {
+                    if is_close:
+                        current = state["positions"].get(ticker)
+                        if current is None:
+                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
+                            return False
+                        if current.get("status") == "closing":
+                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
+                            return False
+                        current["status"] = "closing"
+                    else:
+                        if ticker in state["positions"]:
+                            logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
+                            return False
+                        state["positions"][ticker] = {
+                            "side": side,
+                            "qty": int(qty),
+                            "board": board,
+                            "status": "opening",
+                        }
+
+                    state["pending_orders"][ticker] = {
                         "side": side,
                         "qty": int(qty),
                         "board": board,
-                        "status": "opening",
+                        "status": "closing" if is_close else "opening",
+                        "mode": order_mode,
+                        "is_close": is_close,
                     }
 
-                _pending_orders[ticker] = {
-                    "side": side,
-                    "qty": int(qty),
-                    "board": board,
-                    "status": "closing" if is_close else "opening",
-                    "mode": order_mode,
-                    "is_close": is_close,
-                }
-
             def _run_chase():
-                global _positions, _pending_orders
                 chase = ChaseOrder(
                     connector=connector,
                     account_id=account_id,
@@ -459,15 +480,16 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         f"вид=limit_book(стакан) — ничего не исполнено за 60 сек"
                     )
                     with _state_lock:
-                        _pending_orders.pop(ticker, None)
-                        if is_close:
-                            current = _positions.get(ticker)
-                            if current is not None and current.get("status") == "closing":
-                                current["status"] = "open"
-                        else:
-                            current = _positions.get(ticker)
-                            if current is not None and current.get("status") == "opening":
-                                _positions.pop(ticker, None)
+                        if state is not None:
+                            state["pending_orders"].pop(ticker, None)
+                            if is_close:
+                                current = state["positions"].get(ticker)
+                                if current is not None and current.get("status") == "closing":
+                                    current["status"] = "open"
+                            else:
+                                current = state["positions"].get(ticker)
+                                if current is not None and current.get("status") == "opening":
+                                    state["positions"].pop(ticker, None)
                 else:
                     logger.info(
                         f"[Achilles] Chase {side.upper()} {ticker}x{qty} "
@@ -482,30 +504,31 @@ def _place(connector, account_id: str, board: str, ticker: str,
                             comment=f"limit_book chase avg={chase.avg_price:.4f}",
                         )
                     with _state_lock:
-                        _pending_orders.pop(ticker, None)
-                        if is_close:
-                            current = _positions.get(ticker)
-                            if current is not None:
-                                remaining_qty = max(int(current.get("qty", qty)) - int(chase.filled_qty), 0)
-                                if remaining_qty > 0:
-                                    current["qty"] = remaining_qty
-                                    current["status"] = "open"
-                                else:
-                                    _positions.pop(ticker, None)
-                        else:
-                            current = _positions.get(ticker)
-                            if current is None:
-                                _positions[ticker] = {
-                                    "side": side,
-                                    "qty": int(chase.filled_qty),
-                                    "board": board,
-                                    "status": "open",
-                                }
+                        if state is not None:
+                            state["pending_orders"].pop(ticker, None)
+                            if is_close:
+                                current = state["positions"].get(ticker)
+                                if current is not None:
+                                    remaining_qty = max(int(current.get("qty", qty)) - int(chase.filled_qty), 0)
+                                    if remaining_qty > 0:
+                                        current["qty"] = remaining_qty
+                                        current["status"] = "open"
+                                    else:
+                                        state["positions"].pop(ticker, None)
                             else:
-                                current["side"] = side
-                                current["qty"] = int(chase.filled_qty)
-                                current["board"] = board
-                                current["status"] = "open"
+                                current = state["positions"].get(ticker)
+                                if current is None:
+                                    state["positions"][ticker] = {
+                                        "side": side,
+                                        "qty": int(chase.filled_qty),
+                                        "board": board,
+                                        "status": "open",
+                                    }
+                                else:
+                                    current["side"] = side
+                                    current["qty"] = int(chase.filled_qty)
+                                    current["board"] = board
+                                    current["status"] = "open"
 
             t = threading.Thread(target=_run_chase, daemon=True,
                                  name=f"achilles-chase-{ticker}-{side}")
@@ -518,46 +541,48 @@ def _place(connector, account_id: str, board: str, ticker: str,
             from datetime import datetime as _dt
 
             with _state_lock:
-                pending = _pending_orders.get(ticker)
-                if pending is not None:
-                    logger.warning(
-                        f"[Achilles] {ticker}: уже есть активный лимитный ордер "
-                        f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
-                    )
-                    return False
+                if state is not None:
+                    pending = state["pending_orders"].get(ticker)
+                    if pending is not None:
+                        logger.warning(
+                            f"[Achilles] {ticker}: уже есть активный лимитный ордер "
+                            f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
+                        )
+                        return False
 
-                if is_close:
-                    current = _positions.get(ticker)
-                    if current is None:
-                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
-                        return False
-                    if current.get("status") == "closing":
-                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
-                        return False
-                    current["status"] = "closing"
-                else:
-                    if ticker in _positions:
-                        logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
-                        return False
-                    _positions[ticker] = {
-                        "side": side,
-                        "qty": int(qty),
-                        "board": board,
-                        "status": "opening",
-                    }
+                    if is_close:
+                        current = state["positions"].get(ticker)
+                        if current is None:
+                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
+                            return False
+                        if current.get("status") == "closing":
+                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
+                            return False
+                        current["status"] = "closing"
+                    else:
+                        if ticker in state["positions"]:
+                            logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
+                            return False
+                        state["positions"][ticker] = {
+                            "side": side,
+                            "qty": int(qty),
+                            "board": board,
+                            "status": "opening",
+                        }
 
             price = _get_price(connector, board, ticker)
             if not price:
                 logger.warning(f"[Achilles] limit_price: нет цены для {ticker}, пропуск")
                 with _state_lock:
-                    if is_close:
-                        current = _positions.get(ticker)
-                        if current is not None and current.get("status") == "closing":
-                            current["status"] = "open"
-                    else:
-                        current = _positions.get(ticker)
-                        if current is not None and current.get("status") == "opening":
-                            _positions.pop(ticker, None)
+                    if state is not None:
+                        if is_close:
+                            current = state["positions"].get(ticker)
+                            if current is not None and current.get("status") == "closing":
+                                current["status"] = "open"
+                        else:
+                            current = state["positions"].get(ticker)
+                            if current is not None and current.get("status") == "opening":
+                                state["positions"].pop(ticker, None)
                 return False
 
             tid = connector.place_order(
@@ -577,26 +602,28 @@ def _place(connector, account_id: str, board: str, ticker: str,
                     f"вид=limit_price — ордер не выставлен"
                 )
                 with _state_lock:
-                    if is_close:
-                        current = _positions.get(ticker)
-                        if current is not None and current.get("status") == "closing":
-                            current["status"] = "open"
-                    else:
-                        current = _positions.get(ticker)
-                        if current is not None and current.get("status") == "opening":
-                            _positions.pop(ticker, None)
+                    if state is not None:
+                        if is_close:
+                            current = state["positions"].get(ticker)
+                            if current is not None and current.get("status") == "closing":
+                                current["status"] = "open"
+                        else:
+                            current = state["positions"].get(ticker)
+                            if current is not None and current.get("status") == "opening":
+                                state["positions"].pop(ticker, None)
                 return False
 
             with _state_lock:
-                _pending_orders[ticker] = {
-                    "side": side,
-                    "qty": int(qty),
-                    "board": board,
-                    "status": "closing" if is_close else "opening",
-                    "mode": order_mode,
-                    "is_close": is_close,
-                    "tid": tid,
-                }
+                if state is not None:
+                    state["pending_orders"][ticker] = {
+                        "side": side,
+                        "qty": int(qty),
+                        "board": board,
+                        "status": "closing" if is_close else "opening",
+                        "mode": order_mode,
+                        "is_close": is_close,
+                        "tid": tid,
+                    }
 
             logger.info(f"[Achilles] LIMIT {side.upper()} {ticker}x{qty} @{price:.4f} tid={tid}")
 
@@ -605,7 +632,6 @@ def _place(connector, account_id: str, board: str, ticker: str,
             CANCEL_MIN = TRADING_END_TIME_MIN
 
             def _monitor():
-                global _positions, _pending_orders
                 filled = 0
                 while True:
                     try:
@@ -655,35 +681,36 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         order_ref=str(tid),
                     )
                 with _state_lock:
-                    _pending_orders.pop(ticker, None)
-                    if is_close:
-                        current = _positions.get(ticker)
-                        if current is not None:
-                            remaining_qty = max(int(current.get("qty", qty)) - int(filled), 0)
-                            if remaining_qty > 0:
-                                current["qty"] = remaining_qty
-                                current["status"] = "open"
-                            else:
-                                _positions.pop(ticker, None)
-                    else:
-                        if filled > 0:
-                            current = _positions.get(ticker)
-                            if current is None:
-                                _positions[ticker] = {
-                                    "side": side,
-                                    "qty": int(filled),
-                                    "board": board,
-                                    "status": "open",
-                                }
-                            else:
-                                current["side"] = side
-                                current["qty"] = int(filled)
-                                current["board"] = board
-                                current["status"] = "open"
+                    if state is not None:
+                        state["pending_orders"].pop(ticker, None)
+                        if is_close:
+                            current = state["positions"].get(ticker)
+                            if current is not None:
+                                remaining_qty = max(int(current.get("qty", qty)) - int(filled), 0)
+                                if remaining_qty > 0:
+                                    current["qty"] = remaining_qty
+                                    current["status"] = "open"
+                                else:
+                                    state["positions"].pop(ticker, None)
                         else:
-                            current = _positions.get(ticker)
-                            if current is not None and current.get("status") == "opening":
-                                _positions.pop(ticker, None)
+                            if filled > 0:
+                                current = state["positions"].get(ticker)
+                                if current is None:
+                                    state["positions"][ticker] = {
+                                        "side": side,
+                                        "qty": int(filled),
+                                        "board": board,
+                                        "status": "open",
+                                    }
+                                else:
+                                    current["side"] = side
+                                    current["qty"] = int(filled)
+                                    current["board"] = board
+                                    current["status"] = "open"
+                            else:
+                                current = state["positions"].get(ticker)
+                                if current is not None and current.get("status") == "opening":
+                                    state["positions"].pop(ticker, None)
 
             t = threading.Thread(target=_monitor, daemon=True,
                                  name=f"achilles-lp-{ticker}-{tid}")
@@ -695,9 +722,9 @@ def _place(connector, account_id: str, board: str, ticker: str,
         return False
 
 
-def _do_snapshot(connector, params: dict):
+def _do_snapshot(connector, params: dict, strategy_id: str):
     """Фиксируем референсные цены."""
-    global _reference_prices
+    state = _get_state(strategy_id)
     instruments = _get_instruments(params)
     new_prices = {}
     for instr in instruments:
@@ -710,17 +737,17 @@ def _do_snapshot(connector, params: dict):
         else:
             logger.warning(f"[Achilles] Снимок {ticker}: нет цены")
     with _state_lock:
-        _reference_prices = new_prices
+        state["reference_prices"] = new_prices
 
 
-def _do_signal(connector, params: dict, account_id: str):
+def _do_signal(connector, params: dict, account_id: str, strategy_id: str):
     """Считаем % изменение, входим в топ-рост и топ-падение."""
-    global _positions
+    state = _get_state(strategy_id)
     with _state_lock:
-        if not _reference_prices:
+        if not state["reference_prices"]:
             logger.warning("[Achilles] Нет референсных цен, сигнал пропущен")
             return
-        ref_copy = dict(_reference_prices)
+        ref_copy = dict(state["reference_prices"])
 
     instruments    = _get_instruments(params)
     qty            = int(params.get("qty", 1))
@@ -769,7 +796,7 @@ def _do_signal(connector, params: dict, account_id: str):
             if ok:
                 if order_mode == "market":
                     with _state_lock:
-                        _positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board, "status": "open"}
+                        state["positions"][ticker] = {"side": "buy", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] BUY {ticker} (+{pct:.2f}%) qty={actual_qty} "
                     f"порог={long_percent:.2f}%"
@@ -799,7 +826,7 @@ def _do_signal(connector, params: dict, account_id: str):
             if ok:
                 if order_mode == "market":
                     with _state_lock:
-                        _positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board, "status": "open"}
+                        state["positions"][ticker] = {"side": "sell", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] SELL {ticker} ({pct:.2f}%) qty={actual_qty} "
                     f"порог={short_percent:.2f}%"
@@ -813,16 +840,15 @@ def _do_signal(connector, params: dict, account_id: str):
         logger.info("[Achilles] Шорт пропущен: нет инструментов с allow_sell=true")
 
 
-def _do_close_limit(connector, params: dict, account_id: str):
+def _do_close_limit(connector, params: dict, account_id: str, strategy_id: str):
     """Плановое закрытие лимитками."""
-    global _positions
+    state = _get_state(strategy_id)
     order_mode    = params.get("order_mode", "limit_book")
     spread_offset = float(params.get("spread_offset", 2.0))
-    strategy_id   = params.get("_strategy_id", "")
     connector_id  = params.get("_connector_id", "")
 
     with _state_lock:
-        positions_snapshot = list(_positions.items())
+        positions_snapshot = list(state["positions"].items())
 
     for ticker, pos in positions_snapshot:
         if pos.get("status", "open") != "open":
@@ -837,18 +863,17 @@ def _do_close_limit(connector, params: dict, account_id: str):
         if ok:
             logger.info(f"[Achilles] CLOSE LIMIT {ticker}")
             with _state_lock:
-                if ticker in _positions and order_mode == "market":
-                    _positions.pop(ticker, None)
+                if ticker in state["positions"] and order_mode == "market":
+                    state["positions"].pop(ticker, None)
 
 
-def _do_close_market(connector, params: dict, account_id: str):
+def _do_close_market(connector, params: dict, account_id: str, strategy_id: str):
     """Аварийное закрытие рыночными ордерами."""
-    global _positions
-    strategy_id  = params.get("_strategy_id", "")
+    state = _get_state(strategy_id)
     connector_id = params.get("_connector_id", "")
     # Закрываем ВСЕ позиции, включая те что уже в статусе "closing"
     with _state_lock:
-        positions_snapshot = list(_positions.items())
+        positions_snapshot = list(state["positions"].items())
 
     for ticker, pos in positions_snapshot:
         board      = pos.get("board", "TQBR")
@@ -876,8 +901,8 @@ def _do_close_market(connector, params: dict, account_id: str):
                         order_ref=str(tid),
                     )
                 with _state_lock:
-                    _pending_orders.pop(ticker, None)
-                    _positions.pop(ticker, None)
+                    state["pending_orders"].pop(ticker, None)
+                    state["positions"].pop(ticker, None)
             else:
                 logger.error(f"[Achilles] CLOSE MARKET {ticker} — не удалось")
         except Exception as e:

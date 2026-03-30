@@ -458,6 +458,11 @@ class StrategyWindow(QDialog):
             self.cmb_timeframe.setCurrentIndex(idx)
         trade_form.addRow("Таймфрейм:", self.cmb_timeframe)
 
+        # Информация о текущем борде
+        self.lbl_board_warning = QLabel(f"Текущий борд: {self.data.get('board', 'не задан')}")
+        self.lbl_board_warning.setStyleSheet("color: #6c7086; font-size: 11px;")
+        trade_form.addRow("Борд:", self.lbl_board_warning)
+
         layout.addWidget(trade_group)
 
         layout.addStretch()
@@ -484,11 +489,35 @@ class StrategyWindow(QDialog):
         dlg.exec()
 
     def _on_connector_changed(self):
-        """При смене коннектора обновляем счета и тикер-селектор."""
+        """При смене коннектора обновляем счета и показываем предупреждение о борде."""
         cid = self.cmb_connector.currentData()
         self._refresh_accounts()
-        if hasattr(self, "_ticker_sel"):
-            self._ticker_sel.set_connector(cid)
+
+        # Обновляем ticker_selector в параметрах если есть
+        if hasattr(self, "_param_widgets"):
+            from ui.param_widgets import TickerParamWidget
+            ticker_widget = self._param_widgets.get("ticker")
+            if isinstance(ticker_widget, TickerParamWidget):
+                ticker_widget.ticker_selector.set_connector(cid)
+
+        # Показываем текущий борд и предупреждение
+        current_board = self.data.get("board", "?")
+        if hasattr(self, "lbl_board_warning"):
+            if cid == "quik" and current_board in ("FUT", "TQBR"):
+                self.lbl_board_warning.setText(
+                    f"⚠ Текущий борд: {current_board}. "
+                    f"Для QUIK используйте SPBFUT/TQBR. Проверьте на вкладке Параметры."
+                )
+                self.lbl_board_warning.setStyleSheet("color: #f9e2af; font-size: 11px;")
+            elif cid == "finam" and current_board == "SPBFUT":
+                self.lbl_board_warning.setText(
+                    f"⚠ Текущий борд: {current_board}. "
+                    f"Для Финам используйте FUT. Проверьте на вкладке Параметры."
+                )
+                self.lbl_board_warning.setStyleSheet("color: #f9e2af; font-size: 11px;")
+            else:
+                self.lbl_board_warning.setText(f"Текущий борд: {current_board}")
+                self.lbl_board_warning.setStyleSheet("color: #6c7086; font-size: 11px;")
 
     def _refresh_accounts(self):
         """Обновляет список счетов при смене коннектора."""

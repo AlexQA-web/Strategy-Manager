@@ -203,7 +203,8 @@ def get_order_pnl_multiplier(order: dict) -> float:
                 if info and float(info.get('point_cost') or 0.0) > 0:
                     return float(info['point_cost'])
             elif _is_bond(board):
-                info = MOEXClient.get_instrument_info(ticker, sec_type='bond')
+                # Облигации есть в stock API MOEX
+                info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
                 if info:
                     facevalue = float(info.get('facevalue') or 0.0)
                     minstep = float(info.get('minstep') or 0.0)

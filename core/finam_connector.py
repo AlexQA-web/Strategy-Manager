@@ -62,6 +62,9 @@ class FinamConnector(BaseConnector):
         self._order_status: dict[str, dict] = {}          # transactionid → {status, balance, quantity, orderno}
         self._order_status_lock = threading.Lock()
         self._order_watchers: dict[str, list[Callable]] = {}  # transactionid → callbacks
+        self._order_status_timestamps: dict[str, float] = {}  # tid → time.time()
+        self._ORDER_STATUS_TTL = 86400  # 24 часа
+        self._last_order_cleanup = time.time()
         # Информация по инструментам (sec_info / sec_info_upd)
         self._sec_info: dict[str, dict] = {}  # seccode → {buy_deposit, sell_deposit, point_cost, ...}
         self._sec_info_lock = threading.Lock()
@@ -913,6 +916,7 @@ class FinamConnector(BaseConnector):
 
     def _parse_orders(self, root):
         """Парсит <orders> из callback, обновляет статусы и вызывает watchers."""
+        now = time.time()
         for order in root.findall("order"):
             tid = order.get("transactionid", "")
             if not tid:
@@ -938,6 +942,7 @@ class FinamConnector(BaseConnector):
 
             with self._order_status_lock:
                 self._order_status[tid] = info
+                self._order_status_timestamps[tid] = now
                 watchers = list(self._order_watchers.get(tid, []))
 
             for cb in watchers:
@@ -945,6 +950,34 @@ class FinamConnector(BaseConnector):
                     cb(tid, info)
                 except Exception as e:
                     logger.warning(f"[Finam] order watcher error: {e}")
+
+        # Периодическая очистка старых ордеров (не чаще раза в час)
+        if now - self._last_order_cleanup > 3600:
+            self._cleanup_old_order_status(now)
+
+    def _cleanup_old_order_status(self, now: float):
+        """Удаляет записи о ордерах старше ORDER_STATUS_TTL."""
+        _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
+        cutoff = now - self._ORDER_STATUS_TTL
+        
+        with self._order_status_lock:
+            tids_to_remove = []
+            for tid, ts in self._order_status_timestamps.items():
+                if ts < cutoff:
+                    status = self._order_status.get(tid, {}).get("status", "")
+                    if status in _TERMINAL:  # удаляем только завершённые
+                        tids_to_remove.append(tid)
+            
+            removed = 0
+            for tid in tids_to_remove:
+                self._order_status.pop(tid, None)
+                self._order_watchers.pop(tid, None)
+                self._order_status_timestamps.pop(tid, None)
+                removed += 1
+        
+        self._last_order_cleanup = now
+        if removed:
+            logger.debug(f"[Finam] Очищено {removed} старых записей _order_status")
 
     def get_order_status(self, transaction_id: str) -> Optional[dict]:
         with self._order_status_lock:
@@ -1176,15 +1209,15 @@ class FinamConnector(BaseConnector):
         ticker: str,
         quantity: int = 0,
         agent_name: str = "",
-    ) -> bool:
+    ) -> Optional[str]:
         positions = self.get_positions(account_id)
         pos = next((p for p in positions if p.get("ticker") == ticker), None)
         if not pos:
-            return False
+            return None
         total_qty = int(abs(float(pos.get("quantity", 0))))
         close_qty = quantity if 0 < quantity < total_qty else total_qty
         side = "sell" if float(pos.get("quantity", 0)) > 0 else "buy"
-        result = self.place_order(
+        tid = self.place_order(
             account_id=account_id,
             ticker=ticker,
             side=side,
@@ -1193,7 +1226,7 @@ class FinamConnector(BaseConnector):
             board=pos.get("board", "TQBR"),
             agent_name=agent_name,
         )
-        return result is not None
+        return tid
 
     # ── Позиции / счета ───────────────────────────────────────────────────
 
