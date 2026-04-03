@@ -494,6 +494,10 @@ class MainWindow(QMainWindow):
         self._refreshing_sec_info: set = set()  # множество ключей, которые уже загружаются
         self._SEC_INFO_TTL = 60  # обновлять раз в 60 секунд
 
+        # Кэш состояния таблицы для diff-based обновления (Пункт 17)
+        self._table_state: dict = {}  # {row_key: {col_name: hash_value}}
+        self._widget_cache: dict = {}  # {row_key: {col_name: widget}} для переиспользования виджетов
+
         self._setup_core()
         self._build_ui()
         self._setup_shortcuts()
@@ -548,6 +552,155 @@ class MainWindow(QMainWindow):
                 logger.debug(f"Предзагрузка стратегии: [{sid}]")
             except StrategyLoadError as e:
                 logger.warning(f"Не удалось предзагрузить [{sid}]: {e}")
+
+    # ─────────────────────────────────────────────
+    # Diff-based table update helpers (Пункт 17)
+    # ─────────────────────────────────────────────
+
+    def _compute_row_hash(self, sid: str, data: dict, is_child: bool = False,
+                          child_ticker: str = None) -> str:
+        """Вычисляет хэш состояния строки для определения изменений.
+
+        Возвращает строку-хэш на основе всех данных, отображаемых в строке.
+        Если хэш не изменился — строку можно пропустить при обновлении.
+        """
+        import hashlib
+
+        if is_child:
+            pnl_by_ticker = get_pnl_by_ticker(sid)
+            t_pnl = pnl_by_ticker.get(child_ticker)
+            parts = [
+                "child", sid, child_ticker,
+                str(t_pnl),
+            ]
+        else:
+            status = data.get("status", "stopped")
+            name = data.get("name", sid)
+            params = data.get("params", {})
+            ticker = data.get("ticker") or params.get("ticker", "—")
+            account = data.get("finam_account", "—") or "—"
+            aliases = get_setting("account_aliases") or {}
+            account_label = aliases.get(account, account)
+            instruments = params.get("instruments", [])
+            has_instruments = bool(instruments)
+            expanded = sid in self._expanded
+
+            # Позиция — из LiveEngine или коннектора
+            from core.autostart import get_live_engines
+            from core.connector_manager import connector_manager
+            engines = get_live_engines()
+            engine = engines.get(sid)
+
+            if engine and engine.is_running:
+                pos_info = engine.get_position_info()
+                pos_qty = str(pos_info["quantity"])
+                avg_price = f"{pos_info['avg_price']:.3f}" if pos_info["avg_price"] != 0 else "—"
+                cur_price = f"{pos_info['current_price']:.3f}" if pos_info["current_price"] != 0 else "—"
+                pnl = pos_info["pnl"] if pos_info["quantity"] else None
+            else:
+                connector_id = data.get("connector", "finam")
+                connector = connector_manager.get(connector_id)
+                positions = (
+                    connector.get_positions(account)
+                    if connector and connector.is_connected() and account != "—"
+                    else []
+                )
+                pos = next(
+                    (p for p in positions if p.get("ticker") == ticker), None
+                )
+                pos_qty = str(int(pos["quantity"])) if pos else "0"
+                avg_price = f"{pos['avg_price']:.3f}" if pos else "—"
+                cur_price = f"{pos['current_price']:.3f}" if pos else "—"
+                pnl = pos["pnl"] if pos else None
+
+            total_pnl = get_total_pnl(sid)
+            open_commission = get_open_commission(sid)
+            total_commission = get_total_commission(sid)
+
+            # П.Лот
+            pot_lot_str = ""
+            try:
+                pos_qty_num = float(pos_qty)
+            except (ValueError, TypeError):
+                pos_qty_num = 1
+            if pos_qty_num == 0:
+                lot_sizing = data.get("lot_sizing", {})
+                connector_id = data.get("connector", "finam")
+                connector = connector_manager.get(connector_id)
+                board = data.get("board", "FUT")
+                if lot_sizing.get("dynamic") and connector and connector.is_connected():
+                    from core.equity_tracker import get_max_drawdown
+                    import math
+                    free_money = connector.get_free_money(account)
+                    sec_info = None
+                    if hasattr(connector, "get_sec_info"):
+                        sec_info = self._get_sec_info_cached(connector, connector_id, ticker, board)
+                    go = 0.0
+                    if sec_info:
+                        go = float(sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0)
+                    if free_money and free_money > 0:
+                        if go <= 0:
+                            pot_lot_str = str(int(lot_sizing.get("lot", 1)) or 1)
+                        else:
+                            dd = float(lot_sizing.get("drawdown") or 0) or (get_max_drawdown(sid) or 0)
+                            instances = max(int(lot_sizing.get("instances", 1)), 1)
+                            denom = dd + go
+                            dyn = math.floor((free_money / denom) / instances) if denom > 0 else 0
+                            pot_lot_str = str(dyn) if dyn >= 1 else "0"
+                    else:
+                        pot_lot_str = "—"
+                else:
+                    static_qty = int(lot_sizing.get("lot", data.get("params", {}).get("qty", 1)))
+                    can_afford = True
+                    if connector and connector.is_connected():
+                        free_money = connector.get_free_money(account)
+                        sec_info = self._get_sec_info_cached(connector, connector_id, ticker, data.get("board", "FUT"))
+                        if free_money is not None and sec_info:
+                            from core.equity_tracker import get_max_drawdown
+                            go = sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0
+                            dd = lot_sizing.get("drawdown", 0) or get_max_drawdown(sid) or 0
+                            can_afford = free_money >= (go + dd)
+                    pot_lot_str = str(static_qty) if can_afford else "0"
+
+            pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}" if pnl is not None else "—"
+            comm_str = f"{open_commission:.2f}" if open_commission is not None else "—"
+            total_pnl_str = f"{'+' if total_pnl >= 0 else ''}{total_pnl:.2f}" if total_pnl is not None else "—"
+
+            parts = [
+                "parent", sid, status, name, ticker, account_label,
+                str(has_instruments), str(expanded),
+                pos_qty, avg_price, cur_price, pnl_str,
+                comm_str, total_pnl_str, f"{total_commission:.2f}",
+                pot_lot_str,
+            ]
+
+        raw = "|".join(str(p) for p in parts)
+        return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+    def _has_row_changed(self, row_key: str, new_hash: str) -> bool:
+        """Проверяет, изменилась ли строка с данным ключом."""
+        old_hash = self._table_state.get(row_key)
+        return old_hash != new_hash
+
+    def _update_row_text(self, row: int, col: int, text: str, color: str,
+                         align=None, sid: str = None):
+        """Обновляет текст в ячейке без пересоздания QTableWidgetItem если возможно."""
+        item = self.table.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            self.table.setItem(row, col, item)
+
+        # Проверяем, нужно ли обновить
+        if (item.text() == str(text)
+                and item.foreground().color().name() == QColor(color).name()
+                and item.data(Qt.ItemDataRole.UserRole) == sid):
+            return  # Не изменилось — пропускаем
+
+        item.setText(str(text))
+        item.setTextAlignment(align or (Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft))
+        item.setForeground(QColor(color))
+        if sid is not None:
+            item.setData(Qt.ItemDataRole.UserRole, sid)
 
     # ─────────────────────────────────────────────
     # UI
@@ -923,13 +1076,19 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_fetch, daemon=True).start()
 
     def _refresh_table(self):
+        """Diff-based обновление таблицы.
+
+        Вычисляет хэш каждой строки и обновляет только изменённые строки.
+        Если структура таблицы не изменилась (те же строки, те же хэши) —
+        метод возвращается сразу, без каких-либо операций с виджетами.
+        """
         from core.autostart import get_live_engines
         from core.connector_manager import connector_manager
 
         strategies = get_all_strategies()
         engines = get_live_engines()
 
-        # Применяем сохранённый порядок строк (из in-memory кэша, не из QSettings)
+        # Применяем сохранённый порядок строк
         saved_order = self._row_order
         if saved_order:
             ordered = [(sid, strategies[sid]) for sid in saved_order if sid in strategies]
@@ -937,320 +1096,386 @@ class MainWindow(QMainWindow):
         else:
             ordered = list(strategies.items())
 
-        # Подсчитываем общее кол-во строк (стратегии + дочерние инструменты)
-        total_rows = 0
+        # Строим список всех строк с их ключами и хэшами
+        new_rows: list[tuple[str, str, dict | None]] = []  # (row_key, row_type, data)
         for sid, data in ordered:
-            total_rows += 1
+            row_key = f"p:{sid}"
+            row_hash = self._compute_row_hash(sid, data)
+            new_rows.append((row_key, "parent", data, row_hash))
+
             params = data.get("params", {})
             instruments = params.get("instruments", [])
             if instruments and sid in self._expanded:
-                total_rows += len(instruments)
-
-        self.table.setRowCount(total_rows)
-
-        row = 0
-        for sid, data in ordered:
-            self.table.setRowHeight(row, 32)
-
-            status = data.get("status", "stopped")
-            name = data.get("name", sid)
-            params = data.get("params", {})
-            ticker = data.get("ticker") or params.get("ticker", "—")
-            account = data.get("finam_account", "—") or "—"
-            aliases = get_setting("account_aliases") or {}
-            account_label = aliases.get(account, account)
-
-            # Инструменты корзины (для Ахиллес и подобных)
-            instruments: list = params.get("instruments", [])
-            has_instruments = bool(instruments)
-
-            # Позиции — берём из LiveEngine если доступен, иначе из коннектора
-            engine = engines.get(sid)
-
-            if engine and engine.is_running:
-                pos_info = engine.get_position_info()
-                pos_qty = str(pos_info["quantity"])
-                avg_price = f"{pos_info['avg_price']:.3f}" if pos_info["avg_price"] != 0 else "—"
-                cur_price = f"{pos_info['current_price']:.3f}" if pos_info["current_price"] != 0 else "—"
-                pnl = pos_info["pnl"] if pos_info["quantity"] else None
-            else:
-                connector_id = data.get("connector", "finam")
-                connector = connector_manager.get(connector_id)
-                positions = (
-                    connector.get_positions(account)
-                    if connector and connector.is_connected() and account != "—"
-                    else []
-                )
-                pos = next(
-                    (p for p in positions if p.get("ticker") == ticker), None
-                )
-                pos_qty = str(int(pos["quantity"])) if pos else "0"
-                avg_price = f"{pos['avg_price']:.3f}" if pos else "—"
-                cur_price = f"{pos['current_price']:.3f}" if pos else "—"
-                pnl = pos["pnl"] if pos else None
-
-            # Нарастающий итог П/У и комиссия — общие по стратегии
-            total_pnl = get_total_pnl(sid)
-            open_commission = get_open_commission(sid)
-            total_commission = get_total_commission(sid)
-
-            # Статус
-            status_map = {
-                "active": ("Активен", "#a6e3a1"),
-                "stopped": ("Остановлен", "#f38ba8"),
-                "waiting": ("Ожидание", "#f9e2af"),
-                "error": ("Ошибка", "#fab387"),
-            }
-            status_text, status_color = status_map.get(
-                status, ("Неизвестно", "#6c7086")
-            )
-
-            center = Qt.AlignmentFlag.AlignCenter
-            left = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
-
-            def cell(text, color=None, align=left, _sid=sid):
-                item = QTableWidgetItem(str(text))
-                item.setTextAlignment(align)
-                if color:
-                    item.setForeground(QColor(color))
-                item.setData(Qt.ItemDataRole.UserRole, _sid)
-                return item
-
-            # Колонка «Агент» — виджет с кнопками
-            is_active = status == "active"
-            agent_widget = AgentCellWidget(
-                name=name, sid=sid,
-                on_start=self._start_agent,
-                on_stop=self._stop_agent,
-                is_active=is_active,
-            )
-            dummy = QTableWidgetItem()
-            dummy.setData(Qt.ItemDataRole.UserRole, sid)
-            self.table.setItem(row, COL["Агент"], dummy)
-            self.table.setCellWidget(row, COL["Агент"], agent_widget)
-
-            # Колонка «Тикер» — с кнопкой разворачивания если есть корзина
-            if has_instruments:
-                expanded = sid in self._expanded
-                ticker_label = f"{len(instruments)} инстр."
-                tw = TickerExpandWidget(ticker_label, sid, expanded, self._toggle_instruments)
-                dummy_t = QTableWidgetItem()
-                dummy_t.setData(Qt.ItemDataRole.UserRole, sid)
-                self.table.setItem(row, COL["Тикер"], dummy_t)
-                self.table.setCellWidget(row, COL["Тикер"], tw)
-            else:
-                self.table.setItem(row, COL["Тикер"],
-                                   cell(ticker, "#89b4fa", center))
-
-            self.table.setItem(row, COL["Счёт"],
-                               cell(account_label, "#6c7086", center))
-            status_dummy = QTableWidgetItem()
-            status_dummy.setData(Qt.ItemDataRole.UserRole, sid)
-            self.table.setItem(row, COL["Состояние"], status_dummy)
-            self.table.setCellWidget(row, COL["Состояние"], StatusCellWidget(status_text, status_color))
-            self.table.setItem(row, COL["Позиция"],
-                               cell(pos_qty, "#cdd6f4", center))
-
-            # П.Лот — потенциальный лот (только при позиции 0)
-            pot_lot_str = ""
-            try:
-                pos_qty_num = float(pos_qty)
-            except (ValueError, TypeError):
-                pos_qty_num = 1
-            if pos_qty_num == 0:
-                lot_sizing = data.get("lot_sizing", {})
-                connector_id = data.get("connector", "finam")
-                connector = connector_manager.get(connector_id)
-                board = data.get("board", "FUT")
-                if lot_sizing.get("dynamic") and connector and connector.is_connected():
-                    from core.equity_tracker import get_max_drawdown
-                    import math
-                    free_money = connector.get_free_money(account)
-                    sec_info = self._get_sec_info_cached(connector, connector_id, ticker, board) if hasattr(connector, "get_sec_info") else None
-                    go = 0.0
-                    if sec_info:
-                        go = float(sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0)
-                    if free_money and free_money > 0:
-                        if go <= 0:
-                            pot_lot_str = str(int(lot_sizing.get("lot", 1)) or 1)
-                        else:
-                            dd = float(lot_sizing.get("drawdown") or 0) or (get_max_drawdown(sid) or 0)
-                            instances = max(int(lot_sizing.get("instances", 1)), 1)
-                            denom = dd + go
-                            dyn = math.floor((free_money / denom) / instances) if denom > 0 else 0
-                            # dyn >= 1: можем купить хотя бы 1 лот → показываем dyn
-                            # dyn < 1: денег не хватает → показываем "0"
-                            pot_lot_str = str(dyn) if dyn >= 1 else "0"
-                    else:
-                        pot_lot_str = "—"
-                else:
-                    static_qty = int(lot_sizing.get("lot", data.get("params", {}).get("qty", 1)))
-                    can_afford = True
-                    if connector and connector.is_connected():
-                        free_money = connector.get_free_money(account)
-                        sec_info = self._get_sec_info_cached(connector, connector_id, ticker, data.get("board", "FUT"))
-                        if free_money is not None and sec_info:
-                            from core.equity_tracker import get_max_drawdown
-                            go = sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0
-                            dd = lot_sizing.get("drawdown", 0) or get_max_drawdown(sid) or 0
-                            can_afford = free_money >= (go + dd)
-                    pot_lot_str = str(static_qty) if can_afford else "0"
-            self.table.setItem(row, COL["П.Лот"],
-                               cell(pot_lot_str, "#89dceb", center))
-            self.table.setItem(row, COL["Уч. цена"],
-                               cell(avg_price, "#cdd6f4", center))
-            self.table.setItem(row, COL["Текущая"],
-                               cell(cur_price, "#cdd6f4", center))
-
-            # П/У текущей позиции
-            if pnl is not None:
-                pnl_color = "#a6e3a1" if pnl >= 0 else "#f38ba8"
-                pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}"
-            else:
-                pnl_color, pnl_str = "#6c7086", "—"
-            self.table.setItem(row, COL["П/У"],
-                               cell(pnl_str, pnl_color, center))
-
-            # Комиссия текущей позиции — уже уплаченная комиссия по открытому остатку
-            if open_commission is not None:
-                comm_color, comm_str = "#f9e2af", f"{open_commission:.2f}"
-            else:
-                comm_color, comm_str = "#6c7086", "—"
-            self.table.setItem(row, COL["Комиссия"],
-                               cell(comm_str, comm_color, center))
-
-            # Итог П/У — общий по стратегии
-            if total_pnl is not None:
-                tc = "#a6e3a1" if total_pnl >= 0 else "#f38ba8"
-                t_str = f"{'+' if total_pnl >= 0 else ''}{total_pnl:.2f}"
-            else:
-                tc, t_str = "#6c7086", "—"
-            self.table.setItem(row, COL["Итог П/У"],
-                               cell(t_str, tc, center))
-
-            # Накопленная комиссия по агенту
-            total_commission_str = f"{total_commission:.2f}"
-            self.table.setItem(row, COL["Итого комиссия"],
-                               cell(total_commission_str, "#f9e2af", center))
-
-            # Кнопка истории ордеров
-            btn_history = QPushButton()
-            btn_history.setFixedSize(36, 26)
-            btn_history.setToolTip(f"История ордеров {name}")
-            btn_history.setStyleSheet("""
-                QPushButton {
-                    background: #f9e2af; border: none;
-                    border-radius: 4px; font-size: 14px;
-                }
-                QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
-            """)
-            apply_icon(btn_history, 'actions/history.svg', 16)
-            btn_history.clicked.connect(lambda _, s=sid: self._open_order_history(s))
-            self.table.setCellWidget(row, COL["История ордеров"], btn_history)
-
-            # Кнопка чарта
-            btn_chart = QPushButton()
-            btn_chart.setFixedSize(36, 26)
-            btn_chart.setToolTip(f"График {ticker}")
-            btn_chart.setStyleSheet("""
-                QPushButton {
-                    background: #89b4fa; border: none;
-                    border-radius: 4px; font-size: 14px;
-                }
-                QPushButton:hover { background: #89b4fa; }
-            """)
-            apply_icon(btn_chart, 'actions/chart.svg', 16)
-            btn_chart.clicked.connect(lambda _, s=sid: self._open_chart(s))
-            self.table.setCellWidget(row, COL["📈"], btn_chart)
-
-            row += 1
-
-            # ── Дочерние строки инструментов ──────────
-            if has_instruments and sid in self._expanded:
-                pnl_by_ticker = get_pnl_by_ticker(sid)
-                child_bg = QColor("#1a1a2e")
-
                 for instr in instruments:
-                    # instr может быть строкой или dict {"ticker": ..., "board": ...}
                     if isinstance(instr, dict):
                         t_ticker = instr.get("ticker", "?")
-                        t_board = instr.get("board", "")
                     else:
                         t_ticker = str(instr)
-                        t_board = ""
+                    child_key = f"c:{sid}:{t_ticker}"
+                    child_hash = self._compute_row_hash(sid, data, is_child=True, child_ticker=t_ticker)
+                    new_rows.append((child_key, "child", {"ticker": t_ticker}, child_hash))
 
-                    self.table.setRowHeight(row, 28)
+        # Проверяем, изменилась ли структура таблицы
+        old_keys = set(self._table_state.keys())
+        new_keys = {r[0] for r in new_rows}
 
-                    def child_cell(text, color=None, align=center, _sid=sid):
-                        item = QTableWidgetItem(str(text))
-                        item.setTextAlignment(align)
-                        item.setBackground(child_bg)
-                        if color:
-                            item.setForeground(QColor(color))
-                        item.setData(Qt.ItemDataRole.UserRole, _sid)
-                        # Помечаем как дочернюю строку
-                        item.setData(Qt.ItemDataRole.UserRole + 1, t_ticker)
-                        return item
+        structure_changed = (old_keys != new_keys)
 
-                    # Агент — отступ + имя тикера
-                    self.table.setItem(row, COL["Агент"],
-                                       child_cell(f"    └ {t_ticker}", "#6c7086", left))
-                    # Тикер
-                    board_label = f"{t_ticker}" + (f" [{t_board}]" if t_board else "")
-                    self.table.setItem(row, COL["Тикер"],
-                                       child_cell(board_label, "#89b4fa", center))
-                    # Счёт, Состояние, Позиция, П.Лот, Уч.цена, Текущая, П/У, комиссии — пусто
-                    for col_name in (
-                        "Счёт", "Состояние", "Позиция", "П.Лот", "Уч. цена",
-                        "Текущая", "П/У", "Комиссия", "Итого комиссия",
-                    ):
-                        self.table.setItem(row, COL[col_name], child_cell("—", "#45475a"))
+        # Собираем ключи изменённых строк
+        changed_keys: set[str] = set()
+        for row_key, row_type, row_data, row_hash in new_rows:
+            if not self._has_row_changed(row_key, row_hash):
+                continue
+            changed_keys.add(row_key)
+            # Для родительских строк также помечаем дочерние как изменённые
+            # (потому что данные позиции могут измениться)
+            if row_type == "parent":
+                for ck in list(self._table_state.keys()):
+                    if ck.startswith(f"c:{row_key.split(':', 1)[1]}:") or ck.startswith(f"c:{row_data.get('name', '')}:"):
+                        pass  # дочерние строки будут проверены отдельно
+            # Для дочерних — просто добавляем
+            if row_type == "child":
+                changed_keys.add(row_key)
 
-                    # Итог П/У по тикеру
-                    t_pnl = pnl_by_ticker.get(t_ticker)
-                    if t_pnl is not None:
-                        tp_color = "#a6e3a1" if t_pnl >= 0 else "#f38ba8"
-                        tp_str = f"{'+' if t_pnl >= 0 else ''}{t_pnl:.2f}"
-                    else:
-                        tp_color, tp_str = "#45475a", "—"
-                    self.table.setItem(row, COL["Итог П/У"],
-                                       child_cell(tp_str, tp_color, center))
+        # Если ничего не изменилось — выходим сразу
+        if not structure_changed and not changed_keys:
+            return
 
-                    # Кнопка истории ордеров для инструмента
-                    btn_child_history = QPushButton()
-                    btn_child_history.setFixedSize(36, 26)
-                    btn_child_history.setToolTip(f"История ордеров {t_ticker}")
-                    btn_child_history.setStyleSheet("""
-                        QPushButton {
-                            background: #f9e2af; border: none;
-                            border-radius: 4px; font-size: 14px;
-                        }
-                        QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
-                    """)
-                    apply_icon(btn_child_history, 'actions/history.svg', 16)
-                    btn_child_history.clicked.connect(
-                        lambda _, s=sid, t=t_ticker: self._open_order_history(s, t)
-                    )
-                    self.table.setCellWidget(row, COL["История ордеров"], btn_child_history)
+        # ── Перестраиваем таблицу полностью при изменении структуры ──
+        if structure_changed:
+            self._table_state.clear()
+            self._widget_cache.clear()
+            total_rows = len(new_rows)
+            self.table.setRowCount(total_rows)
+            self._render_all_rows(new_rows, ordered)
+            return
 
-                    # Кнопка чарта для инструмента
-                    btn_child_chart = QPushButton()
-                    btn_child_chart.setFixedSize(36, 26)
-                    btn_child_chart.setToolTip(f"График {t_ticker}")
-                    btn_child_chart.setStyleSheet("""
-                        QPushButton {
-                            background: #89b4fa; border: none;
-                            border-radius: 4px; font-size: 14px;
-                        }
-                        QPushButton:hover { background: #89b4fa; }
-                    """)
-                    apply_icon(btn_child_chart, 'actions/chart.svg', 16)
-                    btn_child_chart.clicked.connect(
-                        lambda _, s=sid, t=t_ticker, b=t_board: self._open_chart_instrument(s, t, b)
-                    )
-                    self.table.setCellWidget(row, COL["📈"], btn_child_chart)
+        # ── Diff-based обновление: обновляем только изменённые строки ──
+        self._update_changed_rows(new_rows, changed_keys)
 
-                    row += 1
+    def _render_all_rows(self, new_rows: list, ordered: list):
+        """Полный рендер всех строк (при изменении структуры)."""
+        row = 0
+        for row_key, row_type, row_data, row_hash in new_rows:
+            if row_type == "parent":
+                self._render_parent_row(row, row_data, row_key)
+            elif row_type == "child":
+                self._render_child_row(row, row_data, row_key)
+            self._table_state[row_key] = row_hash
+            row += 1
+
+    def _update_changed_rows(self, new_rows: list, changed_keys: set):
+        """Обновляет только изменённые строки в таблице."""
+        # Строим маппинг row_key → row_index из текущей структуры
+        key_to_row: dict[str, int] = {}
+        row = 0
+        for row_key, row_type, row_data, row_hash in new_rows:
+            key_to_row[row_key] = row
+            row += 1
+
+        for row_key in changed_keys:
+            if row_key not in key_to_row:
+                continue
+            r = key_to_row[row_key]
+            if row_key.startswith("p:"):
+                sid = row_key[2:]
+                strategies = get_all_strategies()
+                if sid in strategies:
+                    data = strategies[sid]
+                    row_hash = self._compute_row_hash(sid, data)
+                    self._render_parent_row(r, data, row_key)
+                    self._table_state[row_key] = row_hash
+            elif row_key.startswith("c:"):
+                parts = row_key.split(":", 2)
+                if len(parts) >= 3:
+                    sid = parts[1]
+                    t_ticker = parts[2]
+                    strategies = get_all_strategies()
+                    if sid in strategies:
+                        data = strategies[sid]
+                        row_hash = self._compute_row_hash(sid, data, is_child=True, child_ticker=t_ticker)
+                        self._render_child_row(r, {"ticker": t_ticker}, row_key)
+                        self._table_state[row_key] = row_hash
+
+    def _render_parent_row(self, row: int, data: dict, row_key: str):
+        """Рендерит одну родительскую строку стратегии."""
+        from core.autostart import get_live_engines
+        from core.connector_manager import connector_manager
+
+        sid = row_key[2:]  # убираем "p:"
+        engines = get_live_engines()
+
+        self.table.setRowHeight(row, 32)
+
+        status = data.get("status", "stopped")
+        name = data.get("name", sid)
+        params = data.get("params", {})
+        ticker = data.get("ticker") or params.get("ticker", "—")
+        account = data.get("finam_account", "—") or "—"
+        aliases = get_setting("account_aliases") or {}
+        account_label = aliases.get(account, account)
+
+        instruments: list = params.get("instruments", [])
+        has_instruments = bool(instruments)
+
+        # Позиции
+        engine = engines.get(sid)
+        if engine and engine.is_running:
+            pos_info = engine.get_position_info()
+            pos_qty = str(pos_info["quantity"])
+            avg_price = f"{pos_info['avg_price']:.3f}" if pos_info["avg_price"] != 0 else "—"
+            cur_price = f"{pos_info['current_price']:.3f}" if pos_info["current_price"] != 0 else "—"
+            pnl = pos_info["pnl"] if pos_info["quantity"] else None
+        else:
+            connector_id = data.get("connector", "finam")
+            connector = connector_manager.get(connector_id)
+            positions = (
+                connector.get_positions(account)
+                if connector and connector.is_connected() and account != "—"
+                else []
+            )
+            pos = next((p for p in positions if p.get("ticker") == ticker), None)
+            pos_qty = str(int(pos["quantity"])) if pos else "0"
+            avg_price = f"{pos['avg_price']:.3f}" if pos else "—"
+            cur_price = f"{pos['current_price']:.3f}" if pos else "—"
+            pnl = pos["pnl"] if pos else None
+
+        total_pnl = get_total_pnl(sid)
+        open_commission = get_open_commission(sid)
+        total_commission = get_total_commission(sid)
+
+        status_map = {
+            "active": ("Активен", "#a6e3a1"),
+            "stopped": ("Остановлен", "#f38ba8"),
+            "waiting": ("Ожидание", "#f9e2af"),
+            "error": ("Ошибка", "#fab387"),
+        }
+        status_text, status_color = status_map.get(status, ("Неизвестно", "#6c7086"))
+
+        center = Qt.AlignmentFlag.AlignCenter
+        left = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        def cell(text, color=None, align=left, _sid=sid):
+            item = QTableWidgetItem(str(text))
+            item.setTextAlignment(align)
+            if color:
+                item.setForeground(QColor(color))
+            item.setData(Qt.ItemDataRole.UserRole, _sid)
+            return item
+
+        # Агент
+        is_active = status == "active"
+        agent_widget = AgentCellWidget(
+            name=name, sid=sid,
+            on_start=self._start_agent,
+            on_stop=self._stop_agent,
+            is_active=is_active,
+        )
+        dummy = QTableWidgetItem()
+        dummy.setData(Qt.ItemDataRole.UserRole, sid)
+        self.table.setItem(row, COL["Агент"], dummy)
+        self.table.setCellWidget(row, COL["Агент"], agent_widget)
+
+        # Тикер
+        if has_instruments:
+            expanded = sid in self._expanded
+            ticker_label = f"{len(instruments)} инстр."
+            tw = TickerExpandWidget(ticker_label, sid, expanded, self._toggle_instruments)
+            dummy_t = QTableWidgetItem()
+            dummy_t.setData(Qt.ItemDataRole.UserRole, sid)
+            self.table.setItem(row, COL["Тикер"], dummy_t)
+            self.table.setCellWidget(row, COL["Тикер"], tw)
+        else:
+            self.table.setItem(row, COL["Тикер"], cell(ticker, "#89b4fa", center))
+
+        self.table.setItem(row, COL["Счёт"], cell(account_label, "#6c7086", center))
+        status_dummy = QTableWidgetItem()
+        status_dummy.setData(Qt.ItemDataRole.UserRole, sid)
+        self.table.setItem(row, COL["Состояние"], status_dummy)
+        self.table.setCellWidget(row, COL["Состояние"], StatusCellWidget(status_text, status_color))
+        self.table.setItem(row, COL["Позиция"], cell(pos_qty, "#cdd6f4", center))
+
+        # П.Лот
+        pot_lot_str = self._compute_pot_lot(data, pos_qty, account, ticker, sid)
+        self.table.setItem(row, COL["П.Лот"], cell(pot_lot_str, "#89dceb", center))
+        self.table.setItem(row, COL["Уч. цена"], cell(avg_price, "#cdd6f4", center))
+        self.table.setItem(row, COL["Текущая"], cell(cur_price, "#cdd6f4", center))
+
+        # П/У
+        if pnl is not None:
+            pnl_color = "#a6e3a1" if pnl >= 0 else "#f38ba8"
+            pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}"
+        else:
+            pnl_color, pnl_str = "#6c7086", "—"
+        self.table.setItem(row, COL["П/У"], cell(pnl_str, pnl_color, center))
+
+        # Комиссия
+        if open_commission is not None:
+            comm_color, comm_str = "#f9e2af", f"{open_commission:.2f}"
+        else:
+            comm_color, comm_str = "#6c7086", "—"
+        self.table.setItem(row, COL["Комиссия"], cell(comm_str, comm_color, center))
+
+        # Итог П/У
+        if total_pnl is not None:
+            tc = "#a6e3a1" if total_pnl >= 0 else "#f38ba8"
+            t_str = f"{'+' if total_pnl >= 0 else ''}{total_pnl:.2f}"
+        else:
+            tc, t_str = "#6c7086", "—"
+        self.table.setItem(row, COL["Итог П/У"], cell(t_str, tc, center))
+
+        # Итого комиссия
+        self.table.setItem(row, COL["Итого комиссия"], cell(f"{total_commission:.2f}", "#f9e2af", center))
+
+        # Кнопка истории
+        btn_history = QPushButton()
+        btn_history.setFixedSize(36, 26)
+        btn_history.setToolTip(f"История ордеров {name}")
+        btn_history.setStyleSheet("""
+            QPushButton { background: #f9e2af; border: none; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
+        """)
+        apply_icon(btn_history, 'actions/history.svg', 16)
+        btn_history.clicked.connect(lambda _, s=sid: self._open_order_history(s))
+        self.table.setCellWidget(row, COL["История ордеров"], btn_history)
+
+        # Кнопка чарта
+        btn_chart = QPushButton()
+        btn_chart.setFixedSize(36, 26)
+        btn_chart.setToolTip(f"График {ticker}")
+        btn_chart.setStyleSheet("""
+            QPushButton { background: #89b4fa; border: none; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background: #89b4fa; }
+        """)
+        apply_icon(btn_chart, 'actions/chart.svg', 16)
+        btn_chart.clicked.connect(lambda _, s=sid: self._open_chart(s))
+        self.table.setCellWidget(row, COL["📈"], btn_chart)
+
+    def _render_child_row(self, row: int, row_data: dict, row_key: str):
+        """Рендерит одну дочернюю строку инструмента."""
+        parts = row_key.split(":", 2)
+        sid = parts[1]
+        t_ticker = parts[2] if len(parts) > 2 else "?"
+
+        self.table.setRowHeight(row, 28)
+        child_bg = QColor("#1a1a2e")
+        center = Qt.AlignmentFlag.AlignCenter
+        left = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+
+        pnl_by_ticker = get_pnl_by_ticker(sid)
+        t_pnl = pnl_by_ticker.get(t_ticker)
+
+        def child_cell(text, color=None, align=center):
+            item = QTableWidgetItem(str(text))
+            item.setTextAlignment(align)
+            item.setBackground(child_bg)
+            if color:
+                item.setForeground(QColor(color))
+            item.setData(Qt.ItemDataRole.UserRole, sid)
+            item.setData(Qt.ItemDataRole.UserRole + 1, t_ticker)
+            return item
+
+        self.table.setItem(row, COL["Агент"], child_cell(f"    └ {t_ticker}", "#6c7086", left))
+        board_label = t_ticker
+        self.table.setItem(row, COL["Тикер"], child_cell(board_label, "#89b4fa", center))
+
+        for col_name in (
+            "Счёт", "Состояние", "Позиция", "П.Лот", "Уч. цена",
+            "Текущая", "П/У", "Комиссия", "Итого комиссия",
+        ):
+            self.table.setItem(row, COL[col_name], child_cell("—", "#45475a"))
+
+        if t_pnl is not None:
+            tp_color = "#a6e3a1" if t_pnl >= 0 else "#f38ba8"
+            tp_str = f"{'+' if t_pnl >= 0 else ''}{t_pnl:.2f}"
+        else:
+            tp_color, tp_str = "#45475a", "—"
+        self.table.setItem(row, COL["Итог П/У"], child_cell(tp_str, tp_color, center))
+
+        btn_child_history = QPushButton()
+        btn_child_history.setFixedSize(36, 26)
+        btn_child_history.setToolTip(f"История ордеров {t_ticker}")
+        btn_child_history.setStyleSheet("""
+            QPushButton { background: #f9e2af; border: none; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background: #f9e2af; color: #1e1e2e; }
+        """)
+        apply_icon(btn_child_history, 'actions/history.svg', 16)
+        btn_child_history.clicked.connect(lambda _, s=sid, t=t_ticker: self._open_order_history(s, t))
+        self.table.setCellWidget(row, COL["История ордеров"], btn_child_history)
+
+        btn_child_chart = QPushButton()
+        btn_child_chart.setFixedSize(36, 26)
+        btn_child_chart.setToolTip(f"График {t_ticker}")
+        btn_child_chart.setStyleSheet("""
+            QPushButton { background: #89b4fa; border: none; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background: #89b4fa; }
+        """)
+        apply_icon(btn_child_chart, 'actions/chart.svg', 16)
+        # Получаем board из данных стратегии
+        params = {}
+        from core.storage import get_all_strategies
+        strategies = get_all_strategies()
+        if sid in strategies:
+            params = strategies[sid].get("params", {})
+        instruments = params.get("instruments", [])
+        t_board = ""
+        for instr in instruments:
+            if isinstance(instr, dict) and instr.get("ticker") == t_ticker:
+                t_board = instr.get("board", "")
+                break
+        btn_child_chart.clicked.connect(lambda _, s=sid, t=t_ticker, b=t_board: self._open_chart_instrument(s, t, b))
+        self.table.setCellWidget(row, COL["📈"], btn_child_chart)
+
+    def _compute_pot_lot(self, data: dict, pos_qty: str, account: str, ticker: str, sid: str) -> str:
+        """Вычисляет строку потенциального лота."""
+        from core.connector_manager import connector_manager
+
+        try:
+            pos_qty_num = float(pos_qty)
+        except (ValueError, TypeError):
+            pos_qty_num = 1
+
+        if pos_qty_num != 0:
+            return ""
+
+        lot_sizing = data.get("lot_sizing", {})
+        connector_id = data.get("connector", "finam")
+        connector = connector_manager.get(connector_id)
+        board = data.get("board", "FUT")
+
+        if lot_sizing.get("dynamic") and connector and connector.is_connected():
+            from core.equity_tracker import get_max_drawdown
+            import math
+            free_money = connector.get_free_money(account)
+            sec_info = None
+            if hasattr(connector, "get_sec_info"):
+                sec_info = self._get_sec_info_cached(connector, connector_id, ticker, board)
+            go = 0.0
+            if sec_info:
+                go = float(sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0)
+            if free_money and free_money > 0:
+                if go <= 0:
+                    return str(int(lot_sizing.get("lot", 1)) or 1)
+                else:
+                    dd = float(lot_sizing.get("drawdown") or 0) or (get_max_drawdown(sid) or 0)
+                    instances = max(int(lot_sizing.get("instances", 1)), 1)
+                    denom = dd + go
+                    dyn = math.floor((free_money / denom) / instances) if denom > 0 else 0
+                    return str(dyn) if dyn >= 1 else "0"
+            else:
+                return "—"
+        else:
+            static_qty = int(lot_sizing.get("lot", data.get("params", {}).get("qty", 1)))
+            can_afford = True
+            if connector and connector.is_connected():
+                free_money = connector.get_free_money(account)
+                sec_info = self._get_sec_info_cached(connector, connector_id, ticker, data.get("board", "FUT"))
+                if free_money is not None and sec_info:
+                    from core.equity_tracker import get_max_drawdown
+                    go = sec_info.get("buy_deposit") or sec_info.get("sell_deposit") or 0
+                    dd = lot_sizing.get("drawdown", 0) or get_max_drawdown(sid) or 0
+                    can_afford = free_money >= (go + dd)
+            return str(static_qty) if can_afford else "0"
 
     def _open_backtest(self, strategy_id: str):
         from ui.backtest_window import BacktestWindow

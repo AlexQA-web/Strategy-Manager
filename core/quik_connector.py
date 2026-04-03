@@ -30,7 +30,11 @@ class QuikConnector(BaseConnector):
         self._watch_lock = threading.Lock()
         self._order_watchers: dict[str, list[Callable]] = {}
         self._watch_threads: dict[str, threading.Thread] = {}
-        self._terminal_statuses = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
+        self._terminal_statuses = {
+            "matched", "cancelled", "canceled", "denied", "removed", "expired", "killed",
+            # Числовые коды QUIK: 3=исполнен, 4=отменён, 5=отклонён
+            "3", "4", "5",
+        }
         # Кэш ордеров по trans_id для ускорения get_order_status
         self._orders_cache: dict[str, dict] = {}
         self._cache_lock = threading.Lock()
@@ -142,7 +146,7 @@ class QuikConnector(BaseConnector):
                 if not self._is_broker_online():
                     logger.warning("[QUIK] Lua подключён, но брокерский сервер оффлайн — статус disconnected")
                     self._connected = False
-                    self._fire(self._on_disconnect)
+                    self._fire_event('disconnect')
                     return False
                 was_connected = self._connected  # запоминаем для reconnet detection
                 self._connected = True
@@ -156,23 +160,23 @@ class QuikConnector(BaseConnector):
                     self._force_check_orders()
 
                 logger.info("[QUIK] ✅ Подключён к серверу брокера")
-                self._fire(self._on_connect)
+                self._fire_event('connect')
                 return True
             else:
                 logger.warning("[QUIK] Lua-скрипт работает, но терминал не подключён к серверу брокера")
                 self._connected = False
-                self._fire(self._on_disconnect)
+                self._fire_event('disconnect')
                 return False
 
         except ConnectionRefusedError:
             msg = (f"Не удалось подключиться к {host}:{requests_port}. "
                    f"Убедись что QUIK запущен и скрипт QuikSharp.lua активен.")
             logger.error(f"[QUIK] {msg}")
-            self._fire(self._on_error, msg)
+            self._fire_event('error', msg)
             return False
         except Exception as e:
             logger.error(f"[QUIK] Exception: {e}")
-            self._fire(self._on_error, str(e))
+            self._fire_event('error', str(e))
             return False
 
     def disconnect(self):
@@ -198,7 +202,7 @@ class QuikConnector(BaseConnector):
                 except Exception:
                     pass
         logger.info("[QUIK] Отключён")
-        self._fire(self._on_disconnect)
+        self._fire_event('disconnect')
 
     def is_connected(self) -> bool:
         """Проверяет состояние подключения к QUIK и брокеру."""
@@ -263,6 +267,20 @@ class QuikConnector(BaseConnector):
         board: str = "TQBR",
         agent_name: str = "",
     ) -> Optional[str]:
+        # Валидация входных параметров
+        if not ticker or not ticker.strip():
+            logger.error("[QUIK] place_order — пустой ticker")
+            return None
+        if side not in ("buy", "sell"):
+            logger.error(f"[QUIK] place_order — неверный side: {side} (должен быть 'buy' или 'sell')")
+            return None
+        if quantity <= 0:
+            logger.error(f"[QUIK] place_order — quantity должно быть > 0, получено: {quantity}")
+            return None
+        if price < 0:
+            logger.error(f"[QUIK] place_order — price не может быть отрицательным: {price}")
+            return None
+
         if not self._connected or not self._client:
             logger.warning("[QUIK] place_order — нет подключения")
             return None
@@ -286,7 +304,7 @@ class QuikConnector(BaseConnector):
             return trans_id or None
         except Exception as e:
             logger.error(f"[QUIK] place_order error: {e}")
-            self._fire(self._on_error, str(e))
+            self._fire_event('error', str(e))
             return None
 
     def cancel_order(self, order_id: str, account_id: str) -> bool:
@@ -373,15 +391,39 @@ class QuikConnector(BaseConnector):
         logger.debug(f"[QUIK] Кэш ордеров синхронизирован: {len(new_cache)} ордеров")
 
     def _map_order_status(self, raw: str) -> str:
+        """Маппинг статусов QUIK в унифицированный формат.
+        
+        QUIK может возвращать:
+        - Английские строки: "matched", "cancelled", "working"
+        - Русские строки: "Исполнен", "Отменён", "Активен"
+        - Числовые коды: 3=исполнен, 4=отменён, 5=отклонён, 1=активен
+        """
         status = (raw or "").strip().lower()
-        if status in ("matched", "filled", "executed"):
+        
+        # Числовые коды QUIK
+        if status in ("3",):
             return "matched"
-        if status in ("cancelled", "canceled", "killed"):
+        if status in ("4",):
             return "canceled"
-        if status in ("rejected", "denied"):
+        if status in ("5",):
             return "denied"
-        if status in ("working", "active", "open"):
+        if status in ("1", "2"):
             return "working"
+        
+        # Английские статусы
+        if status in ("matched", "filled", "executed", "исполнен"):
+            return "matched"
+        if status in ("cancelled", "canceled", "killed", "отменён", "отменен"):
+            return "canceled"
+        if status in ("rejected", "denied", "отклонён", "отклонен"):
+            return "denied"
+        if status in ("working", "active", "open", "активен", "действует"):
+            return "working"
+        if status in ("removed", "удалён", "удален"):
+            return "removed"
+        if status in ("expired", "истёк", "истек"):
+            return "expired"
+        
         return status or "working"
 
     def get_order_status(self, transaction_id: str) -> Optional[dict]:
@@ -788,7 +830,10 @@ class QuikConnector(BaseConnector):
 
     def get_history(self, ticker: str, board: str,
                     period: str, days: int) -> Optional["pd.DataFrame"]:
-        """Загружает историю свечей через QUIK DataSource (get_candles_from_data_source)."""
+        """Загружает историю свечей через QUIK DataSource (get_candles_from_data_source).
+        
+        Ограничивает количество баров чтобы не блокировать другие запросы на длительное время.
+        """
         if not self._connected or not self._client:
             return None
         try:
@@ -800,10 +845,17 @@ class QuikConnector(BaseConnector):
                 "1h": 60, "4h": 240, "1d": 1440,
             }
             interval = interval_map.get(period, 15)
+            
+            # Ограничиваем количество баров чтобы не блокировать lock на минуты
+            # Для 1m: ~5000 баров = ~3.5 торговых дней
+            # Для 5m: ~5000 баров = ~17 торговых дней
+            # Для 1d: ~500 баров = ~2 года
+            max_bars = {1: 5000, 5: 5000, 15: 3000, 30: 2000, 60: 1000, 240: 500, 1440: 500}
+            count = max_bars.get(interval, 3000)
 
             with self._lock:
                 result = self._client.get_candles_from_data_source(
-                    board, ticker, interval, count=0
+                    board, ticker, interval, count=count
                 )
             candles = result.get("data", [])
 
@@ -1062,4 +1114,21 @@ class QuikConnector(BaseConnector):
             return None
 
 
-quik_connector = QuikConnector()
+# Ленивая инициализация — не создаём при импорте модуля
+_quik_connector_instance: Optional["QuikConnector"] = None
+
+def get_quik_connector() -> "QuikConnector":
+    """Возвращает синглтон QuikConnector с ленивой инициализацией."""
+    global _quik_connector_instance
+    if _quik_connector_instance is None:
+        _quik_connector_instance = QuikConnector()
+    return _quik_connector_instance
+
+# Для обратной совместимости — свойство-прокси
+class _ConnectorProxy:
+    def __getattribute__(self, name):
+        return getattr(get_quik_connector(), name)
+    def __setattr__(self, name, value):
+        setattr(get_quik_connector(), name, value)
+
+quik_connector = _ConnectorProxy()

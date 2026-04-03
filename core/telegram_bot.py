@@ -13,7 +13,7 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("python-telegram-bot не установлен. Уведомления отключены.")
 
-from core.storage import get_setting
+from core.storage import get_setting, get_bool_setting
 from core.ntfy_notifier import ntfy_notifier
 
 
@@ -255,7 +255,7 @@ class TelegramNotifier:
         token = get_setting("telegram_token")
         chat_id = get_setting("telegram_chat_id")
         level = get_setting("telegram_level", NotificationLevel.ALL)
-        tg_enabled = str(get_setting("telegram_enabled", "false")).lower() == "true"
+        tg_enabled = get_bool_setting("telegram_enabled")
 
         if token and chat_id and tg_enabled:
             self.configure(token, chat_id, level, enabled=True)
@@ -340,9 +340,7 @@ class TelegramNotifier:
 
     def _ntfy_enabled(self) -> bool:
         """Проверяет, включена ли отправка в NTFY."""
-        # Загружаем настройки NTFY и проверяем, включена ли она
-        from core.storage import get_setting
-        return bool(get_setting("ntfy_enabled", False))
+        return get_bool_setting("ntfy_enabled")
 
     async def test_connection(self) -> tuple[bool, str]:
         """
@@ -400,34 +398,43 @@ class TelegramNotifier:
         except Exception as e:
             logger.error(f"Telegram: неизвестная ошибка [{event_code}]: {e}")
 
-    def _should_send(self, event_code: str) -> bool:
-        """Проверяет нужно ли отправлять событие по явной настройке или уровню уведомлений."""
-        # Проверяем, включена ли отправка для этого типа уведомления хотя бы в одном из каналов
+    def _should_send(self, event_code: str) -> tuple[bool, bool]:
+        """Проверяет нужно ли отправлять событие по явной настройке или уровню уведомлений.
+        
+        Returns:
+            (send_telegram: bool, send_ntfy: bool)
+        """
         telegram_key = f"notify_telegram_{event_code}"
         ntfy_key = f"notify_ntfy_{event_code}"
         
-        # Получаем настройки для каждого канала
         telegram_notify = get_setting(telegram_key)
         ntfy_notify = get_setting(ntfy_key)
         
-        # Если для какого-то канала настройка явно указана, используем её
-        tg_global_enabled = str(get_setting("telegram_enabled", "false")).lower() == "true"
-        ntfy_global_enabled = str(get_setting("ntfy_enabled", "false")).lower() == "true"
+        tg_global_enabled = get_bool_setting("telegram_enabled")
+        ntfy_global_enabled = get_bool_setting("ntfy_enabled")
 
-        telegram_enabled = self._enabled and tg_global_enabled and (telegram_notify is None or str(telegram_notify).lower() == "true")
-        ntfy_enabled = ntfy_global_enabled and self._ntfy_enabled() and (ntfy_notify is None or str(ntfy_notify).lower() == "true")
+        def _is_notify_enabled(notify_val) -> bool:
+            if notify_val is None:
+                return True  # нет явной настройки — используем глобальную
+            if isinstance(notify_val, bool):
+                return notify_val
+            return str(notify_val).lower() in ("true", "1", "yes", "on")
+
+        telegram_enabled = self._enabled and tg_global_enabled and _is_notify_enabled(telegram_notify)
+        ntfy_enabled = ntfy_global_enabled and self._ntfy_enabled() and _is_notify_enabled(ntfy_notify)
         
-        # Отправляем, если хотя бы в одном канале разрешено
-        if telegram_enabled or ntfy_enabled:
-            # Также проверяем уровень уведомлений
-            level = (self._level or NotificationLevel.ALL).lower()
-            if level == NotificationLevel.CRITICAL_ONLY:
-                return event_code in _CRITICAL_CODES
-            if level == NotificationLevel.ERRORS_ONLY:
-                return event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
-            if level == "off":
-                return False
-            return True
+        # Проверяем уровень уведомлений
+        level = (self._level or NotificationLevel.ALL).lower()
+        if level == "off":
+            return False, False
+        
+        level_ok = True
+        if level == NotificationLevel.CRITICAL_ONLY:
+            level_ok = event_code in _CRITICAL_CODES
+        elif level == NotificationLevel.ERRORS_ONLY:
+            level_ok = event_code in _ERROR_CODES or event_code in _CRITICAL_CODES
+        
+        return telegram_enabled and level_ok, ntfy_enabled and level_ok
         
         return False
 

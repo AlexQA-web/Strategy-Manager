@@ -62,6 +62,7 @@ class QuikPy:
         self.requests_port = requests_port  # Порт для отправки запросов и получения ответов
         self.callbacks_port = callbacks_port  # Порт для функций обратного вызова
         self.socket_requests = socket(AF_INET, SOCK_STREAM)  # Создаем соединение для запросов
+        self.socket_requests.settimeout(30)  # Таймаут 30 сек чтобы не блокировать навсегда
         self.socket_requests.connect((self.host, self.requests_port))  # Открываем соединение для запросов
 
         self.callback_exit_event = ThreadingEvent()  # Определяем событие выхода из потока
@@ -837,7 +838,11 @@ class QuikPy:
         self.socket_requests.sendall(raw_data)  # Отправляем запрос в QUIK
         fragments = []  # Гораздо быстрее получать ответ в виде списка фрагментов
         while True:  # Пока фрагменты есть в буфере
-            fragment = self.socket_requests.recv(self.buffer_size)  # Читаем фрагмент из буфера
+            try:
+                fragment = self.socket_requests.recv(self.buffer_size)  # Читаем фрагмент из буфера
+            except timeout:  # Таймаут сокета — QUIK не отвечает
+                self.lock.release()
+                raise TimeoutError("QUIK не ответил в течение 30 секунд")
             fragments.append(fragment.decode('cp1251'))  # Переводим фрагмент в Windows кодировку 1251, добавляем в список
             if len(fragment) < self.buffer_size:  # Если в принятом фрагменте данных меньше чем размер буфера
                 data = ''.join(fragments)  # Собираем список фрагментов в строку

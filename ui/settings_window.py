@@ -10,6 +10,7 @@ from loguru import logger
 from core.storage import (
     get_exportable_settings,
     get_setting,
+    get_bool_setting,
     set_setting as save_setting,
     get_all_schedules,
     SCHEDULES_FILE,
@@ -404,7 +405,7 @@ class _SettingsMixin:
         tg_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.tg_enabled = QCheckBox("Включить Telegram уведомления")
-        self.tg_enabled.setChecked(str(get_setting("telegram_enabled", "false")).lower() == "true")
+        self.tg_enabled.setChecked(get_bool_setting("telegram_enabled"))
         tg_form.addRow(self.tg_enabled)
 
         self.tg_token = QLineEdit()
@@ -439,7 +440,7 @@ class _SettingsMixin:
         ntfy_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self.ntfy_enabled = QCheckBox("Включить NTFY уведомления")
-        self.ntfy_enabled.setChecked(str(get_setting("ntfy_enabled", "false")).lower() == "true")
+        self.ntfy_enabled.setChecked(get_bool_setting("ntfy_enabled"))
         ntfy_form.addRow(self.ntfy_enabled)
 
         self.ntfy_server_url = QLineEdit()
@@ -1022,17 +1023,17 @@ class _SettingsMixin:
         # --- Telegram ---
         self.tg_token.setText(get_setting("telegram_token") or "")
         self.tg_chat_id.setText(str(get_setting("telegram_chat_id") or ""))
-        self.tg_enabled.setChecked(str(get_setting("telegram_enabled", "false")).lower() == "true")
+        self.tg_enabled.setChecked(get_bool_setting("telegram_enabled"))
 
         # --- NTFY ---
         self.ntfy_server_url.setText(get_setting("ntfy_server_url") or "https://ntfy.sh")
         self.ntfy_topic.setText(get_setting("ntfy_topic") or "")
-        self.ntfy_enabled.setChecked(str(get_setting("ntfy_enabled", "false")).lower() == "true")
+        self.ntfy_enabled.setChecked(get_bool_setting("ntfy_enabled"))
 
         # --- Уведомления для каждого канала ---
         for key, cb in self._notify_telegram_checks.items():
             default = "false"
-            cb.setChecked(str(get_setting(key) or default).lower() == "true")
+            cb.setChecked(get_bool_setting(key))
         for key, cb in self._notify_ntfy_checks.items():
             default = "false"
             cb.setChecked(str(get_setting(key) or default).lower() == "true")

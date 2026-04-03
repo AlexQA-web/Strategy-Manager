@@ -12,6 +12,13 @@ def is_in_schedule(connector_id: str) -> bool:
 
     Используется в autostart для проверки перед запуском LiveEngine.
     Если расписание не найдено или неактивно — возвращает True (не блокируем).
+
+    NOTE: overnight логика:
+    - connect_time <= disconnect_time: окно в пределах одного дня (06:50-23:45)
+    - connect_time > disconnect_time: окно с переходом через полночь
+      (06:50-00:01 означает "с 06:50 до конца дня ИЛИ с начала дня до 00:01")
+      Это НЕ "с 06:50 до 00:01 следующего дня" — для этого нужно ставить
+      connect_time="06:50", disconnect_time="23:59" + отдельное расписание на следующий день.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -41,9 +48,21 @@ def is_in_schedule(connector_id: str) -> bool:
 
     connect_t    = dtime(ch, cm)
     disconnect_t = dtime(dh, dm)
+
+    # Информационное сообщение об overnight-расписании (переход через полночь)
+    if connect_t > disconnect_t and disconnect_t.hour == 0 and disconnect_t.minute <= 5:
+        logger.debug(
+            f"[Scheduler] is_in_schedule({connector_id}): "
+            f"overnight-расписание connect={connect_t} disconnect={disconnect_t}. "
+            f"Окно: 'с {connect_t} до конца дня ИЛИ с начала дня до {disconnect_t}'."
+        )
+
     if connect_t <= disconnect_t:
+        # Обычное окно в пределах одного дня
         return connect_t <= now_t <= disconnect_t
     else:
+        # Overnight: connect_t > disconnect_t
+        # Работаем: с connect_t до конца дня ИЛИ с начала дня до disconnect_t
         return now_t >= connect_t or now_t <= disconnect_t
 
 

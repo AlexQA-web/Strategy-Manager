@@ -4,7 +4,7 @@ import time
 from typing import Optional
 from loguru import logger
 
-from core.storage import get_setting
+from core.storage import get_setting, get_bool_setting
 
 
 class NtfyNotifier:
@@ -43,7 +43,7 @@ class NtfyNotifier:
         """
         server_url = get_setting("ntfy_server_url")
         topic = get_setting("ntfy_topic")
-        enabled = str(get_setting("ntfy_enabled", "false")).lower() == "true"
+        enabled = get_bool_setting("ntfy_enabled")
 
         if server_url and topic and enabled:
             self.configure(server_url, topic, enabled=True)

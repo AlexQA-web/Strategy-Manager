@@ -242,6 +242,8 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str) -> No
     Для закрытия использует подтверждённую позицию из коннектора,
     а не локальное оптимистичное состояние.
     """
+    from core.order_placer import OrderPlacer
+
     action     = signal.get("action")
     qty        = int(signal.get("qty", 1))
     comment    = signal.get("comment", "")
@@ -249,11 +251,13 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str) -> No
     board      = params.get("board", "SPBFUT")
     order_mode = params.get("order_mode", "market")
 
+    placer = OrderPlacer(connector, agent_name="Бочка CNY")
+
     if action == "buy":
-        _place(connector, account_id, board, ticker, "buy", qty, comment, order_mode)
+        placer.place(account_id, board, ticker, "buy", qty, order_mode, comment)
 
     elif action == "sell":
-        _place(connector, account_id, board, ticker, "sell", qty, comment, order_mode)
+        placer.place(account_id, board, ticker, "sell", qty, order_mode, comment)
 
     elif action == "close":
         live_side, live_qty = _get_confirmed_position(connector, account_id, ticker, board)
@@ -261,273 +265,7 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str) -> No
             logger.warning('[Бочка CNY] close сигнал, но подтверждённая позиция отсутствует — пропуск')
             return
         close_side = "sell" if live_side > 0 else "buy"
-        _place(connector, account_id, board, ticker, close_side, live_qty, comment, order_mode)
-
-
-def _place(connector, account_id: str, board: str, ticker: str,
-           side: str, qty: int, comment: str = "",
-           order_mode: str = "market") -> bool:
-    """
-    Выставляет заявку через коннектор в зависимости от order_mode:
-      - "market"      — рыночная заявка
-      - "limit"       — ChaseOrder: лимитка по bid/offer с автоперестановкой
-      - "limit_price" — лимитная по last price; мониторится до исполнения или 23:45
-    """
-    try:
-        if order_mode == "limit":
-            # Лимитка по лучшей цене стакана — ChaseOrder в фоновом потоке
-            from core.chase_order import ChaseOrder
-            import threading
-
-            # Проверяем наличие рыночных данных перед созданием ChaseOrder
-            quote_available = False
-            try:
-                if hasattr(connector, "get_best_quote"):
-                    quote = connector.get_best_quote(board, ticker)
-                    if quote and (quote.get("bid") or quote.get("offer") or quote.get("last")):
-                        quote_available = True
-            except Exception:
-                pass
-
-            if not quote_available:
-                logger.warning(
-                    f"[Бочка CNY] Нет рыночных данных для {ticker}, "
-                    f"используем рыночный ордер вместо лимитного | {comment}"
-                )
-                # Fallback на рыночный ордер
-                tid = connector.place_order(
-                    account_id=account_id,
-                    ticker=ticker,
-                    side=side,
-                    quantity=qty,
-                    order_type="market",
-                    board=board,
-                    agent_name="Бочка CNY",
-                )
-                if tid:
-                    logger.info(f"[Бочка CNY] MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
-                    return True
-                else:
-                    logger.error(
-                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
-                        f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
-                    )
-                    return False
-
-            def _run_chase():
-                chase = ChaseOrder(
-                    connector=connector,
-                    account_id=account_id,
-                    ticker=ticker,
-                    side=side,
-                    quantity=qty,
-                    board=board,
-                    agent_name="Бочка CNY",
-                )
-                chase.wait(timeout=60)
-                if not chase.is_done:
-                    chase.cancel()
-                if chase.filled_qty == 0:
-                    logger.error(
-                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
-                        f"сторона={side.upper()} qty={qty} цена=bid/offer "
-                        f"вид=limit(стакан) — ничего не исполнено за 60 сек | {comment}"
-                    )
-                    # Если chase-ордер не исполнился, пробуем выставить рыночный ордер
-                    tid = connector.place_order(
-                        account_id=account_id,
-                        ticker=ticker,
-                        side=side,
-                        quantity=qty,
-                        order_type="market",
-                        board=board,
-                        agent_name="Бочка CNY",
-                    )
-                    if tid:
-                        logger.info(f"[Бочка CNY] FALLBACK MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
-                    else:
-                        logger.error(
-                            f"[Бочка CNY] ОШИБКА fallback заявки: агент=Бочка CNY тикер={ticker} "
-                            f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
-                        )
-                else:
-                    logger.info(
-                        f"[Бочка CNY] Chase {side.upper()} {ticker}x{qty} "
-                        f"filled={chase.filled_qty} avg={chase.avg_price:.4f} | {comment}"
-                    )
-
-            t = threading.Thread(target=_run_chase, daemon=True,
-                                 name=f"bochka-chase-{ticker}-{side}")
-            t.start()
-            return True
-
-        elif order_mode == "limit_price":
-            # Лимитная по last price — висит до исполнения или до 23:45
-            import threading, time as _time
-            from datetime import datetime as _dt
-
-            # Проверяем наличие рыночных данных перед использованием limit_price
-            quote_available = False
-            try:
-                if hasattr(connector, "get_best_quote"):
-                    quote = connector.get_best_quote(board, ticker)
-                    if quote and (quote.get("bid") or quote.get("offer") or quote.get("last")):
-                        quote_available = True
-            except Exception:
-                pass
-            
-            if not quote_available:
-                logger.warning(
-                    f"[Бочка CNY] Нет рыночных данных для {ticker}, "
-                    f"используем рыночный ордер вместо limit_price | {comment}"
-                )
-                # Fallback на рыночный ордер
-                tid = connector.place_order(
-                    account_id=account_id,
-                    ticker=ticker,
-                    side=side,
-                    quantity=qty,
-                    order_type="market",
-                    board=board,
-                    agent_name="Бочка CNY",
-                )
-                if tid:
-                    logger.info(f"[Бочка CNY] MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
-                    return True
-                else:
-                    logger.error(
-                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
-                        f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
-                    )
-                    return False
-
-            price = _get_last_price(connector, board, ticker)
-            if not price:
-                logger.warning(f"[Бочка CNY] limit_price: нет цены для {ticker}, fallback market")
-                order_mode = "market"
-            else:
-                tid = connector.place_order(
-                    account_id=account_id,
-                    ticker=ticker,
-                    side=side,
-                    quantity=qty,
-                    order_type="limit",
-                    price=price,
-                    board=board,
-                    agent_name="Бочка CNY",
-                )
-                if not tid:
-                    logger.error(
-                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
-                        f"сторона={side.upper()} qty={qty} цена={price} "
-                        f"вид=limit_price — ордер не выставлен | {comment}"
-                    )
-                    return False
-
-                logger.info(f"[Бочка CNY] LIMIT {side.upper()} {ticker}x{qty} @{price} tid={tid} | {comment}")
-
-                from config.settings import TRADING_END_TIME_MIN
-                _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
-                CANCEL_MIN = TRADING_END_TIME_MIN
-
-                def _monitor():
-                    filled = 0
-                    while True:
-                        try:
-                            info = connector.get_order_status(tid)
-                            if info:
-                                status = info.get("status", "")
-                                b = info.get("balance")
-                                q = info.get("quantity")
-                                if b is not None and q is not None:
-                                    filled = int(q) - int(b)
-                                if status in _TERMINAL:
-                                    logger.info(f"[Бочка CNY] LIMIT tid={tid} {status} filled={filled}/{qty}")
-                                    break
-                        except Exception as e:
-                            logger.warning(f"[Бочка CNY] monitor tid={tid}: {e}")
-
-                        now_min = _dt.now().hour * 60 + _dt.now().minute
-                        if now_min >= CANCEL_MIN:
-                            logger.info(f"[Бочка CNY] LIMIT tid={tid} снимается в 23:45 (filled={filled}/{qty})")
-                            try:
-                                connector.cancel_order(tid, account_id)
-                            except Exception:
-                                pass
-                            # Ждём финального статуса
-                            deadline = _time.monotonic() + 2.0
-                            while _time.monotonic() < deadline:
-                                _time.sleep(0.1)
-                                try:
-                                    info2 = connector.get_order_status(tid)
-                                    if info2 and info2.get("status", "") in _TERMINAL:
-                                        b2 = info2.get("balance")
-                                        q2 = info2.get("quantity")
-                                        if b2 is not None and q2 is not None:
-                                            filled = int(q2) - int(b2)
-                                        break
-                                except Exception:
-                                    pass
-                            break
-                        _time.sleep(1.0)
-
-                t = threading.Thread(target=_monitor, daemon=True,
-                                     name=f"bochka-lp-{ticker}-{tid}")
-                t.start()
-                return True
-
-        # market (включая fallback из limit_price при отсутствии цены)
-        tid = connector.place_order(
-            account_id=account_id,
-            ticker=ticker,
-            side=side,
-            quantity=qty,
-            order_type="market",
-            board=board,
-            agent_name="Бочка CNY",
-        )
-        if tid:
-            logger.info(f"[Бочка CNY] {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
-            return True
-        else:
-            logger.error(
-                f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
-                f"сторона={side.upper()} qty={qty} цена=market "
-                f"вид=market — ордер не выставлен | {comment}"
-            )
-            return False
-
-    except Exception as e:
-        logger.error(f"[Бочка CNY] _place {ticker} {side}: {e}")
-        return False
-
-
-def _get_last_price(connector, board: str, ticker: str) -> float:
-    """Возвращает last price для лимитной заявки по цене."""
-    try:
-        if hasattr(connector, "get_best_quote"):
-            q = connector.get_best_quote(board, ticker)
-            if q:
-                # Проверяем, что хотя бы одна цена доступна
-                last = q.get("last")
-                bid = q.get("bid")
-                offer = q.get("offer")
-                
-                # Возвращаем доступную цену в порядке приоритета: last -> bid -> offer
-                if last and last > 0:
-                    return last
-                elif bid and bid > 0:
-                    return bid
-                elif offer and offer > 0:
-                    return offer
-        if hasattr(connector, "get_last_price"):
-            price = connector.get_last_price(ticker, board)
-            if price and price > 0:
-                return price
-    except Exception as e:
-        logger.warning(f"[Бочка CNY] _get_last_price {ticker}: {e}")
-    return 0.0
-
+        placer.place(account_id, board, ticker, close_side, live_qty, order_mode, comment)
 
 
 def _get_confirmed_position(connector, account_id: str, ticker: str, board: str) -> tuple[int, int]:

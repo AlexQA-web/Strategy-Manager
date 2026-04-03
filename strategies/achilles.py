@@ -378,348 +378,200 @@ def _place(connector, account_id: str, board: str, ticker: str,
            spread_offset: float, agent_name: str = "Achilles",
            strategy_id: str = "", connector_id: str = "",
            is_close: bool = False) -> bool:
-    """
-    Выставляет заявку в зависимости от order_mode:
-      - "market"      — рыночная заявка
-      - "limit_book"  — лимитка по bid/offer ± spread_offset (ChaseOrder с автоперестановкой)
-      - "limit_price" — лимитка по last price; мониторится до исполнения или 23:45
-    """
+    """Выставляет заявку через OrderPlacer с управлением состоянием."""
+    from core.order_placer import OrderPlacer
+
     state = _get_state(strategy_id) if strategy_id else None
-    try:
-        if order_mode == "market":
-            tid = connector.place_order(
-                account_id=account_id,
-                ticker=ticker,
-                side=side,
-                quantity=qty,
-                order_type="market",
-                board=board,
-                agent_name=agent_name,
-            )
-            if tid:
-                logger.info(f"[Achilles] MARKET {side.upper()} {ticker}x{qty} tid={tid}")
-                price = _get_price(connector, board, ticker)
-                if strategy_id:
-                    _record_trade(
-                        ticker=ticker, board=board, side=side, qty=qty,
-                        price=price, order_role="taker",
-                        strategy_id=strategy_id, connector_id=connector_id,
-                        comment=f"market tid={tid}",
-                        order_ref=str(tid),
+    placer = OrderPlacer(connector, agent_name=agent_name)
+
+    # ── Проверка дубликатов ордеров (специфично для Achilles) ──
+    if order_mode in ('limit_book', 'limit_price'):
+        with _state_lock:
+            if state is not None:
+                pending = state["pending_orders"].get(ticker)
+                if pending is not None:
+                    logger.warning(
+                        f"[Achilles] {ticker}: уже есть активный лимитный ордер "
+                        f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
                     )
-                return True
-            else:
-                logger.error(
-                    f"[Achilles] ОШИБКА заявки: агент=Achilles тикер={ticker} "
-                    f"сторона={side.upper()} qty={qty} цена=market "
-                    f"вид=market — ордер не выставлен"
-                )
-                return False
+                    return False
 
-        elif order_mode == "limit_book":
-            # ChaseOrder: лимитка по bid/offer с автоперестановкой в фоновом потоке
-            import threading
-            from core.chase_order import ChaseOrder
-
-            with _state_lock:
-                if state is not None:
-                    pending = state["pending_orders"].get(ticker)
-                    if pending is not None:
-                        logger.warning(
-                            f"[Achilles] {ticker}: уже есть активный лимитный ордер "
-                            f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
-                        )
+                if is_close:
+                    current = state["positions"].get(ticker)
+                    if current is None:
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
                         return False
-
-                    if is_close:
-                        current = state["positions"].get(ticker)
-                        if current is None:
-                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
-                            return False
-                        if current.get("status") == "closing":
-                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
-                            return False
-                        current["status"] = "closing"
-                    else:
-                        if ticker in state["positions"]:
-                            logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
-                            return False
-                        state["positions"][ticker] = {
-                            "side": side,
-                            "qty": int(qty),
-                            "board": board,
-                            "status": "opening",
-                        }
-
-                    state["pending_orders"][ticker] = {
-                        "side": side,
-                        "qty": int(qty),
-                        "board": board,
-                        "status": "closing" if is_close else "opening",
-                        "mode": order_mode,
-                        "is_close": is_close,
-                    }
-
-            def _run_chase():
-                chase = ChaseOrder(
-                    connector=connector,
-                    account_id=account_id,
-                    ticker=ticker,
-                    side=side,
-                    quantity=qty,
-                    board=board,
-                    agent_name=agent_name,
-                )
-                chase.wait(timeout=60)
-                if not chase.is_done:
-                    chase.cancel()
-                if chase.filled_qty == 0:
-                    logger.error(
-                        f"[Achilles] ОШИБКА заявки: агент=Achilles тикер={ticker} "
-                        f"сторона={side.upper()} qty={qty} цена=bid/offer "
-                        f"вид=limit_book(стакан) — ничего не исполнено за 60 сек"
-                    )
-                    with _state_lock:
-                        if state is not None:
-                            state["pending_orders"].pop(ticker, None)
-                            if is_close:
-                                current = state["positions"].get(ticker)
-                                if current is not None and current.get("status") == "closing":
-                                    current["status"] = "open"
-                            else:
-                                current = state["positions"].get(ticker)
-                                if current is not None and current.get("status") == "opening":
-                                    state["positions"].pop(ticker, None)
+                    if current.get("status") == "closing":
+                        logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
+                        return False
+                    current["status"] = "closing"
                 else:
-                    logger.info(
-                        f"[Achilles] Chase {side.upper()} {ticker}x{qty} "
-                        f"filled={chase.filled_qty} avg={chase.avg_price:.4f}"
-                    )
-                    if strategy_id:
-                        _record_trade(
-                            ticker=ticker, board=board, side=side,
-                            qty=chase.filled_qty, price=chase.avg_price,
-                            order_role="maker",
-                            strategy_id=strategy_id, connector_id=connector_id,
-                            comment=f"limit_book chase avg={chase.avg_price:.4f}",
-                        )
-                    with _state_lock:
-                        if state is not None:
-                            state["pending_orders"].pop(ticker, None)
-                            if is_close:
-                                current = state["positions"].get(ticker)
-                                if current is not None:
-                                    remaining_qty = max(int(current.get("qty", qty)) - int(chase.filled_qty), 0)
-                                    if remaining_qty > 0:
-                                        current["qty"] = remaining_qty
-                                        current["status"] = "open"
-                                    else:
-                                        state["positions"].pop(ticker, None)
-                            else:
-                                current = state["positions"].get(ticker)
-                                if current is None:
-                                    state["positions"][ticker] = {
-                                        "side": side,
-                                        "qty": int(chase.filled_qty),
-                                        "board": board,
-                                        "status": "open",
-                                    }
-                                else:
-                                    current["side"] = side
-                                    current["qty"] = int(chase.filled_qty)
-                                    current["board"] = board
-                                    current["status"] = "open"
-
-            t = threading.Thread(target=_run_chase, daemon=True,
-                                 name=f"achilles-chase-{ticker}-{side}")
-            t.start()
-            return True
-
-        else:  # limit_price
-            # Лимитная по last price — висит до исполнения или до 23:45
-            import threading, time as _time
-            from datetime import datetime as _dt
-
-            with _state_lock:
-                if state is not None:
-                    pending = state["pending_orders"].get(ticker)
-                    if pending is not None:
-                        logger.warning(
-                            f"[Achilles] {ticker}: уже есть активный лимитный ордер "
-                            f"status={pending.get('status')} mode={pending.get('mode')}, пропуск"
-                        )
+                    if ticker in state["positions"]:
+                        logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
                         return False
-
-                    if is_close:
-                        current = state["positions"].get(ticker)
-                        if current is None:
-                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
-                            return False
-                        if current.get("status") == "closing":
-                            logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: уже закрывается")
-                            return False
-                        current["status"] = "closing"
-                    else:
-                        if ticker in state["positions"]:
-                            logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
-                            return False
-                        state["positions"][ticker] = {
-                            "side": side,
-                            "qty": int(qty),
-                            "board": board,
-                            "status": "opening",
-                        }
-
-            price = _get_price(connector, board, ticker)
-            if not price:
-                logger.warning(f"[Achilles] limit_price: нет цены для {ticker}, пропуск")
-                with _state_lock:
-                    if state is not None:
-                        if is_close:
-                            current = state["positions"].get(ticker)
-                            if current is not None and current.get("status") == "closing":
-                                current["status"] = "open"
-                        else:
-                            current = state["positions"].get(ticker)
-                            if current is not None and current.get("status") == "opening":
-                                state["positions"].pop(ticker, None)
-                return False
-
-            tid = connector.place_order(
-                account_id=account_id,
-                ticker=ticker,
-                side=side,
-                quantity=qty,
-                order_type="limit",
-                price=round(price, 6),
-                board=board,
-                agent_name=agent_name,
-            )
-            if not tid:
-                logger.error(
-                    f"[Achilles] ОШИБКА заявки: агент=Achilles тикер={ticker} "
-                    f"сторона={side.upper()} qty={qty} цена={price:.4f} "
-                    f"вид=limit_price — ордер не выставлен"
-                )
-                with _state_lock:
-                    if state is not None:
-                        if is_close:
-                            current = state["positions"].get(ticker)
-                            if current is not None and current.get("status") == "closing":
-                                current["status"] = "open"
-                        else:
-                            current = state["positions"].get(ticker)
-                            if current is not None and current.get("status") == "opening":
-                                state["positions"].pop(ticker, None)
-                return False
-
-            with _state_lock:
-                if state is not None:
-                    state["pending_orders"][ticker] = {
+                    state["positions"][ticker] = {
                         "side": side,
                         "qty": int(qty),
                         "board": board,
-                        "status": "closing" if is_close else "opening",
-                        "mode": order_mode,
-                        "is_close": is_close,
-                        "tid": tid,
+                        "status": "opening",
                     }
 
-            logger.info(f"[Achilles] LIMIT {side.upper()} {ticker}x{qty} @{price:.4f} tid={tid}")
+                state["pending_orders"][ticker] = {
+                    "side": side,
+                    "qty": int(qty),
+                    "board": board,
+                    "status": "closing" if is_close else "opening",
+                    "mode": order_mode,
+                    "is_close": is_close,
+                }
 
-            from config.settings import TRADING_END_TIME_MIN
-            _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
-            CANCEL_MIN = TRADING_END_TIME_MIN
+    def _on_placed(order_id: str):
+        if state is not None and order_id:
+            state["pending_orders"][ticker] = {
+                **state["pending_orders"].get(ticker, {}),
+                "tid": order_id,
+            }
 
-            def _monitor():
-                filled = 0
-                while True:
-                    try:
-                        info = connector.get_order_status(tid)
-                        if info:
-                            status = info.get("status", "")
-                            b = info.get("balance")
-                            q = info.get("quantity")
-                            if b is not None and q is not None:
-                                filled = int(q) - int(b)
-                            if status in _TERMINAL:
-                                logger.info(f"[Achilles] LIMIT tid={tid} {ticker} {status} filled={filled}/{qty}")
-                                break
-                    except Exception as e:
-                        logger.warning(f"[Achilles] monitor tid={tid} {ticker}: {e}")
+    def _on_filled_market(filled_qty: int, avg_price: float):
+        """Callback для market-ордеров — запись сделки и обновление состояния."""
+        price = avg_price or _get_price(connector, board, ticker)
+        if strategy_id:
+            _record_trade(
+                ticker=ticker, board=board, side=side, qty=qty,
+                price=price, order_role="taker",
+                strategy_id=strategy_id, connector_id=connector_id,
+                comment=f"market filled={filled_qty}",
+            )
+        with _state_lock:
+            if state is not None:
+                state["pending_orders"].pop(ticker, None)
+                state["positions"][ticker] = {
+                    "side": side,
+                    "qty": int(filled_qty) if filled_qty > 0 else int(qty),
+                    "board": board,
+                    "status": "open",
+                }
 
-                    now_min = _dt.now().hour * 60 + _dt.now().minute
-                    if now_min >= CANCEL_MIN:
-                        logger.info(f"[Achilles] LIMIT tid={tid} {ticker} снимается в 23:45 (filled={filled}/{qty})")
-                        try:
-                            connector.cancel_order(tid, account_id)
-                        except Exception:
-                            pass
-                        deadline = _time.monotonic() + 2.0
-                        while _time.monotonic() < deadline:
-                            _time.sleep(0.1)
-                            try:
-                                info2 = connector.get_order_status(tid)
-                                if info2 and info2.get("status", "") in _TERMINAL:
-                                    b2 = info2.get("balance")
-                                    q2 = info2.get("quantity")
-                                    if b2 is not None and q2 is not None:
-                                        filled = int(q2) - int(b2)
-                                    break
-                            except Exception:
-                                pass
-                        break
-                    _time.sleep(1.0)
-
-                if filled > 0 and strategy_id:
-                    _record_trade(
-                        ticker=ticker, board=board, side=side,
-                        qty=filled, price=price,
-                        order_role="maker",
-                        strategy_id=strategy_id, connector_id=connector_id,
-                        comment=f"limit_price tid={tid} filled={filled}/{qty}",
-                        order_ref=str(tid),
-                    )
-                with _state_lock:
-                    if state is not None:
-                        state["pending_orders"].pop(ticker, None)
-                        if is_close:
-                            current = state["positions"].get(ticker)
-                            if current is not None:
-                                remaining_qty = max(int(current.get("qty", qty)) - int(filled), 0)
-                                if remaining_qty > 0:
-                                    current["qty"] = remaining_qty
-                                    current["status"] = "open"
-                                else:
-                                    state["positions"].pop(ticker, None)
+    def _on_filled_chase(filled_qty: int, avg_price: float):
+        """Callback для chase-ордеров — запись сделки и обновление состояния."""
+        if filled_qty > 0 and strategy_id:
+            _record_trade(
+                ticker=ticker, board=board, side=side,
+                qty=filled_qty, price=avg_price,
+                order_role="maker",
+                strategy_id=strategy_id, connector_id=connector_id,
+                comment=f"limit_book chase avg={avg_price:.4f}",
+            )
+        with _state_lock:
+            if state is not None:
+                state["pending_orders"].pop(ticker, None)
+                if is_close:
+                    current = state["positions"].get(ticker)
+                    if current is not None:
+                        remaining_qty = max(int(current.get("qty", qty)) - int(filled_qty), 0)
+                        if remaining_qty > 0:
+                            current["qty"] = remaining_qty
+                            current["status"] = "open"
                         else:
-                            if filled > 0:
-                                current = state["positions"].get(ticker)
-                                if current is None:
-                                    state["positions"][ticker] = {
-                                        "side": side,
-                                        "qty": int(filled),
-                                        "board": board,
-                                        "status": "open",
-                                    }
-                                else:
-                                    current["side"] = side
-                                    current["qty"] = int(filled)
-                                    current["board"] = board
-                                    current["status"] = "open"
-                            else:
-                                current = state["positions"].get(ticker)
-                                if current is not None and current.get("status") == "opening":
-                                    state["positions"].pop(ticker, None)
+                            state["positions"].pop(ticker, None)
+                else:
+                    current = state["positions"].get(ticker)
+                    if current is None:
+                        state["positions"][ticker] = {
+                            "side": side,
+                            "qty": int(filled_qty),
+                            "board": board,
+                            "status": "open",
+                        }
+                    else:
+                        current["side"] = side
+                        current["qty"] = int(filled_qty)
+                        current["board"] = board
+                        current["status"] = "open"
 
-            t = threading.Thread(target=_monitor, daemon=True,
-                                 name=f"achilles-lp-{ticker}-{tid}")
-            t.start()
-            return True
+    def _on_filled_limit_price(filled_qty: int, avg_price: float):
+        """Callback для limit_price-ордеров — запись сделки и обновление состояния."""
+        if filled_qty > 0 and strategy_id:
+            _record_trade(
+                ticker=ticker, board=board, side=side,
+                qty=filled_qty, price=avg_price,
+                order_role="maker",
+                strategy_id=strategy_id, connector_id=connector_id,
+                comment=f"limit_price filled={filled_qty}",
+            )
+        with _state_lock:
+            if state is not None:
+                state["pending_orders"].pop(ticker, None)
+                if is_close:
+                    current = state["positions"].get(ticker)
+                    if current is not None:
+                        remaining_qty = max(int(current.get("qty", qty)) - int(filled_qty), 0)
+                        if remaining_qty > 0:
+                            current["qty"] = remaining_qty
+                            current["status"] = "open"
+                        else:
+                            state["positions"].pop(ticker, None)
+                else:
+                    if filled_qty > 0:
+                        current = state["positions"].get(ticker)
+                        if current is None:
+                            state["positions"][ticker] = {
+                                "side": side,
+                                "qty": int(filled_qty),
+                                "board": board,
+                                "status": "open",
+                            }
+                        else:
+                            current["side"] = side
+                            current["qty"] = int(filled_qty)
+                            current["board"] = board
+                            current["status"] = "open"
+                    else:
+                        current = state["positions"].get(ticker)
+                        if current is not None and current.get("status") == "opening":
+                            state["positions"].pop(ticker, None)
 
-    except Exception as e:
-        logger.error(f"[Achilles] _place {ticker}: {e}")
-        return False
+    def _on_failed():
+        """Callback при неудаче — откат состояния."""
+        with _state_lock:
+            if state is not None:
+                state["pending_orders"].pop(ticker, None)
+                if is_close:
+                    current = state["positions"].get(ticker)
+                    if current is not None and current.get("status") == "closing":
+                        current["status"] = "open"
+                else:
+                    current = state["positions"].get(ticker)
+                    if current is not None and current.get("status") == "opening":
+                        state["positions"].pop(ticker, None)
+
+    # Выбираем нужный callback в зависимости от режима
+    if order_mode == "market":
+        result = placer.place_with_state(
+            account_id, board, ticker, side, qty,
+            order_mode=order_mode,
+            on_placed=_on_placed,
+            on_filled=_on_filled_market,
+            on_failed=_on_failed,
+        )
+    elif order_mode == "limit_book":
+        result = placer.place_with_state(
+            account_id, board, ticker, side, qty,
+            order_mode=order_mode,
+            on_placed=_on_placed,
+            on_filled=_on_filled_chase,
+            on_failed=_on_failed,
+        )
+    else:  # limit_price
+        result = placer.place_with_state(
+            account_id, board, ticker, side, qty,
+            order_mode=order_mode,
+            on_placed=_on_placed,
+            on_filled=_on_filled_limit_price,
+            on_failed=_on_failed,
+        )
+
+    return result.success
 
 
 def _do_snapshot(connector, params: dict, strategy_id: str):

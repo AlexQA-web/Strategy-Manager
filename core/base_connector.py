@@ -115,13 +115,33 @@ class BaseConnector(ABC):
         self._reconnect_attempts = attempts
         self._reconnect_delay    = delay
 
-    def _fire(self, cb: Optional[Callable], *args):
-        """Безопасный вызов колбэка + всех подписчиков."""
+    def _fire_event(self, event_type: str, *args):
+        """Безопасный вызов колбэка + всех подписчиков по типу события."""
+        mapping = {
+            'connect': (self._on_connect, self._connect_listeners),
+            'disconnect': (self._on_disconnect, self._disconnect_listeners),
+            'error': (self._on_error, self._error_listeners),
+            'reconnect': (self._on_reconnect, self._reconnect_listeners),
+            'positions': (self._on_positions_update, self._positions_listeners),
+        }
+        cb, listeners = mapping.get(event_type, (None, []))
         if cb:
             try:
                 cb(*args)
             except Exception as e:
-                from loguru import logger
+                logger.error(f"[{self.__class__.__name__}] callback error: {e}")
+        for listener in list(listeners):
+            try:
+                listener(*args)
+            except Exception as e:
+                logger.error(f"[{self.__class__.__name__}] listener error: {e}")
+
+    def _fire(self, cb: Optional[Callable], *args):
+        """Безопасный вызов колбэка + всех подписчиков (обратная совместимость)."""
+        if cb:
+            try:
+                cb(*args)
+            except Exception as e:
                 logger.error(f"[{self.__class__.__name__}] callback error: {e}")
         # Вызываем соответствующие списки слушателей
         listeners: list[Callable] = []
@@ -140,7 +160,6 @@ class BaseConnector(ABC):
             try:
                 listener(*args)
             except Exception as e:
-                from loguru import logger
                 logger.error(f"[{self.__class__.__name__}] listener error: {e}")
 
     def on_connect(self, callback: Callable[[], None]):
@@ -253,8 +272,8 @@ class BaseConnector(ABC):
 
             if attempt >= self._reconnect_attempts:
                 logger.error(f"[{name}] Исчерпаны попытки переподключения")
-                self._fire(
-                    self._on_error,
+                self._fire_event(
+                    'error',
                     f"Не удалось переподключиться после {attempt} попыток"
                 )
                 break
@@ -264,7 +283,7 @@ class BaseConnector(ABC):
                 self.connect()
                 if self.is_connected():
                     logger.info(f"[{name}] Успешное переподключение")
-                    self._fire(self._on_reconnect)
+                    self._fire_event('reconnect')
             except Exception as e:
                 logger.error(f"[{name}] Исключение при connect(): {e}")
             if not self.is_connected():

@@ -213,24 +213,30 @@ class BacktestEngine:
         """
         Применяет проскальзывание к базовой цене исполнения.
         Slippage всегда ухудшает цену исполнения:
-        - Для buy (вход в long): цена увеличивается
-        - Для sell (вход в short): цена уменьшается
+        - Для buy (вход в long или закрытие short): цена увеличивается
+        - Для sell (вход в short или закрытие long): цена уменьшается
         - Для close long (direction=+1): цена закрытия уменьшается
         - Для close short (direction=-1): цена закрытия увеличивается
+        - Для close без direction: fallback к sell (цена уменьшается)
         """
         if slippage <= 0:
             return base_price
         if action == "buy":
+            # Покупка — всегда платим больше (вход в long или закрытие short)
             return base_price * (1.0 + slippage)
         elif action == "sell":
+            # Продажа — всегда получаем меньше (вход в short или закрытие long)
             return base_price * (1.0 - slippage)
         elif action == "close":
             if direction == +1:
-                # Закрываем long — slippage уменьшает цену выхода
+                # Закрываем long = продаём — slippage уменьшает цену выхода
                 return base_price * (1.0 - slippage)
             elif direction == -1:
-                # Закрываем short — slippage увеличивает цену выхода
+                # Закрываем short = покупаем — slippage увеличивает цену выхода
                 return base_price * (1.0 + slippage)
+            else:
+                # Fallback: close без direction = sell
+                return base_price * (1.0 - slippage)
         return base_price
 
     @staticmethod
@@ -328,11 +334,16 @@ class BacktestEngine:
 
         sorted_days = sorted(daily.keys())
         if len(sorted_days) > 1:
-            daily_returns = [
-                daily[sorted_days[i]] - daily[sorted_days[i - 1]]
-                for i in range(1, len(sorted_days))
-            ]
-            if len(daily_returns) > 1:
-                avg = statistics.mean(daily_returns)
-                std = statistics.stdev(daily_returns)
+            # Используем процентные доходности для корректного расчёта Sharpe
+            daily_returns_pct = []
+            for i in range(1, len(sorted_days)):
+                prev_val = daily[sorted_days[i - 1]]
+                curr_val = daily[sorted_days[i]]
+                if prev_val > 0:
+                    daily_returns_pct.append((curr_val - prev_val) / prev_val)
+                else:
+                    daily_returns_pct.append(0.0)
+            if len(daily_returns_pct) > 1:
+                avg = statistics.mean(daily_returns_pct)
+                std = statistics.stdev(daily_returns_pct)
                 result.sharpe_ratio = (avg / std) * (252 ** 0.5) if std > 0 else 0.0

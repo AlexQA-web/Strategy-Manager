@@ -98,10 +98,12 @@ def save(ticker: str, timeframe: str, df: pd.DataFrame, board: str = 'TQBR'):
 
 
 def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
-    """Мержит кеш с новыми барами. Перезаписывает последний бар кеша (мог не закрыться).
+    """Мержит кеш с новыми барами.
     
-    NOTE: Исправлено - теперь проверяем, является ли последний бар кэша "свежим" (недавно обновлялся).
-    Для дневных/недельных таймфреймов старый закрытый бар не отрезается.
+    Логика:
+    - Если fresh начинается ПОСЛЕ последнего бара кеша — просто конкатенируем
+    - Если fresh ПЕРЕКРЫВАЕТСЯ с кешем — берём кеш включая последний бар + fresh,
+      затем дедуплицируем с keep='last' (fresh перезаписывает кеш при конфликте)
     """
     if cached is None or cached.empty:
         return fresh
@@ -109,15 +111,14 @@ def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
         return cached
     
     cutoff = cached.index[-1]
-    # Проверяем, является ли последний бар кэша "свежим" - т.е. мог ли он измениться
-    # Если последний бар кэша младше чем первый бар fresh - он точно закрыт и не нужно его отрезать
+    
     if fresh.index[0] > cutoff:
-        # Бары не пересекаются - просто добавляем fresh к кэшу
+        # Бары не пересекаются — просто добавляем fresh к кешу
         combined = pd.concat([cached, fresh])
     else:
-        # Бары пересекаются - отрезаем только если последний бар кэша может быть незакрытым
-        cached_trimmed = cached[cached.index < cutoff]
-        combined = pd.concat([cached_trimmed, fresh])
+        # Бары пересекаются — берём весь кеш (включая последний бар) + fresh
+        # Дедупликация с keep='last' обеспечит приоритет fresh над кешем
+        combined = pd.concat([cached, fresh])
     
     combined = combined[~combined.index.duplicated(keep="last")]
     combined.sort_index(inplace=True)

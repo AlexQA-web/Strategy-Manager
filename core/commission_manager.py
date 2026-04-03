@@ -324,7 +324,11 @@ class CommissionManager:
             return moex_pct + broker_pct
     
     def _resolve_lot_size(self, ticker: str, board: str, lot_size: Optional[int]) -> int:
-        """Возвращает размер лота для акций/облигаций/ETF."""
+        """Возвращает размер лота для акций/облигаций/ETF.
+        
+        Для фьючерсов lot_size не нужен (комиссия считается через point_cost),
+        поэтому MOEX запрос по stock-типу будет бессмысленным.
+        """
         if lot_size is not None:
             try:
                 parsed = int(lot_size)
@@ -332,6 +336,11 @@ class CommissionManager:
                     return parsed
             except (TypeError, ValueError):
                 pass
+
+        # Для фьючерсов не ищем lot_size — комиссия считается через point_cost
+        if board in ("SPBFUT", "FUT"):
+            logger.debug(f'[CommissionManager] futures {ticker}.{board}: lot_size не используется, возвращаем 1')
+            return 1
 
         try:
             moex_info = MOEXClient.get_instrument_info(ticker, sec_type='stock')

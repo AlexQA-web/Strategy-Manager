@@ -43,7 +43,7 @@ class ConnectorManager:
                 logger.warning(f"[ConnectorManager] Неизвестный коннектор: {connector_id}")
                 logger.debug(f"[ConnectorManager] Доступные коннекторы: {list(self._registry.keys())}")
             else:
-                logger.debug(f"[ConnectorManager] get({connector_id}): found, is_connected={c.is_connected()}")
+                logger.debug(f"[ConnectorManager] get({connector_id}): found")
             return c
 
     def all(self) -> dict[str, BaseConnector]:

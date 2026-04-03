@@ -15,6 +15,8 @@ from loguru import logger
 
 from config.settings import APP_PROFILE_DIR, DATA_DIR
 
+from core.rwlock import RWLock
+
 
 class DATA_BLOB(ctypes.Structure):
     _fields_ = [
@@ -27,8 +29,7 @@ _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 _SECRET_STORE_VERSION = 1
 _MAX_BACKUPS = 3  # максимальное количество бэкап-файлов
 
-_write_lock = threading.Lock()   # защита от конкурентных записей
-_cache_lock = threading.Lock()   # защита кэша
+_rwlock = RWLock()           # единый readers-writer lock
 _cache: dict[str, tuple[Any, float, float]] = {}  # path → (data, monotonic_ts, mtime)
 _CACHE_TTL = 2.0          # секунды — время жизни записи в кэше
 _MAX_TRADES_HISTORY = 10_000  # максимальное количество сделок в trades_history.json
@@ -85,13 +86,13 @@ def _read(filepath: Path, use_cache: bool = True) -> Any:
     Args:
         filepath: Путь к файлу
         use_cache: Если False - игнорирует кэш и читает напрямую с диска.
-                   Используется внутри _write_lock для избежания race condition.
+                   Используется внутри write-блокировки для избежания stale reads.
     """
     key = str(filepath)
     current_mtime = filepath.stat().st_mtime if filepath.exists() else 0
 
     if use_cache:
-        with _cache_lock:
+        with _rwlock.read_lock():
             entry = _cache.get(key)
             if entry:
                 data, cached_at, cached_mtime = entry
@@ -103,8 +104,10 @@ def _read(filepath: Path, use_cache: bool = True) -> Any:
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        with _cache_lock:
-            _cache[key] = (data, time.monotonic(), current_mtime)
+        # Обновление кэша без write_lock — GIL гарантирует атомарность dict assignment.
+        # Это допустимо, т.к. stale read из кэша просто вернёт старые данные,
+        # которые будут инвалидированы при следующей записи.
+        _cache[key] = (data, time.monotonic(), current_mtime)
         return data
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f'Ошибка чтения {filepath.name}: {e}')
@@ -113,8 +116,7 @@ def _read(filepath: Path, use_cache: bool = True) -> Any:
             backup_data = _read_backup(filepath, i)
             if backup_data is not None:
                 logger.warning(f'Восстановлено из бэкапа: {filepath.with_suffix("").name}.bak{i}{filepath.suffix}')
-                with _cache_lock:
-                    _cache[key] = (backup_data, time.monotonic(), current_mtime)
+                _cache[key] = (backup_data, time.monotonic(), current_mtime)
                 return backup_data
         return {}
 
@@ -135,7 +137,10 @@ def _cleanup_old_backups(filepath: Path):
 
 
 def _rotate_backups(filepath: Path):
-    """Ротация бэкапов: .bak → .bak2, текущий → .bak, новый записывается."""
+    """Ротация бэкапов: .bak → .bak2, текущий → .bak, новый записывается.
+    
+    Атомарное копирование: сначала во временный файл, потом rename.
+    """
     suffix = filepath.suffix
     base = filepath.with_suffix('')
     
@@ -149,13 +154,20 @@ def _rotate_backups(filepath: Path):
             except OSError as e:
                 logger.debug(f'Не удалось переименовать {src.name} → {dst.name}: {e}')
     
-    # Текущий файл → .bak
+    # Текущий файл → .bak (атомарно через .tmp → rename)
     if filepath.exists() and filepath.stat().st_size > 0:
         bak = Path(f'{base}.bak{suffix}')
+        bak_tmp = Path(f'{base}.bak{suffix}.tmp')
         try:
-            shutil.copy(filepath, bak)
+            # Копируем во временный файл, потом атомарно переименовываем
+            shutil.copy2(filepath, bak_tmp)
+            bak_tmp.replace(bak)
         except OSError as e:
             logger.warning(f'Не удалось создать бэкап {filepath.name}: {e}')
+            try:
+                bak_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     
     # Очищаем старые бэкапы
     _cleanup_old_backups(filepath)
@@ -189,8 +201,8 @@ def _read_backup(filepath: Path, n: int = 1) -> Optional[Any]:
         return None
 
 
-def _write_unsafe(filepath: Path, data: Any):
-    """Запись без захвата lock — вызывать только внутри with _write_lock.
+def _write_unsafe_inner(filepath: Path, data: Any):
+    """Запись без захвата lock — вызывать только внутри write-блокировки.
 
     Выполняет атомарную запись через .tmp с ротацией бэкапов.
     """
@@ -206,17 +218,25 @@ def _write_unsafe(filepath: Path, data: Any):
     except OSError as e:
         logger.error(f'Ошибка записи {filepath.name}: {e}')
         raise
-    with _cache_lock:
-        _cache.pop(str(filepath), None)
+    # Invalidation кэша происходит внутри write-блокировки вызывающего
+    _cache.pop(str(filepath), None)
+
+
+def _write_unsafe(filepath: Path, data: Any):
+    """Запись с захватом write-lock.
+
+    Атомарная запись через .tmp с ротацией бэкапов и инвалидацией кэша.
+    """
+    with _rwlock.write_lock():
+        _write_unsafe_inner(filepath, data)
 
 
 def _write(filepath: Path, data: Any):
     """Атомарная запись через .tmp с бэкапом предыдущей версии.
 
-    Захватывает _write_lock перед записью.
+    Захватывает _rwlock.write_lock() перед записью.
     """
-    with _write_lock:
-        _write_unsafe(filepath, data)
+    _write_unsafe(filepath, data)
 
 
 # ── Безопасное хранение секретов ───────────────────────────────────────────────
@@ -331,6 +351,7 @@ def _read_secret_settings(use_cache: bool = True) -> dict[str, Any]:
 
 
 def _write_secret_settings_unsafe(data: dict[str, Any]):
+    """Вызывать только внутри write-блокировки."""
     payload: dict[str, Any] = {
         'version': _SECRET_STORE_VERSION,
         'values': {},
@@ -339,7 +360,7 @@ def _write_secret_settings_unsafe(data: dict[str, Any]):
         if key not in SENSITIVE_SETTING_KEYS or _is_empty_secret_value(value):
             continue
         payload['values'][key] = _encrypt_secret_value(value)
-    _write_unsafe(SECRETS_FILE, payload)
+    _write_unsafe_inner(SECRETS_FILE, payload)
 
 
 # ── Публичный низкоуровневый API для других модулей core/ ──────────────────────
@@ -359,7 +380,7 @@ def write_json(filepath: Path, data: Any):
 
 
 def _migrate_sensitive_settings_if_needed():
-    with _write_lock:
+    with _rwlock.write_lock():
         settings = _read(SETTINGS_FILE, use_cache=False)
         if not isinstance(settings, dict) or not settings:
             return
@@ -374,7 +395,7 @@ def _migrate_sensitive_settings_if_needed():
 
         secrets = _read_secret_settings(use_cache=False)
         secrets.update(migrated)
-        _write_unsafe(SETTINGS_FILE, settings)
+        _write_unsafe_inner(SETTINGS_FILE, settings)
         _write_secret_settings_unsafe(secrets)
         logger.warning(f'Чувствительные настройки перенесены из {SETTINGS_FILE.name} в {SECRETS_FILE.name}')
 
@@ -399,8 +420,8 @@ def get_settings() -> dict:
 def save_settings(data: dict):
     _migrate_sensitive_settings_if_needed()
     public_settings, secret_updates = _split_settings(data)
-    with _write_lock:
-        _write_unsafe(SETTINGS_FILE, public_settings)
+    with _rwlock.write_lock():
+        _write_unsafe_inner(SETTINGS_FILE, public_settings)
         current_secrets = _read_secret_settings(use_cache=False)
         for key, value in secret_updates.items():
             if _is_empty_secret_value(value):
@@ -414,10 +435,22 @@ def get_setting(key: str, default=None) -> Any:
     return get_settings().get(key, default)
 
 
+def get_bool_setting(key: str, default: bool = False) -> bool:
+    """Безопасное получение boolean-настройки из строкового значения."""
+    val = get_setting(key)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.lower() in ("true", "1", "yes", "on")
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return default
+
+
 def save_setting(key: str, value: Any):
     """Сохранить одну настройку. Потокобезопасно (read-modify-write внутри lock)."""
     _migrate_sensitive_settings_if_needed()
-    with _write_lock:
+    with _rwlock.write_lock():
         if key in SENSITIVE_SETTING_KEYS:
             secrets = _read_secret_settings(use_cache=False)
             if _is_empty_secret_value(value):
@@ -431,7 +464,7 @@ def save_setting(key: str, value: Any):
         if not isinstance(settings, dict):
             settings = {}
         settings[key] = value
-        _write_unsafe(SETTINGS_FILE, settings)
+        _write_unsafe_inner(SETTINGS_FILE, settings)
 
 
 def get_bool_setting(key: str, default: bool = False) -> bool:
@@ -459,21 +492,21 @@ def get_strategy(strategy_id: str) -> Optional[dict]:
 
 
 def save_strategy(strategy_id: str, data: dict):
-    with _write_lock:
+    with _rwlock.write_lock():
         strategies = _read(STRATEGIES_FILE, use_cache=False)
         if not isinstance(strategies, dict):
             strategies = {}
         strategies[strategy_id] = data
-        _write_unsafe(STRATEGIES_FILE, strategies)
+        _write_unsafe_inner(STRATEGIES_FILE, strategies)
 
 
 def delete_strategy(strategy_id: str) -> bool:
-    with _write_lock:
+    with _rwlock.write_lock():
         strategies = _read(STRATEGIES_FILE, use_cache=False)
         if not isinstance(strategies, dict) or strategy_id not in strategies:
             return False
         del strategies[strategy_id]
-        _write_unsafe(STRATEGIES_FILE, strategies)
+        _write_unsafe_inner(STRATEGIES_FILE, strategies)
         logger.info(f'Стратегия {strategy_id} удалена')
         return True
 
@@ -511,16 +544,16 @@ def get_all_schedules() -> dict:
 def append_trade(trade: dict):
     """Атомарное добавление сделки через read-modify-write внутри lock.
 
-    Использует _write_unsafe для избежания deadlock (lock уже захвачен).
+    Использует _write_unsafe_inner для избежания deadlock (lock уже захвачен).
     """
-    with _write_lock:
+    with _rwlock.write_lock():
         trades = _read(TRADES_FILE, use_cache=False)
         if not isinstance(trades, list):
             trades = []
         trades.append(trade)
         if len(trades) > _MAX_TRADES_HISTORY:
             trades = trades[-_MAX_TRADES_HISTORY:]
-        _write_unsafe(TRADES_FILE, trades)
+        _write_unsafe_inner(TRADES_FILE, trades)
 
 
 def get_trades(strategy_id: str = None, limit: int = 200) -> list:

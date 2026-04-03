@@ -63,7 +63,8 @@ class FinamConnector(BaseConnector):
         self._order_status_lock = threading.Lock()
         self._order_watchers: dict[str, list[Callable]] = {}  # transactionid → callbacks
         self._order_status_timestamps: dict[str, float] = {}  # tid → time.time()
-        self._ORDER_STATUS_TTL = 86400  # 24 часа
+        self._ORDER_STATUS_TTL = 3600  # 1 час — TTL для завершённых ордеров
+        self._ORDER_STATUS_MAX_AGE = 7200  # 2 часа — абсолютный TTL для всех ордеров
         self._last_order_cleanup = time.time()
         # Информация по инструментам (sec_info / sec_info_upd)
         self._sec_info: dict[str, dict] = {}  # seccode → {buy_deposit, sell_deposit, point_cost, ...}
@@ -171,19 +172,19 @@ class FinamConnector(BaseConnector):
                     if not self._connected:
                         self._connected = True
                         logger.info("[Finam] ✅ Подключён к серверу")
-                        self._fire(self._on_connect)
+                        self._fire_event('connect')
                         # Запрашиваем лимиты клиентов после подключения
                         threading.Thread(target=self._request_client_limits, daemon=True).start()
                 elif connected == "false":
                     if self._connected:
                         self._connected = False
                         logger.info("[Finam] Соединение с сервером потеряно")
-                        self._fire(self._on_disconnect)
+                        self._fire_event('disconnect')
                 elif connected == "error":
                     err_text = root.text or "Ошибка соединения"
                     logger.error(f"[Finam] Ошибка сервера: {err_text}")
                     self._connected = False
-                    self._fire(self._on_error, err_text)
+                    self._fire_event('error', err_text)
 
             elif tag == "securities":
                 self._parse_securities(root)
@@ -201,7 +202,7 @@ class FinamConnector(BaseConnector):
                 err_text = (root.text or "Ошибка").strip()
                 if self._should_emit_error(err_text):
                     logger.error(f"[Finam] DLL error: {err_text}")
-                    self._fire(self._on_error, err_text)
+                    self._fire_event('error', err_text)
                 else:
                     logger.debug(f"[Finam] DLL error suppressed: {err_text}")
 
@@ -386,7 +387,7 @@ class FinamConnector(BaseConnector):
                 "pnl": float(pos.findtext("varmargin", "0") or "0"),
             })
         self._positions = result
-        self._fire(self._on_positions_update)
+        self._fire_event('positions')
 
         # forts_money — свободные средства FORTS
         for fm in root.findall(".//forts_money"):
@@ -1008,16 +1009,24 @@ class FinamConnector(BaseConnector):
             self._cleanup_old_order_status(now)
 
     def _cleanup_old_order_status(self, now: float):
-        """Удаляет записи о ордерах старше ORDER_STATUS_TTL."""
+        """Удаляет записи о ордерах старше ORDER_STATUS_TTL.
+        
+        Fallback: удаляет записи старше ORDER_STATUS_MAX_AGE независимо от статуса
+        чтобы предотвратить утечку памяти при зависших ордерах.
+        """
         _TERMINAL = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
         cutoff = now - self._ORDER_STATUS_TTL
+        max_age_cutoff = now - self._ORDER_STATUS_MAX_AGE
         
         with self._order_status_lock:
             tids_to_remove = []
             for tid, ts in self._order_status_timestamps.items():
-                if ts < cutoff:
+                if ts < max_age_cutoff:
+                    # Абсолютный TTL — удаляем независимо от статуса
+                    tids_to_remove.append(tid)
+                elif ts < cutoff:
                     status = self._order_status.get(tid, {}).get("status", "")
-                    if status in _TERMINAL:  # удаляем только завершённые
+                    if status in _TERMINAL:
                         tids_to_remove.append(tid)
             
             removed = 0
@@ -1081,7 +1090,7 @@ class FinamConnector(BaseConnector):
 
         if not login or not password:
             logger.warning("[Finam] Логин/пароль не настроены")
-            self._fire(self._on_error, "Логин или пароль не указаны в настройках")
+            self._fire_event('error', "Логин или пароль не указаны в настройках")
             return False
 
         logger.info(f"[Finam] Подключение → {host}:{port}")
@@ -1160,7 +1169,7 @@ class FinamConnector(BaseConnector):
                     )
                     return False
                 logger.error(f"[Finam] Ошибка подключения: {err}")
-                self._fire(self._on_error, err)
+                self._fire_event('error', err)
                 return False
 
             # Команда принята — reconnect_loop дождётся server_status
@@ -1171,7 +1180,7 @@ class FinamConnector(BaseConnector):
 
         except Exception as e:
             logger.error(f"[Finam] Exception: {e}")
-            self._fire(self._on_error, str(e))
+            self._fire_event('error', str(e))
             return False
 
     def disconnect(self):
@@ -1185,7 +1194,7 @@ class FinamConnector(BaseConnector):
         finally:
             self._connected = False
             logger.info("[Finam] Отключён")
-            self._fire(self._on_disconnect)
+            self._fire_event('disconnect')
 
     def is_connected(self) -> bool:
         return self._connected
@@ -1229,6 +1238,20 @@ class FinamConnector(BaseConnector):
         board: str = "TQBR",
         agent_name: str = "",
     ) -> Optional[str]:
+        # Валидация входных параметров
+        if not ticker or not ticker.strip():
+            logger.error("[Finam] place_order — пустой ticker")
+            return None
+        if side not in ("buy", "sell"):
+            logger.error(f"[Finam] place_order — неверный side: {side} (должен быть 'buy' или 'sell')")
+            return None
+        if quantity <= 0:
+            logger.error(f"[Finam] place_order — quantity должно быть > 0, получено: {quantity}")
+            return None
+        if price < 0:
+            logger.error(f"[Finam] place_order — price не может быть отрицательным: {price}")
+            return None
+
         if not self._connected:
             logger.warning("[Finam] place_order — нет подключения")
             return None
@@ -1252,7 +1275,7 @@ class FinamConnector(BaseConnector):
             err = self._parse_error(response)
             if err:
                 logger.error(f"[Finam] Ордер отклонён: {err}")
-                self._fire(self._on_error, err)
+                self._fire_event('error', err)
                 return None
 
             # Парсим transactionid из ответа
@@ -1266,7 +1289,7 @@ class FinamConnector(BaseConnector):
             return tid or None
         except Exception as e:
             logger.error(f"[Finam] place_order error: {e}")
-            self._fire(self._on_error, str(e))
+            self._fire_event('error', str(e))
             return None
 
     def cancel_order(self, order_id: str, account_id: str) -> bool:
@@ -1675,4 +1698,21 @@ class FinamConnector(BaseConnector):
             self._initialized = False
 
 
-finam_connector = FinamConnector()
+# Ленивая инициализация — не создаём при импорте модуля
+_finam_connector_instance: Optional["FinamConnector"] = None
+
+def get_finam_connector() -> "FinamConnector":
+    """Возвращает синглтон FinamConnector с ленивой инициализацией."""
+    global _finam_connector_instance
+    if _finam_connector_instance is None:
+        _finam_connector_instance = FinamConnector()
+    return _finam_connector_instance
+
+# Для обратной совместимости — свойство-прокси
+class _ConnectorProxy:
+    def __getattribute__(self, name):
+        return getattr(get_finam_connector(), name)
+    def __setattr__(self, name, value):
+        setattr(get_finam_connector(), name, value)
+
+finam_connector = _ConnectorProxy()

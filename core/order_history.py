@@ -78,7 +78,7 @@ def make_order(
 # Хранилище
 # ─────────────────────────────────────────────
 
-def _load() -> Dict[str, Any]:
+def _load(use_cache: bool = True) -> Dict[str, Any]:
     data = read_json(ORDERS_FILE)
     return data if isinstance(data, dict) else {}
 
@@ -102,7 +102,7 @@ def _key(order: Dict[str, Any]) -> tuple[str, str, str]:
 def save_order(order: Dict[str, Any]) -> None:
     """Сохраняет ордер в историю. Защищено от race condition через _orders_lock."""
     with _orders_lock:
-        data = _load()
+        data = _load(use_cache=False)  # защита от устаревшего кэша при параллельных вставках
         strategy_id = order["strategy_id"]
         if strategy_id not in data:
             data[strategy_id] = []

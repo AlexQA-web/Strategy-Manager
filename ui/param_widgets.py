@@ -475,46 +475,46 @@ class TickerParamWidget(BaseParamWidget):
 
 
 class InstrumentsParamWidget(BaseParamWidget):
-    """Виджет для параметра instruments - обёртка над _InstrumentsWidget"""
-    
+    """Виджет для параметра instruments - обёртка над InstrumentsWidget"""
+
     def __init__(self, key: str, meta: dict, current_value: Any, connector_id: str = None, parent=None):
         super().__init__(key, meta, current_value, connector_id, parent)
-        
-        from ui.strategy_window import _InstrumentsWidget
-        
+
+        from ui.instruments_widget import InstrumentsWidget
+
         # Получаем текущий список инструментов
         instruments = current_value if isinstance(current_value, list) else []
         if not instruments:
             instruments = meta.get("default", [])
-        
-        # Создаём _InstrumentsWidget
-        self.instruments_widget = _InstrumentsWidget(
+
+        # Создаём InstrumentsWidget
+        self.instruments_widget = InstrumentsWidget(
             connector_id=connector_id or "finam",
             instruments=instruments,
             parent=self
         )
-        
+
         # Применяем tooltip
         if self.toolTip():
             self.instruments_widget.setToolTip(self.toolTip())
-    
+
     def get_value(self) -> list:
         """Возвращает список инструментов"""
         return self.instruments_widget.get_value()
-    
+
     def set_value(self, value: Any):
         """Устанавливает список инструментов"""
         if isinstance(value, list):
             # Пересоздаём виджет с новым списком
-            from ui.strategy_window import _InstrumentsWidget
-            
+            from ui.instruments_widget import InstrumentsWidget
+
             old_widget = self.instruments_widget
-            self.instruments_widget = _InstrumentsWidget(
+            self.instruments_widget = InstrumentsWidget(
                 connector_id=self.connector_id or "finam",
                 instruments=value,
                 parent=self
             )
-            
+
             # Заменяем виджет в layout родителя
             # NOTE: self.layout() может вернуть None, поэтому используем parent.layout()
             parent_layout = self.parent().layout() if self.parent() else None
