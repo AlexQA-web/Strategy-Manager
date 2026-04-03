@@ -162,6 +162,9 @@ class BaseConnector(ABC):
     def subscribe_connect(self, callback: Callable[[], None]):
         if callback not in self._connect_listeners:
             self._connect_listeners.append(callback)
+            # Устанавливаем dummy callback чтобы _fire мог определить тип события
+            if self._on_connect is None:
+                self._on_connect = lambda: None
 
     def unsubscribe_connect(self, callback: Callable[[], None]):
         self._connect_listeners = [cb for cb in self._connect_listeners if cb is not callback]
@@ -169,6 +172,9 @@ class BaseConnector(ABC):
     def subscribe_disconnect(self, callback: Callable[[], None]):
         if callback not in self._disconnect_listeners:
             self._disconnect_listeners.append(callback)
+            # Устанавливаем dummy callback чтобы _fire мог определить тип события
+            if self._on_disconnect is None:
+                self._on_disconnect = lambda: None
 
     def unsubscribe_disconnect(self, callback: Callable[[], None]):
         self._disconnect_listeners = [cb for cb in self._disconnect_listeners if cb is not callback]
@@ -183,6 +189,9 @@ class BaseConnector(ABC):
     def subscribe_error(self, callback: Callable[[str], None]):
         if callback not in self._error_listeners:
             self._error_listeners.append(callback)
+            # Устанавливаем dummy callback чтобы _fire мог определить тип события
+            if self._on_error is None:
+                self._on_error = lambda msg: None
 
     def unsubscribe_error(self, callback: Callable[[str], None]):
         self._error_listeners = [cb for cb in self._error_listeners if cb is not callback]
@@ -190,6 +199,9 @@ class BaseConnector(ABC):
     def subscribe_positions(self, callback: Callable[[], None]):
         if callback not in self._positions_listeners:
             self._positions_listeners.append(callback)
+            # Устанавливаем dummy callback чтобы _fire мог определить тип события
+            if self._on_positions_update is None:
+                self._on_positions_update = lambda: None
 
     def unsubscribe_positions(self, callback: Callable[[], None]):
         self._positions_listeners = [cb for cb in self._positions_listeners if cb is not callback]

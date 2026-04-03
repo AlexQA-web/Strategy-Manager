@@ -1,6 +1,8 @@
+import json
 import threading
 import time
 import re
+from pathlib import Path
 from typing import Callable, Optional
 from loguru import logger
 
@@ -29,6 +31,72 @@ class QuikConnector(BaseConnector):
         self._order_watchers: dict[str, list[Callable]] = {}
         self._watch_threads: dict[str, threading.Thread] = {}
         self._terminal_statuses = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
+        # Кэш ордеров по trans_id для ускорения get_order_status
+        self._orders_cache: dict[str, dict] = {}
+        self._cache_lock = threading.Lock()
+        self._cache_last_sync = 0.0
+        self._cache_sync_interval = 30.0  # полная синхронизация раз в 30 секунд
+
+        # ── Кэш инструментов (аналог OsEngine SecuritiesCachePath) ────────
+        self._securities_cache_path = Path(__file__).resolve().parent.parent / "data" / "quik_securities_cache.json"
+
+    def _save_securities_cache(self, board: str, securities: list[dict]):
+        """Сохраняет кэш инструментов в JSON-файл."""
+        try:
+            cache_dir = self._securities_cache_path.parent
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache = {}
+            if self._securities_cache_path.exists():
+                with open(self._securities_cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            cache[board] = securities
+            with open(self._securities_cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+            logger.debug(f"[QUIK] Кэш инструментов сохранён: {board} ({len(securities)})")
+        except Exception as e:
+            logger.warning(f"[QUIK] _save_securities_cache error: {e}")
+
+    def _load_securities_cache(self, board: str) -> list[dict]:
+        """Загружает кэш инструментов из JSON-файла."""
+        if not self._securities_cache_path.exists():
+            return []
+        try:
+            with open(self._securities_cache_path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            data = cache.get(board, [])
+            if isinstance(data, list) and len(data) > 0:
+                logger.info(f"[QUIK] Загружено {len(data)} инструментов из кэша ({board})")
+            return data
+        except Exception as e:
+            logger.warning(f"[QUIK] _load_securities_cache error: {e}")
+            return []
+
+    def _force_check_orders(self):
+        """Force check всех активных ордеров при реконнекте."""
+        def _check():
+            with self._watch_lock:
+                active_tids = list(self._order_watchers.keys())
+            if not active_tids:
+                return
+            logger.info(f"[QUIK] Force check {len(active_tids)} active orders after reconnect")
+            # Синхронизируем кэш ордеров
+            self._sync_orders_cache()
+            for tid in active_tids:
+                try:
+                    info = self.get_order_status(tid)
+                    if info and info.get("status") in self._terminal_statuses:
+                        # Ордер завершился — уведомляем watchers
+                        with self._watch_lock:
+                            callbacks = list(self._order_watchers.get(tid, []))
+                        for cb in callbacks:
+                            try:
+                                cb(tid, info)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    logger.warning(f"[QUIK] Force check order {tid} error: {e}")
+
+        threading.Thread(target=_check, daemon=True, name="quik-force-check-orders").start()
 
     # ── Подключение ─────────────────────────────────────────────────────
 
@@ -76,9 +144,17 @@ class QuikConnector(BaseConnector):
                     self._connected = False
                     self._fire(self._on_disconnect)
                     return False
+                was_connected = self._connected  # запоминаем для reconnet detection
                 self._connected = True
                 self._stop_reconnect.clear()
                 self.start_reconnect_loop()
+                # Инициализируем кэш ордеров при подключении
+                self._sync_orders_cache()
+
+                # Force check orders при реконнекте (аналог OsEngine ForceCheckOrdersAfterReconnectEvent)
+                if was_connected:
+                    self._force_check_orders()
+
                 logger.info("[QUIK] ✅ Подключён к серверу брокера")
                 self._fire(self._on_connect)
                 return True
@@ -144,22 +220,35 @@ class QuikConnector(BaseConnector):
             return False
 
     def _is_broker_online(self) -> bool:
-        """Проверка доступности брокерского сервера через SERVERTIME.
+        """Проверка доступности брокерского сервера через TRADEDATE.
 
         Если сервер недоступен, QUIK возвращает пустой/нулевой параметр.
         Метод intentionally лёгкий и вызывается в connect/ping/is_connected.
         """
         if not self._client:
             return False
-        try:
-            with self._lock:
-                result = self._client.get_info_param("SERVERTIME")
-            data = result.get("data", {}) if isinstance(result, dict) else {}
-            value = data.get("param_value")
-            return bool(value)
-        except Exception as e:
-            logger.debug(f"[QUIK] broker_online check error: {e}")
-            return False
+
+        for _ in range(3):  # 3 попытки, макс. 1.5 сек блокировки
+            try:
+                with self._lock:
+                    result = self._client.get_info_param("SERVERTIME")
+
+                data = result.get("data")
+
+                if isinstance(data, dict):
+                    value = data.get("param_value")
+                else:
+                    value = data
+
+                if value:
+                    return True
+
+            except Exception as e:
+                logger.debug(f"[QUIK] broker_online check error: {e}")
+
+            time.sleep(0.5)
+
+        return False
 
     # ── Ордера ──────────────────────────────────────────────────────────
 
@@ -242,6 +331,47 @@ class QuikConnector(BaseConnector):
                 logger.debug(f"[QUIK] {method_name} error: {e}")
         return []
 
+    def _sync_orders_cache(self) -> None:
+        """Полная синхронизация кэша ордеров."""
+        orders = self._fetch_orders()
+        new_cache: dict[str, dict] = {}
+        for row in orders:
+            tid = str(
+                row.get("trans_id")
+                or row.get("transid")
+                or row.get("transaction_id")
+                or row.get("TRANS_ID")
+                or ""
+            )
+            if not tid:
+                continue
+            quantity = self._to_int(
+                row.get("qty")
+                or row.get("quantity")
+                or row.get("QUANTITY")
+                or row.get("order_qty"),
+                0,
+            )
+            balance = self._to_int(
+                row.get("balance")
+                or row.get("BALANCE")
+                or row.get("qty_left")
+                or quantity,
+                quantity,
+            )
+            status = self._map_order_status(
+                str(row.get("status") or row.get("state") or row.get("STATUS") or "")
+            )
+            new_cache[tid] = {
+                "status": status,
+                "quantity": quantity,
+                "balance": max(0, balance),
+            }
+        with self._cache_lock:
+            self._orders_cache = new_cache
+            self._cache_last_sync = time.monotonic()
+        logger.debug(f"[QUIK] Кэш ордеров синхронизирован: {len(new_cache)} ордеров")
+
     def _map_order_status(self, raw: str) -> str:
         status = (raw or "").strip().lower()
         if status in ("matched", "filled", "executed"):
@@ -259,6 +389,26 @@ class QuikConnector(BaseConnector):
             return None
 
         tid = str(transaction_id)
+
+        # Сначала ищем в кэше
+        with self._cache_lock:
+            cached = self._orders_cache.get(tid)
+            if cached is not None:
+                # Проверяем, нужна ли полная синхронизация
+                now = time.monotonic()
+                if now - self._cache_last_sync < self._cache_sync_interval:
+                    return cached  # кэш актуален
+
+        # Кэш устарел или ордер не найден — обновляем кэш
+        self._sync_orders_cache()
+
+        # Повторный поиск в обновлённом кэше
+        with self._cache_lock:
+            cached = self._orders_cache.get(tid)
+            if cached is not None:
+                return cached
+
+        # Если всё ещё не найден — пробуем прямой запрос
         orders = self._fetch_orders()
         order = next(
             (
@@ -304,11 +454,15 @@ class QuikConnector(BaseConnector):
             elif flags & 0b1:
                 status = "working"
 
-        return {
+        result = {
             "status": status,
             "quantity": quantity,
             "balance": max(0, balance),
         }
+        # Обновляем кэш
+        with self._cache_lock:
+            self._orders_cache[tid] = result
+        return result
 
     def watch_order(self, transaction_id: str, callback: Callable):
         tid = str(transaction_id)
@@ -434,11 +588,10 @@ class QuikConnector(BaseConnector):
 
     def get_positions(self, account_id: str) -> list[dict]:
         """Позиции по счёту. account_id может быть client_code (10U9QR) или trdaccid.
-        Резолвим оба варианта через _resolve_trade_acc чтобы не терять позиции.
 
-        ВАЖНО: используем реальные таблицы позиций, не depo limits.
-        - Акции: get_portfolio_info_ex + get_client_portfolio_info
-        - Фьючерсы: get_futures_client_holding
+        Используем методы QuikPy:
+        - Фьючерсы: get_futures_holdings() (без аргументов)
+        - Акции: get_portfolio_info_ex(firm_id, client_code, limit_kind)
         """
         if not self._connected or not self._client:
             return []
@@ -446,10 +599,10 @@ class QuikConnector(BaseConnector):
             trade_ids = self._resolve_trade_acc(account_id)
             positions: list[dict] = []
 
-            # Фьючерсы: get_futures_client_holding
+            # Фьючерсы: get_futures_holdings (без аргументов)
             try:
                 with self._lock:
-                    fut = self._client.get_futures_client_holding()
+                    fut = self._client.get_futures_holdings()
                 fut_rows = fut.get("data", []) if fut else []
                 if isinstance(fut_rows, list):
                     for row in fut_rows:
@@ -468,48 +621,39 @@ class QuikConnector(BaseConnector):
                             "pnl":           0.0,
                         })
             except Exception as e:
-                logger.debug(f"[QUIK] futures holding error: {e}")
+                logger.debug(f"[QUIK] futures holdings error: {e}")
 
-            # Акции: get_portfolio_info_ex и get_client_portfolio_info (остатки T0/T+)
+            # Акции: get_portfolio_info_ex(firm_id, client_code, limit_kind)
             try:
-                with self._lock:
-                    p_ex = self._client.get_portfolio_info_ex(account_id)
-                p_items = p_ex.get("data", []) if p_ex else []
-                if isinstance(p_items, list):
-                    for row in p_items:
-                        qty = float(row.get("currentbal", 0))
-                        if qty == 0:
-                            continue
-                        positions.append({
-                            "ticker":        row.get("sec_code", ""),
-                            "board":         row.get("class_code", "TQBR"),
-                            "quantity":      qty,
-                            "avg_price":     float(row.get("awg_position_price", 0)),
-                            "current_price": 0.0,
-                            "pnl":           0.0,
-                        })
+                # Получаем firm_id из accounts
+                quik_accounts = getattr(self._client, "accounts", [])
+                firm_id = ""
+                for acc in quik_accounts:
+                    cc = acc.get("client_code", "")
+                    trd = acc.get("trade_account_id", "")
+                    if cc == account_id or trd == account_id:
+                        firm_id = acc.get("firm_id", "")
+                        break
+
+                if firm_id:
+                    with self._lock:
+                        p_ex = self._client.get_portfolio_info_ex(firm_id, account_id, 0)
+                    p_items = p_ex.get("data", []) if p_ex else []
+                    if isinstance(p_items, list):
+                        for row in p_items:
+                            qty = float(row.get("currentbal", 0))
+                            if qty == 0:
+                                continue
+                            positions.append({
+                                "ticker":        row.get("sec_code", ""),
+                                "board":         row.get("class_code", "TQBR"),
+                                "quantity":      qty,
+                                "avg_price":     float(row.get("awg_position_price", 0)),
+                                "current_price": 0.0,
+                                "pnl":           0.0,
+                            })
             except Exception as e:
                 logger.debug(f"[QUIK] portfolio_info_ex error: {e}")
-
-            try:
-                with self._lock:
-                    p_cli = self._client.get_client_portfolio_info(account_id)
-                p_items2 = p_cli.get("data", []) if p_cli else []
-                if isinstance(p_items2, list):
-                    for row in p_items2:
-                        qty = float(row.get("currentbalance", 0))
-                        if qty == 0:
-                            continue
-                        positions.append({
-                            "ticker":        row.get("sec_code", ""),
-                            "board":         row.get("class_code", "TQBR"),
-                            "quantity":      qty,
-                            "avg_price":     float(row.get("avgprice", 0)),
-                            "current_price": 0.0,
-                            "pnl":           0.0,
-                        })
-            except Exception as e:
-                logger.debug(f"[QUIK] client_portfolio_info error: {e}")
 
             return positions
         except Exception as e:
@@ -615,6 +759,11 @@ class QuikConnector(BaseConnector):
             return []
 
     def get_securities(self, board: str = "TQBR") -> list[dict]:
+        # Пробуем загрузить из кэша (аналог OsEngine SecuritiesCachePath)
+        cached = self._load_securities_cache(board)
+        if cached:
+            return cached
+
         if not self._connected or not self._client:
             return []
         try:
@@ -629,6 +778,9 @@ class QuikConnector(BaseConnector):
                     "name":   "",   # имя грузится отдельно — дорого для всего списка
                     "board":  board,
                 })
+            # Сохраняем в кэш
+            if securities:
+                self._save_securities_cache(board, securities)
             return securities
         except Exception as e:
             logger.error(f"[QUIK] get_securities error: {e}")

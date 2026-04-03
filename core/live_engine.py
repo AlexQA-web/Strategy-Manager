@@ -79,6 +79,8 @@ class LiveEngine:
                 self._connector_id = "quik"
             elif isinstance(connector, FinamConnector):
                 self._connector_id = "finam"
+            elif isinstance(connector, PaperConnector):
+                self._connector_id = "paper"
             else:
                 self._connector_id = "finam"  # значение по умолчанию
         else:
@@ -355,83 +357,89 @@ class LiveEngine:
         return self._calculate_commission_manual(ticker, abs_qty, price, sec_type)
 
     def _load_point_cost(self) -> bool:
-        """Загружает стоимость пункта из коннектора.
+        """Загружает стоимость пункта из коннектора с повторными попытками.
 
         Приоритет источников:
           1. MOEX API через коннектор (если get_moex_info доступен)
           2. point_cost из get_sec_info коннектора
 
-        Требование: point_cost и lot_size должны быть >0, иначе старт запрещён.
+        Для фьючерсов делает до 3 попыток с задержкой 2 секунды.
         
         Returns:
             True при успехе, False если данные недоступны.
         """
-        try:
-            if hasattr(self._connector, 'get_sec_info'):
-               sec_info = self._connector.get_sec_info(self._ticker, self._board)
-               if sec_info:
-                    minstep = sec_info.get('minstep')
-                    pc_from_connector = float(sec_info.get('point_cost') or 0.0)
-                    lot_size = sec_info.get('lotsize') or sec_info.get('lot_size') or 0
-                    try:
-                        self._lot_size = max(int(lot_size), 1)
-                    except (TypeError, ValueError):
-                        self._lot_size = 0
+        max_retries = 3 if self._is_futures(self._ticker) else 1
+        retry_delay = 2  # секунды
 
-                    # Приоритет 1: MOEX API
-                    if hasattr(self._connector, 'get_moex_info'):
-                        moex_sec_type = 'futures' if self._is_futures(self._ticker) else 'stock'
-                        moex_info = self._connector.get_moex_info(self._ticker, sec_type=moex_sec_type)
-                        if moex_info:
-                            if moex_info.get('point_cost'):
-                                self._point_cost = float(moex_info['point_cost'])
-                            if moex_info.get('lot_size'):
-                                self._lot_size = max(int(moex_info['lot_size']), 1)
+        for attempt in range(max_retries):
+            if attempt > 0:
+                logger.info(f'[LiveEngine:{self._strategy_id}] Повторная попытка {attempt + 1}/{max_retries} для point_cost...')
+                time.sleep(retry_delay)
+
+            try:
+                if hasattr(self._connector, 'get_sec_info'):
+                   sec_info = self._connector.get_sec_info(self._ticker, self._board)
+                   if sec_info:
+                        minstep = sec_info.get('minstep')
+                        pc_from_connector = float(sec_info.get('point_cost') or 0.0)
+                        lot_size = sec_info.get('lotsize') or sec_info.get('lot_size') or 0
+                        try:
+                            self._lot_size = max(int(lot_size), 1)
+                        except (TypeError, ValueError):
+                            self._lot_size = 0
+
+                        # Приоритет 1: MOEX API
+                        if hasattr(self._connector, 'get_moex_info'):
+                            moex_sec_type = 'futures' if self._is_futures(self._ticker) else 'stock'
+                            moex_info = self._connector.get_moex_info(self._ticker, sec_type=moex_sec_type)
+                            if moex_info:
+                                if moex_info.get('point_cost'):
+                                    self._point_cost = float(moex_info['point_cost'])
+                                if moex_info.get('lot_size'):
+                                    self._lot_size = max(int(moex_info['lot_size']), 1)
+                                logger.info(
+                                    f'[LiveEngine:{self._strategy_id}] point_cost={self._point_cost} '
+                                    f'lot_size={self._lot_size} (из MOEX API для {self._ticker})'
+                                )
+                                return True
+
+                        # Приоритет 2: point_cost от коннектора
+                        if pc_from_connector > 0:
+                            self._point_cost = pc_from_connector
+                            if self._lot_size <= 0:
+                                self._lot_size = 1
                             logger.info(
-                                f'[LiveEngine:{self._strategy_id}] point_cost={self._point_cost} '
-                                f'lot_size={self._lot_size} (из MOEX API для {self._ticker})'
+                                f'[LiveEngine:{self._strategy_id}] point_cost={pc_from_connector}'
+                                f' minstep={minstep}'
+                                f' lot_size={self._lot_size}'
+                                f" step_cost={round(pc_from_connector * float(minstep), 6) if minstep else 'n/a'}"
                             )
                             return True
 
-                    # Приоритет 2: point_cost от коннектора
-                    if pc_from_connector > 0:
-                        self._point_cost = pc_from_connector
-                        if self._lot_size <= 0:
-                            self._lot_size = 1
-                        logger.info(
-                            f'[LiveEngine:{self._strategy_id}] point_cost={pc_from_connector}'
-                            f' minstep={minstep}'
-                            f' lot_size={self._lot_size}'
-                            f" step_cost={round(pc_from_connector * float(minstep), 6) if minstep else 'n/a'}"
-                        )
-                        return True
+                # Финальный fallback: попробовать получить lot_size из MOEX API
+                if not self._is_futures(self._ticker):
+                    try:
+                        from core.moex_api import MOEXClient
+                        moex_info = MOEXClient.get_instrument_info(self._ticker, sec_type='stock')
+                        if moex_info and moex_info.get('lot_size'):
+                            self._lot_size = max(int(moex_info['lot_size']), 1)
+                            self._point_cost = 1.0
+                            logger.info(
+                                f"[LiveEngine:{self._strategy_id}] "
+                                f"lot_size={self._lot_size} из MOEX API (брокер недоступен)"
+                            )
+                            return True
+                    except Exception as e:
+                        logger.debug(f"[LiveEngine:{self._strategy_id}] MOEX fallback error: {e}")
 
-            # Если сюда дошли — point_cost не найден
-            logger.error(f"[LiveEngine:{self._strategy_id}] point_cost не получен — старт запрещён")
-            self._point_cost = 0.0
+            except Exception as e:
+               logger.warning(f"[LiveEngine:{self._strategy_id}] point_cost error (attempt {attempt + 1}): {e}")
+               self._point_cost = 0.0
 
-            # Финальный fallback: попробовать получить lot_size из MOEX API
-            # чтобы комиссия рассчитывалась корректно даже при недоступности брокерских данных
-            if not self._is_futures(self._ticker):  # только для акций — для фьючерсов point_cost критичен
-                try:
-                    from core.moex_api import MOEXClient
-                    moex_info = MOEXClient.get_instrument_info(self._ticker, sec_type='stock')
-                    if moex_info and moex_info.get('lot_size'):
-                        self._lot_size = max(int(moex_info['lot_size']), 1)
-                        self._point_cost = 1.0   # для акций point_cost = 1 руб./пункт
-                        logger.info(
-                            f"[LiveEngine:{self._strategy_id}] "
-                            f"lot_size={self._lot_size} из MOEX API (брокер недоступен)"
-                        )
-                        return True
-                except Exception as e:
-                    logger.debug(f"[LiveEngine:{self._strategy_id}] MOEX fallback error: {e}")
-
-            return False
-        except Exception as e:
-           logger.warning(f"[LiveEngine:{self._strategy_id}] point_cost error: {e}")
-           self._point_cost = 0.0
-           return False
+        # Все попытки исчерпаны
+        logger.error(f"[LiveEngine:{self._strategy_id}] point_cost не получен после {max_retries} попыток — старт запрещён")
+        self._point_cost = 0.0
+        return False
 
     @property
     def is_running(self) -> bool:
@@ -624,19 +632,16 @@ class LiveEngine:
         self._stop_event.set()
 
         # Graceful shutdown: отменяем активные chase-ордера
-        # Копируем список ВНЕ блокировки, чтобы избежать deadlock
+        # Атомарная copy-and-clear операция для предотвращения race condition
         with self._chase_lock:
             active_chases = list(self._active_chase_orders)
-        
+            self._active_chase_orders.clear()  # Очищаем СРАЗУ под lock'ом
+
         # Отменяем chase-потоки без удержания блокировки
         for chase in active_chases:
             if not chase.is_done:
                 chase.cancel()
                 chase.wait(timeout=5)
-        
-        # Очищаем список под блокировкой после завершения всех потоков
-        with self._chase_lock:
-            self._active_chase_orders.clear()
 
         # Ждём завершения основного потока
         if self._thread and self._thread.is_alive():
@@ -1897,6 +1902,10 @@ class LiveEngine:
             self._order_in_flight = False
 
         # Передаём chase_ref как order_ref чтобы сделка была сохранена
+        logger.info(
+            f"[LiveEngine:{self._strategy_id}] Запись chase-ордера в history: "
+            f"exec_key={chase_ref}, side={side}, filled={filled}, avg_px={avg_px}"
+        )
         self._record_trade(side, filled, avg_px, comment, order_type="chase",
                            order_ref=chase_ref)
         self._record_success()

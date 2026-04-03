@@ -25,6 +25,7 @@ class DATA_BLOB(ctypes.Structure):
 
 _CRYPTPROTECT_UI_FORBIDDEN = 0x01
 _SECRET_STORE_VERSION = 1
+_MAX_BACKUPS = 3  # максимальное количество бэкап-файлов
 
 _write_lock = threading.Lock()   # защита от конкурентных записей
 _cache_lock = threading.Lock()   # защита кэша
@@ -107,33 +108,97 @@ def _read(filepath: Path, use_cache: bool = True) -> Any:
         return data
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f'Ошибка чтения {filepath.name}: {e}')
-        bak = filepath.with_suffix(filepath.suffix + '.bak')
-        if bak.exists():
-            try:
-                with open(bak, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                logger.warning(f'Восстановлено из бэкапа: {bak.name}')
+        # Пробуем бэкапы по порядку: .bak, .bak2, .bak3
+        for i in range(1, _MAX_BACKUPS + 1):
+            backup_data = _read_backup(filepath, i)
+            if backup_data is not None:
+                logger.warning(f'Восстановлено из бэкапа: {filepath.with_suffix("").name}.bak{i}{filepath.suffix}')
                 with _cache_lock:
-                    _cache[key] = (data, time.monotonic(), current_mtime)
-                return data
-            except Exception as backup_error:
-                logger.error(f'Бэкап тоже повреждён {bak.name}: {backup_error}')
+                    _cache[key] = (backup_data, time.monotonic(), current_mtime)
+                return backup_data
         return {}
+
+
+def _cleanup_old_backups(filepath: Path):
+    """Удаляет старые бэкап-файлы, оставляя не более _MAX_BACKUPS."""
+    suffix = filepath.suffix
+    base = filepath.with_suffix('')
+    # Удаляем .bakN где N > _MAX_BACKUPS
+    for i in range(_MAX_BACKUPS + 1, _MAX_BACKUPS + 10):
+        old_bak = Path(f'{base}.bak{i}{suffix}')
+        if old_bak.exists():
+            try:
+                old_bak.unlink()
+                logger.debug(f'Удалён старый бэкап: {old_bak.name}')
+            except OSError as e:
+                logger.warning(f'Не удалось удалить {old_bak.name}: {e}')
+
+
+def _rotate_backups(filepath: Path):
+    """Ротация бэкапов: .bak → .bak2, текущий → .bak, новый записывается."""
+    suffix = filepath.suffix
+    base = filepath.with_suffix('')
+    
+    # Сдвигаем существующие бэкапы: .bakN → .bak(N+1)
+    for i in range(_MAX_BACKUPS, 1, -1):
+        src = Path(f'{base}.bak{i - 1}{suffix}')
+        dst = Path(f'{base}.bak{i}{suffix}')
+        if src.exists():
+            try:
+                src.rename(dst)
+            except OSError as e:
+                logger.debug(f'Не удалось переименовать {src.name} → {dst.name}: {e}')
+    
+    # Текущий файл → .bak
+    if filepath.exists() and filepath.stat().st_size > 0:
+        bak = Path(f'{base}.bak{suffix}')
+        try:
+            shutil.copy(filepath, bak)
+        except OSError as e:
+            logger.warning(f'Не удалось создать бэкап {filepath.name}: {e}')
+    
+    # Очищаем старые бэкапы
+    _cleanup_old_backups(filepath)
+
+
+def _read_backup(filepath: Path, n: int = 1) -> Optional[Any]:
+    """Читает конкретный бэкап-файл (.bakN).
+    
+    Args:
+        filepath: Путь к основному файлу
+        n: Номер бэкапа (1 = .bak, 2 = .bak2, и т.д.)
+    
+    Returns:
+        Данные из бэкапа или None если файл не существует
+    """
+    suffix = filepath.suffix
+    base = filepath.with_suffix('')
+    if n == 1:
+        bak_path = Path(f'{base}.bak{suffix}')
+    else:
+        bak_path = Path(f'{base}.bak{n}{suffix}')
+    
+    if not bak_path.exists():
+        return None
+    
+    try:
+        with open(bak_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f'Ошибка чтения бэкапа {bak_path.name}: {e}')
+        return None
 
 
 def _write_unsafe(filepath: Path, data: Any):
     """Запись без захвата lock — вызывать только внутри with _write_lock.
 
-    Выполняет атомарную запись через .tmp с бэкапом предыдущей версии.
+    Выполняет атомарную запись через .tmp с ротацией бэкапов.
     """
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
+        # Ротация бэкапов вместо простого копирования
         if filepath.exists() and filepath.stat().st_size > 0:
-            bak = filepath.with_suffix(filepath.suffix + '.bak')
-            try:
-                shutil.copy2(filepath, bak)
-            except OSError as e:
-                logger.warning(f'Не удалось создать бэкап {filepath.name}: {e}')
+            _rotate_backups(filepath)
         tmp = filepath.with_suffix('.tmp')
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

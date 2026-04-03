@@ -2,10 +2,11 @@
 
 import threading
 import time
+from typing import Any, Dict, Optional
 from loguru import logger
 
 
-def autoconnect_connectors():
+def autoconnect_connectors() -> None:
     """Автоподключение коннекторов по расписанию."""
     from core.storage import get_bool_setting, get_all_schedules
     from core.connector_manager import connector_manager, register_connectors
@@ -59,11 +60,15 @@ def autoconnect_connectors():
             logger.info(f"Автозапуск [{cid}]: вне окна работы — пропуск")
 
 
-_live_engines: dict = {}  # strategy_id → LiveEngine
+_live_engines: Dict[str, Any] = {}  # strategy_id → LiveEngine
 _live_engines_lock = threading.Lock()  # защита от race condition
 
+# Защита от двойного запуска: стратегии "в процессе запуска"
+_launching_engines: Dict[str, bool] = {}
+_launching_engines_lock = threading.Lock()
 
-def get_live_engines() -> dict:
+
+def get_live_engines() -> Dict[str, Any]:
     """Возвращает копию словаря запущенных LiveEngine (потокобезопасно)."""
     with _live_engines_lock:
         return dict(_live_engines)
@@ -133,77 +138,95 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
     params = {k: v['default'] for k, v in loaded.params_schema.items()}
     params.update(data.get('params', {}))
 
+    # Миграция order_mode: если на верхнем уровне — перенести в params
+    order_mode = data.get('order_mode')
+    if order_mode is not None and 'order_mode' not in params:
+        params['order_mode'] = order_mode
+        logger.info(f"[autostart] [{strategy_id}] order_mode мигрирован в params: {params['order_mode']}")
+
     with _live_engines_lock:
         existing = _live_engines.get(strategy_id)
     if existing is not None:
         logger.info(f"[autostart] [{strategy_id}] LiveEngine уже запущен")
         return True
 
-    def _wait_for_connector(conn, timeout=120):
-        """Ждёт подключения коннектора с таймаутом."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if conn.is_connected():
-                return True
-            time.sleep(1)
-        return False
+    # Защита от двойного запуска: проверяем, не запущен ли уже процесс
+    with _launching_engines_lock:
+        if _launching_engines.get(strategy_id, False):
+            logger.info(f"[autostart] [{strategy_id}] LiveEngine уже в процессе запуска — пропуск")
+            return False
+        _launching_engines[strategy_id] = True
 
-    if not loaded.call_on_start(params, connector):
-        return False
+    try:
+        def _wait_for_connector(conn, timeout=120):
+            """Ждёт подключения коннектора с таймаутом."""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if conn.is_connected():
+                    return True
+                time.sleep(1)
+            return False
 
-    logger.info(f"Автозапуск: [{strategy_id}] запущена")
+        if not loaded.call_on_start(params, connector):
+            return False
 
-    if hasattr(loaded.module, 'on_bar') and connector:
-        if not connector.is_connected():
-            if wait_for_connection:
-                if not is_in_schedule(connector_id):
-                    logger.info(
-                        f"Автозапуск [{strategy_id}]: коннектор вне расписания, LiveEngine не запущен"
-                    )
-                    return False
-                logger.info(f"Автозапуск [{strategy_id}]: ожидаем подключения коннектора...")
-                if not _wait_for_connector(connector, timeout=30):
+        logger.info(f"Автозапуск: [{strategy_id}] запущена")
+
+        if hasattr(loaded.module, 'on_bar') and connector:
+            if not connector.is_connected():
+                if wait_for_connection:
+                    if not is_in_schedule(connector_id):
+                        logger.info(
+                            f"Автозапуск [{strategy_id}]: коннектор вне расписания, LiveEngine не запущен"
+                        )
+                        return False
+                    logger.info(f"Автозапуск [{strategy_id}]: ожидаем подключения коннектора...")
+                    if not _wait_for_connector(connector, timeout=30):
+                        logger.warning(
+                            f"Автозапуск [{strategy_id}]: коннектор не подключился за 30с, LiveEngine не запущен"
+                        )
+                        return False
+                else:
                     logger.warning(
-                        f"Автозапуск [{strategy_id}]: коннектор не подключился за 30с, LiveEngine не запущен"
+                        f"[autostart] [{strategy_id}] коннектор '{connector_id}' не подключён, LiveEngine не запущен"
                     )
                     return False
-            else:
+            # Дополнительная валидация перед стартом: отказ если офлайн
+            if not connector.is_connected():
                 logger.warning(
-                    f"[autostart] [{strategy_id}] коннектор '{connector_id}' не подключён, LiveEngine не запущен"
+                    f"[autostart] [{strategy_id}] коннектор '{connector_id}' офлайн, запуск отменён"
                 )
                 return False
-        # Дополнительная валидация перед стартом: отказ если офлайн
-        if not connector.is_connected():
-            logger.warning(
-                f"[autostart] [{strategy_id}] коннектор '{connector_id}' офлайн, запуск отменён"
-            )
-            return False
-        try:
-            engine = LiveEngine(
-                strategy_id=strategy_id,
-                loaded_strategy=loaded,
-                params=params,
-                connector=connector,
-                account_id=data.get('account_id') or data.get('finam_account', ''),
-                ticker=data.get('ticker', params.get('ticker', '')),
-                board=data.get('board', 'FUT'),
-                timeframe=data.get('timeframe', '5'),
-                agent_name=strategy_id,
-                order_mode=data.get('order_mode', 'market'),
-                lot_sizing=data.get('lot_sizing', {}),
-            )
-            engine.start()
-            with _live_engines_lock:
-                _live_engines[strategy_id] = engine
-            logger.info(f"Автозапуск: [{strategy_id}] LiveEngine запущен")
-        except Exception as e:
-            logger.error(f"Автозапуск [{strategy_id}]: ошибка LiveEngine — {e}")
-            return False
+            try:
+                engine = LiveEngine(
+                    strategy_id=strategy_id,
+                    loaded_strategy=loaded,
+                    params=params,
+                    connector=connector,
+                    account_id=data.get('account_id') or data.get('finam_account', ''),
+                    ticker=data.get('ticker', params.get('ticker', '')),
+                    board=data.get('board', 'FUT'),
+                    timeframe=data.get('timeframe', '5'),
+                    agent_name=strategy_id,
+                    order_mode=params.get('order_mode', 'market'),
+                    lot_sizing=data.get('lot_sizing', {}),
+                )
+                engine.start()
+                with _live_engines_lock:
+                    _live_engines[strategy_id] = engine
+                logger.info(f"Автозапуск: [{strategy_id}] LiveEngine запущен")
+            except Exception as e:
+                logger.error(f"Автозапуск [{strategy_id}]: ошибка LiveEngine — {e}")
+                return False
 
-    return True
+        return True
+    finally:
+        # Снимаем флаг запуска независимо от результата
+        with _launching_engines_lock:
+            _launching_engines.pop(strategy_id, None)
 
 
-def autostart_strategies():
+def autostart_strategies() -> None:
     """Автозапуск активных стратегий (вызывается в фоновом потоке)."""
     from core.storage import get_bool_setting, get_all_strategies
 
@@ -248,7 +271,7 @@ _connector_states_lock = threading.Lock()
 _watchdog_stop_event = threading.Event()
 
 
-def _sync_engines_with_connectors():
+def _sync_engines_with_connectors() -> None:
     """
     Ядро watchdog: синхронизирует запущенные движки с состоянием коннекторов.
 
@@ -342,7 +365,7 @@ def _sync_engines_with_connectors():
                     logger.error(f"[Watchdog] Ошибка остановки [{sid}]: {e}")
 
 
-def start_engine_watchdog(interval_sec: int = 15):
+def start_engine_watchdog(interval_sec: int = 15) -> None:
     """
     Запускает фоновый поток watchdog, который следит за состоянием коннекторов
     и автоматически запускает/останавливает движки стратегий.
@@ -375,6 +398,6 @@ def start_engine_watchdog(interval_sec: int = 15):
     threading.Thread(target=_loop, daemon=True, name="EngineWatchdog").start()
 
 
-def stop_engine_watchdog():
+def stop_engine_watchdog() -> None:
     """Останавливает watchdog (вызывать при завершении приложения)."""
     _watchdog_stop_event.set()

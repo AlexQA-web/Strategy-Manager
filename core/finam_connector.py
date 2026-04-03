@@ -73,6 +73,10 @@ class FinamConnector(BaseConnector):
         self._client_limits: dict[str, dict] = {}  # client_id → {money_free, money_current, ...}
         self._client_limits_lock = threading.Lock()
 
+        # ── Кэш инструментов (аналог OsEngine SecuritiesCachePath) ────────
+        self._securities_cache_path = Path(__file__).resolve().parent.parent / "data" / "finam_securities_cache.json"
+        self._securities_loaded_from_cache = False  # флаг: кэш уже загружен
+
     # ── Внутренние утилиты DLL ────────────────────────────────────────────
 
     def _load_dll(self):
@@ -245,8 +249,7 @@ class FinamConnector(BaseConnector):
 
     def _parse_securities(self, root):
         """Парсит список бумаг из callback.
-        Сохраняем minstep и point_cost из структуры securities (раздел 4.6 TRANSAQ),
-        чтобы они были доступны в get_sec_info до прихода sec_info callback.
+        НЕ сохраняет в файл — кэш пишется один раз при connect().
         """
         result = []
         for sec in root.findall("security"):
@@ -265,8 +268,9 @@ class FinamConnector(BaseConnector):
                         pass
             result.append(entry)
         if result:
-            self._securities.extend(result)
-            logger.debug(f"[Finam] Получено {len(result)} инструментов, всего в кэше: {len(self._securities)}")
+            # НЕ extend — заменяем полностью (как в OsEngine)
+            self._securities = result
+            logger.debug(f"[Finam] Получено {len(result)} инструментов")
             # Обновляем кэш sec_info minstep/point_cost если запись уже есть
             with self._sec_info_lock:
                 for entry in result:
@@ -275,6 +279,34 @@ class FinamConnector(BaseConnector):
                         for f in ("minstep", "point_cost", "lotsize"):
                             if f in entry and f not in self._sec_info[ticker]:
                                 self._sec_info[ticker][f] = entry[f]
+
+    def _save_securities_cache(self):
+        """Сохраняет кэш инструментов в JSON-файл (аналог OsEngine SecuritiesCachePath)."""
+        try:
+            cache_dir = self._securities_cache_path.parent
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self._securities_cache_path, "w", encoding="utf-8") as f:
+                json.dump(self._securities, f, ensure_ascii=False, indent=2)
+            logger.debug(f"[Finam] Кэш инструментов сохранён: {self._securities_cache_path}")
+        except Exception as e:
+            logger.warning(f"[Finam] _save_securities_cache error: {e}")
+
+    def _load_securities_cache(self) -> bool:
+        """Загружает кэш инструментов из JSON-файла. Возвращает True если кэш валиден."""
+        if not self._securities_cache_path.exists():
+            return False
+        try:
+            with open(self._securities_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and len(data) > 0:
+                self._securities = data
+                logger.info(f"[Finam] Загружено {len(data)} инструментов из кэша")
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"[Finam] _load_securities_cache error: {e}")
+            return False
+
     def _has_security_in_cache(self, ticker: str, board: str) -> bool:
         """Проверяет, есть ли инструмент в уже загруженном кеше securities."""
         market = self._BOARD_TO_MARKET.get(board, "1")
@@ -482,7 +514,7 @@ class FinamConnector(BaseConnector):
             )
 
     def _cleanup_old_trades(self):
-        """Удаляет записи старше 24 часов"""
+        """Удаляет записи старше 24 часов (сделки + ошибки)."""
         cutoff = time.time() - 86400  # 24 часа
         with self._processed_trades_lock:
             to_remove = [tradeno for tradeno, ts in self._processed_trades.items() if ts < cutoff]
@@ -490,6 +522,14 @@ class FinamConnector(BaseConnector):
                 del self._processed_trades[tradeno]
         self._last_cleanup = time.time()
         logger.debug(f"[Finam] Очищено {len(to_remove)} старых записей сделок")
+
+        # Очистка _error_throttle старше 5 минут
+        cutoff_errors = time.time() - 300  # 5 минут
+        to_remove_err = [msg for msg, ts in self._error_throttle.items() if ts < cutoff_errors]
+        for msg in to_remove_err:
+            del self._error_throttle[msg]
+        if to_remove_err:
+            logger.debug(f"[Finam] Очищено {len(to_remove_err)} старых записей _error_throttle")
 
     def _parse_clients(self, root):
         """Парсит список клиентов/счетов из callback (обёртка <clients>)."""
@@ -866,8 +906,20 @@ class FinamConnector(BaseConnector):
 
     def get_best_quote(self, board: str, seccode: str) -> Optional[dict]:
         """Возвращает {"bid": float, "offer": float} или None."""
+        # Алиасы для нормализации кодов биржи
+        _BOARD_ALIASES = {
+            "FUT": "SPBFUT",
+            "SPBFUT": "FUT",
+        }
+        
         with self._quotes_lock:
-            return self._quotes.get((board, seccode))
+            result = self._quotes.get((board, seccode))
+            if result is None:
+                # Пробуем альтернативное имя борда (FUT ↔ SPBFUT)
+                alt_board = _BOARD_ALIASES.get(board)
+                if alt_board:
+                    result = self._quotes.get((alt_board, seccode))
+            return result
 
     def get_order_book(self, board: str, ticker: str, depth: int = 10) -> Optional[dict]:
         """
@@ -996,6 +1048,29 @@ class FinamConnector(BaseConnector):
             except ValueError:
                 pass
 
+    def _force_check_orders(self):
+        """Force check всех активных ордеров при реконнекте (аналог OsEngine ForceCheckOrdersAfterReconnectEvent).
+        
+        Запускает фоновый поток, который перепроверяет статусы всех ордеров
+        с активными watchers. Вызывается при reconnet для надёжности.
+        """
+        def _check():
+            with self._order_status_lock:
+                active_tids = list(self._order_watchers.keys())
+            if not active_tids:
+                return
+            logger.info(f"[Finam] Force check {len(active_tids)} active orders after reconnect")
+            for tid in active_tids:
+                try:
+                    # Запрашиваем статус через DLL — ответ придёт через callback
+                    cmd = f'<command id="get_orders"/>'
+                    self._send_command(cmd)
+                    time.sleep(0.1)  # небольшая задержка между запросами
+                except Exception as e:
+                    logger.warning(f"[Finam] Force check order {tid} error: {e}")
+
+        threading.Thread(target=_check, daemon=True, name="finam-force-check-orders").start()
+
     # ── Подключение ───────────────────────────────────────────────────────
 
     def connect(self) -> bool:
@@ -1013,10 +1088,20 @@ class FinamConnector(BaseConnector):
         try:
             self._load_dll()
 
-            # Очищаем кэши перед новым подключением
-            self._securities.clear()
+            # Загружаем кэш инструментов если есть (ускорение подключения)
+            if not self._load_securities_cache():
+                # Кэша нет — очищаем для fresh загрузки
+                self._securities.clear()
+            else:
+                logger.info(f"[Finam] Использован кэш инструментов ({len(self._securities)} записей)")
+
             self._accounts.clear()
             self._positions.clear()
+
+            # Force check orders при реконнекте — перепроверяем активные ордера
+            if self._connected:
+                logger.info("[Finam] Reconnet: force check active orders")
+                self._force_check_orders()
 
             # Инициализация DLL (один раз)
             if not self._initialized:
@@ -1078,9 +1163,9 @@ class FinamConnector(BaseConnector):
                 self._fire(self._on_error, err)
                 return False
 
-            # Команда принята — реальный статус придёт через callback
+            # Команда принята — reconnect_loop дождётся server_status
             self._stop_reconnect.clear()
-            self.start_reconnect_loop()  # Запускаем мониторинг реконнекта
+            self.start_reconnect_loop()
             logger.info("[Finam] Команда connect отправлена, ожидаем ответ сервера...")
             return True
 

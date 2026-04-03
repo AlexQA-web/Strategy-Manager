@@ -17,7 +17,7 @@ from loguru import logger
 
 from config.settings import APP_NAME, APP_VERSION
 from core.storage import (
-    get_all_strategies, save_strategy,
+    get_all_strategies, save_strategy, save_setting,
     delete_strategy, get_strategy, get_setting, get_bool_setting,
 )
 from core.strategy_loader import strategy_loader, StrategyLoadError
@@ -511,6 +511,8 @@ class MainWindow(QMainWindow):
         # Регистрация коннекторов после инициализации UI
         from core.connector_manager import register_connectors
         register_connectors()
+        
+        self._paper_mode = False  # отключён
 
     # ─────────────────────────────────────────────
     # Backend
@@ -688,6 +690,7 @@ class MainWindow(QMainWindow):
             QPushButton:pressed { background:#c05070; }
         """
 
+        # Paper Mode переключатель
         btn_add = QPushButton("+ Добавить агента")
         btn_add.setObjectName("btn_add")
         btn_add.setToolTip("Добавить нового агента (Ctrl+N)")

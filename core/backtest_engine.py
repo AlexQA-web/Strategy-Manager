@@ -82,6 +82,8 @@ class BacktestEngine:
         commission_value = 0.0 if commission_mode == "auto" else float(commission_param)
         # Получаем order_mode для определения роли ордера (maker/taker)
         order_mode = params.get("order_mode", "market")
+        # Параметр slippage (проскальзывание) — доля от цены исполнения
+        slippage = float(params.get("slippage", 0.0))
 
         bars = self._loader.load(filepath)
         if len(bars) < 2:
@@ -133,8 +135,12 @@ class BacktestEngine:
             action = signal.get("action")
 
             if action is not None:
-                exec_price = next_bar.open
+                base_price = next_bar.open
                 exec_dt    = next_bar.dt
+                # Применяем проскальзывание к цене исполнения
+                # Для close передаём направление открытой позиции
+                direction = open_trade.direction if open_trade is not None else 0
+                exec_price = self._apply_slippage(base_price, action, slippage, direction)
 
                 if action == "close" and open_trade is not None:
                     trade = self._close_trade(
@@ -176,8 +182,10 @@ class BacktestEngine:
 
         if open_trade is not None:
             last  = bars[-1]
+            # Применяем slippage к forced close
+            exit_price = self._apply_slippage(last.close, "close", slippage, open_trade.direction)
             trade = self._close_trade(
-                open_trade, last.close, last.dt,
+                open_trade, exit_price, last.dt,
                 "Force close (end of data)", commission_mode, commission_value,
                 bars[0].ticker, bars[0].board, order_mode
             )
@@ -199,6 +207,31 @@ class BacktestEngine:
             f"max DD: {result.max_drawdown:.2f}"
         )
         return result
+
+    @staticmethod
+    def _apply_slippage(base_price: float, action: str, slippage: float, direction: int = 0) -> float:
+        """
+        Применяет проскальзывание к базовой цене исполнения.
+        Slippage всегда ухудшает цену исполнения:
+        - Для buy (вход в long): цена увеличивается
+        - Для sell (вход в short): цена уменьшается
+        - Для close long (direction=+1): цена закрытия уменьшается
+        - Для close short (direction=-1): цена закрытия увеличивается
+        """
+        if slippage <= 0:
+            return base_price
+        if action == "buy":
+            return base_price * (1.0 + slippage)
+        elif action == "sell":
+            return base_price * (1.0 - slippage)
+        elif action == "close":
+            if direction == +1:
+                # Закрываем long — slippage уменьшает цену выхода
+                return base_price * (1.0 - slippage)
+            elif direction == -1:
+                # Закрываем short — slippage увеличивает цену выхода
+                return base_price * (1.0 + slippage)
+        return base_price
 
     @staticmethod
     def _precalc_indicators(df: pd.DataFrame, params: dict, module=None) -> pd.DataFrame:

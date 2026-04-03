@@ -279,6 +279,41 @@ def _place(connector, account_id: str, board: str, ticker: str,
             from core.chase_order import ChaseOrder
             import threading
 
+            # Проверяем наличие рыночных данных перед созданием ChaseOrder
+            quote_available = False
+            try:
+                if hasattr(connector, "get_best_quote"):
+                    quote = connector.get_best_quote(board, ticker)
+                    if quote and (quote.get("bid") or quote.get("offer") or quote.get("last")):
+                        quote_available = True
+            except Exception:
+                pass
+
+            if not quote_available:
+                logger.warning(
+                    f"[Бочка CNY] Нет рыночных данных для {ticker}, "
+                    f"используем рыночный ордер вместо лимитного | {comment}"
+                )
+                # Fallback на рыночный ордер
+                tid = connector.place_order(
+                    account_id=account_id,
+                    ticker=ticker,
+                    side=side,
+                    quantity=qty,
+                    order_type="market",
+                    board=board,
+                    agent_name="Бочка CNY",
+                )
+                if tid:
+                    logger.info(f"[Бочка CNY] MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
+                    return True
+                else:
+                    logger.error(
+                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
+                        f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
+                    )
+                    return False
+
             def _run_chase():
                 chase = ChaseOrder(
                     connector=connector,
@@ -298,6 +333,23 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         f"сторона={side.upper()} qty={qty} цена=bid/offer "
                         f"вид=limit(стакан) — ничего не исполнено за 60 сек | {comment}"
                     )
+                    # Если chase-ордер не исполнился, пробуем выставить рыночный ордер
+                    tid = connector.place_order(
+                        account_id=account_id,
+                        ticker=ticker,
+                        side=side,
+                        quantity=qty,
+                        order_type="market",
+                        board=board,
+                        agent_name="Бочка CNY",
+                    )
+                    if tid:
+                        logger.info(f"[Бочка CNY] FALLBACK MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
+                    else:
+                        logger.error(
+                            f"[Бочка CNY] ОШИБКА fallback заявки: агент=Бочка CNY тикер={ticker} "
+                            f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
+                        )
                 else:
                     logger.info(
                         f"[Бочка CNY] Chase {side.upper()} {ticker}x{qty} "
@@ -313,6 +365,41 @@ def _place(connector, account_id: str, board: str, ticker: str,
             # Лимитная по last price — висит до исполнения или до 23:45
             import threading, time as _time
             from datetime import datetime as _dt
+
+            # Проверяем наличие рыночных данных перед использованием limit_price
+            quote_available = False
+            try:
+                if hasattr(connector, "get_best_quote"):
+                    quote = connector.get_best_quote(board, ticker)
+                    if quote and (quote.get("bid") or quote.get("offer") or quote.get("last")):
+                        quote_available = True
+            except Exception:
+                pass
+            
+            if not quote_available:
+                logger.warning(
+                    f"[Бочка CNY] Нет рыночных данных для {ticker}, "
+                    f"используем рыночный ордер вместо limit_price | {comment}"
+                )
+                # Fallback на рыночный ордер
+                tid = connector.place_order(
+                    account_id=account_id,
+                    ticker=ticker,
+                    side=side,
+                    quantity=qty,
+                    order_type="market",
+                    board=board,
+                    agent_name="Бочка CNY",
+                )
+                if tid:
+                    logger.info(f"[Бочка CNY] MARKET {side.upper()} {ticker}x{qty} tid={tid} | {comment}")
+                    return True
+                else:
+                    logger.error(
+                        f"[Бочка CNY] ОШИБКА заявки: агент=Бочка CNY тикер={ticker} "
+                        f"сторона={side.upper()} qty={qty} вид=market — ордер не выставлен | {comment}"
+                    )
+                    return False
 
             price = _get_last_price(connector, board, ticker)
             if not price:
@@ -421,9 +508,22 @@ def _get_last_price(connector, board: str, ticker: str) -> float:
         if hasattr(connector, "get_best_quote"):
             q = connector.get_best_quote(board, ticker)
             if q:
-                return q.get("last") or q.get("bid") or q.get("offer") or 0.0
+                # Проверяем, что хотя бы одна цена доступна
+                last = q.get("last")
+                bid = q.get("bid")
+                offer = q.get("offer")
+                
+                # Возвращаем доступную цену в порядке приоритета: last -> bid -> offer
+                if last and last > 0:
+                    return last
+                elif bid and bid > 0:
+                    return bid
+                elif offer and offer > 0:
+                    return offer
         if hasattr(connector, "get_last_price"):
-            return connector.get_last_price(ticker, board) or 0.0
+            price = connector.get_last_price(ticker, board)
+            if price and price > 0:
+                return price
     except Exception as e:
         logger.warning(f"[Бочка CNY] _get_last_price {ticker}: {e}")
     return 0.0

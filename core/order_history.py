@@ -16,7 +16,7 @@ NOTE: Race condition fix - добавлен _orders_lock для защиты rea
 import threading
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from core.moex_api import MOEXClient
@@ -45,7 +45,7 @@ def make_order(
     commission_total: float | None = None,  # абсолютная комиссия за всю сторону
     exec_key: str = "",
     source: str = "",
-) -> dict:
+) -> Dict[str, Any]:
     qty_abs = abs(int(quantity or 0))
     commission_per_lot = float(commission or 0.0)
     if commission_total is None:
@@ -78,12 +78,12 @@ def make_order(
 # Хранилище
 # ─────────────────────────────────────────────
 
-def _load() -> dict:
+def _load() -> Dict[str, Any]:
     data = read_json(ORDERS_FILE)
     return data if isinstance(data, dict) else {}
 
 
-def _save(data: dict):
+def _save(data: Dict[str, Any]) -> None:
     write_json(ORDERS_FILE, data)
 
 
@@ -91,7 +91,7 @@ def _save(data: dict):
 FIFO_KEY_FIELDS = ("strategy_id", "ticker", "board")
 
 
-def _key(order: dict) -> tuple[str, str, str]:
+def _key(order: Dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(order.get("strategy_id", "")),
         str(order.get("ticker", "")).upper(),
@@ -99,7 +99,7 @@ def _key(order: dict) -> tuple[str, str, str]:
     )
 
 
-def save_order(order: dict):
+def save_order(order: Dict[str, Any]) -> None:
     """Сохраняет ордер в историю. Защищено от race condition через _orders_lock."""
     with _orders_lock:
         data = _load()
@@ -115,6 +115,13 @@ def save_order(order: dict):
         else:
             logger.warning(f"[{strategy_id}] save_order: нет exec_key, запись пропущена")
             return
+        # Логирование chase-ордеров для отладки
+        order_type = order.get("source", "")
+        if exec_key.startswith("chase:"):
+            logger.info(
+                f"[{strategy_id}] Запись chase-ордера: exec_key={exec_key}, "
+                f"side={order['side']}, qty={order['quantity']}, price={order['price']}"
+            )
         data[strategy_id].append(order)
         _save(data)
     logger.debug(
@@ -124,7 +131,7 @@ def save_order(order: dict):
     )
 
 
-def get_orders(strategy_id: str) -> list[dict]:
+def get_orders(strategy_id: str) -> List[Dict[str, Any]]:
     """Возвращает историю ордеров стратегии, сортированную по времени."""
     with _orders_lock:
         data = _load()
@@ -132,7 +139,7 @@ def get_orders(strategy_id: str) -> list[dict]:
         return sorted(orders, key=lambda o: o["timestamp"])
 
 
-def update_order_pnl(order_id: str, strategy_id: str, pnl: float):
+def update_order_pnl(order_id: str, strategy_id: str, pnl: float) -> None:
     """Обновляет П/У закрывающего ордера. Защищено от race condition."""
     with _orders_lock:
         data = _load()
@@ -143,7 +150,7 @@ def update_order_pnl(order_id: str, strategy_id: str, pnl: float):
         _save(data)
 
 
-def clear_orders(strategy_id: str):
+def clear_orders(strategy_id: str) -> None:
     """Очищает историю ордеров стратегии. Защищено от race condition."""
     with _orders_lock:
         data = _load()
@@ -155,7 +162,7 @@ def clear_orders(strategy_id: str):
 # ─────────────────────────────────────────────
 
 
-def get_order_commission_total(order: dict) -> float:
+def get_order_commission_total(order: Dict[str, Any]) -> float:
     """Возвращает абсолютную комиссию ордера в рублях за всю сторону."""
     if "commission_total" in order:
         try:
@@ -170,7 +177,7 @@ def get_order_commission_total(order: dict) -> float:
     return per_lot * qty_abs
 
 
-def get_order_pnl_multiplier(order: dict) -> float:
+def get_order_pnl_multiplier(order: Dict[str, Any]) -> float:
     """Возвращает денежный множитель для расчёта PnL по ордеру.
 
     Приоритет:
@@ -204,13 +211,14 @@ def get_order_pnl_multiplier(order: dict) -> float:
                     return float(info['point_cost'])
             elif _is_bond(board):
                 # Облигации есть в stock API MOEX
+                # Котировка в % от номинала: pnl_multiplier = facevalue * minstep / 100
                 info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
                 if info:
                     facevalue = float(info.get('facevalue') or 0.0)
                     minstep = float(info.get('minstep') or 0.0)
                     if facevalue > 0:
                         step = minstep if minstep > 0 else 0.01
-                        return facevalue * step
+                        return facevalue * step / 100
             else:
                 info = MOEXClient.get_instrument_info(ticker, sec_type='stock')
                 if info and int(info.get('lot_size') or 0) > 0:
@@ -254,7 +262,7 @@ def get_open_commission(strategy_id: str) -> Optional[float]:
 # ─────────────────────────────────────────────
 
 
-def get_order_pairs(strategy_id: str) -> list[dict]:
+def get_order_pairs(strategy_id: str) -> List[Dict[str, Any]]:
     """
     Сопоставляет ордера в пары (открытие + закрытие) по FIFO.
     Возвращает список пар с рассчитанным П/У.
@@ -429,7 +437,7 @@ def get_pnl_by_ticker(strategy_id: str) -> dict[str, Optional[float]]:
 
 
 
-def get_closed_order_pairs(strategy_id: str, ticker: str | None = None) -> list[dict]:
+def get_closed_order_pairs(strategy_id: str, ticker: Optional[str] = None) -> List[Dict[str, Any]]:
     """Возвращает только закрытые пары сделок, опционально по тикеру."""
     pairs = [p for p in get_order_pairs(strategy_id) if p.get("close") is not None]
     if ticker:

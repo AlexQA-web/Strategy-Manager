@@ -86,7 +86,10 @@ connector_manager = ConnectorManager()
 # Вызывать после настройки приложения.
 
 def register_connectors():
-    """Регистрирует встроенные коннекторы. Вызывается после инициализации UI."""
+    """Регистрирует встроенные коннекторы. Вызывается после инициализации UI.
+    
+    Всегда регистрирует finam и quik.
+    """
     from core.finam_connector import finam_connector
     from core.quik_connector import quik_connector
     
