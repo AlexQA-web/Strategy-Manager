@@ -9,6 +9,8 @@ from loguru import logger
 
 from core.txt_loader import Bar, TXTLoader
 from core.commission_manager import commission_manager
+from core.moex_api import MOEXClient
+from core.instrument_classifier import instrument_classifier
 
 
 @dataclass
@@ -64,6 +66,7 @@ class BacktestEngine:
 
     def __init__(self, loader: TXTLoader | None = None):
         self._loader = loader or TXTLoader()
+        self._point_cost_cache: dict[str, float] = {}
 
     def run(self, module, filepath: str, connector_id: str = "finam", 
             board: str = "TQBR", stop_flag=None) -> BacktestResult:
@@ -155,8 +158,7 @@ class BacktestEngine:
                     logger.debug(f" CLOSE {exec_dt} @ {exec_price:.4f} | net: {trade.net_pnl:+.2f}")
 
                 elif action == "buy" and position == 0:
-                    # Получаем point_cost из модуля стратегии, если доступно
-                    point_cost = getattr(module, "point_cost", 1.0) or 1.0
+                    point_cost = self._get_point_cost(bars[0].ticker, board)
                     open_trade = Trade(
                         direction=+1, qty=signal.get("qty", 1),
                         entry_dt=exec_dt, entry_price=exec_price,
@@ -167,8 +169,7 @@ class BacktestEngine:
                     logger.debug(f" BUY  {exec_dt} @ {exec_price:.4f}")
 
                 elif action == "sell" and position == 0:
-                    # Получаем point_cost из модуля стратегии, если доступно
-                    point_cost = getattr(module, "point_cost", 1.0) or 1.0
+                    point_cost = self._get_point_cost(bars[0].ticker, board)
                     open_trade = Trade(
                         direction=-1, qty=signal.get("qty", 1),
                         entry_dt=exec_dt, entry_price=exec_price,
@@ -285,6 +286,26 @@ class BacktestEngine:
         
         trade.net_pnl = trade.gross_pnl - trade.commission
         return trade
+
+    def _get_point_cost(self, ticker: str, board: str) -> float:
+        """Получает point_cost через MOEX API или классификатор."""
+        cache_key = f"{ticker}:{board}"
+        if cache_key in self._point_cost_cache:
+            return self._point_cost_cache[cache_key]
+
+        try:
+            is_fut = instrument_classifier.is_futures(ticker, board)
+            if is_fut:
+                info = MOEXClient.get_futures_info(ticker)
+                if info and info.get("point_cost"):
+                    pc = float(info["point_cost"])
+                    self._point_cost_cache[cache_key] = pc
+                    return pc
+        except Exception as e:
+            logger.debug(f"Не удалось получить point_cost для {ticker}: {e}")
+
+        self._point_cost_cache[cache_key] = 1.0
+        return 1.0
 
     @staticmethod
     def _calc_metrics(result: BacktestResult) -> None:

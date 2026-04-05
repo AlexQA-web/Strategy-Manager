@@ -6,7 +6,8 @@ This file provides guidance to agents when working with code in this repository.
 - Запуск GUI: `python main.py`
 - Проверка изменённого файла: `python -m py_compile <path/to/file.py>`
 - Сборка exe: `build.bat` (скрипт сам активирует `.venv` и вызывает `pyinstaller -y trading_manager.spec`)
-- Тестов (pytest/unittest) в репозитории нет; «single test» не поддерживается. Минимальный аналог проверки изменения — `py_compile` на конкретном файле.
+- Тесты (pytest): `python -m pytest tests/ -v`
+- Один тест: `python -m pytest tests/test_commission_manager.py::test_futures_taker_commission -v`
 
 ## Нестандартные соглашения кода (из .claude/rules.md + кода)
 - Комментарии/docstring/логи — на русском; идентификаторы и имена файлов — на английском.

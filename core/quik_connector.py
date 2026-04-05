@@ -40,6 +40,11 @@ class QuikConnector(BaseConnector):
         self._cache_lock = threading.Lock()
         self._cache_last_sync = 0.0
         self._cache_sync_interval = 30.0  # полная синхронизация раз в 30 секунд
+        self._sync_in_progress = threading.Event()  # защита от параллельных синхронизаций
+        # Кэш статуса брокера для is_connected() — чтобы не делать сетевой запрос каждый раз
+        self._broker_online_cache: bool = False
+        self._broker_cache_time: float = 0.0
+        self._broker_cache_ttl: float = 5.0  # 5 секунд TTL
 
         # ── Кэш инструментов (аналог OsEngine SecuritiesCachePath) ────────
         self._securities_cache_path = Path(__file__).resolve().parent.parent / "data" / "quik_securities_cache.json"
@@ -205,10 +210,23 @@ class QuikConnector(BaseConnector):
         self._fire_event('disconnect')
 
     def is_connected(self) -> bool:
-        """Проверяет состояние подключения к QUIK и брокеру."""
+        """Проверяет состояние подключения к QUIK и брокеру.
+        
+        Использует кэширование результата проверки брокера (TTL 5 сек),
+        чтобы не блокировать поток сетевыми запросами при частых вызовах.
+        """
         if not self._connected or self._client is None:
+            self._broker_online_cache = False
             return False
-        return self._is_broker_online()
+        # Проверяем кэш — если он ещё валиден, возвращаем без сетевого запроса
+        now = time.time()
+        if now - self._broker_cache_time < self._broker_cache_ttl:
+            return self._broker_online_cache
+        # Кэш устарел — делаем реальную проверку
+        result = self._is_broker_online()
+        self._broker_online_cache = result
+        self._broker_cache_time = now
+        return result
 
     def ping(self) -> bool:
         """Реальная проверка соединения через легкий запрос + брокер."""
@@ -350,45 +368,59 @@ class QuikConnector(BaseConnector):
         return []
 
     def _sync_orders_cache(self) -> None:
-        """Полная синхронизация кэша ордеров."""
-        orders = self._fetch_orders()
-        new_cache: dict[str, dict] = {}
-        for row in orders:
-            tid = str(
-                row.get("trans_id")
-                or row.get("transid")
-                or row.get("transaction_id")
-                or row.get("TRANS_ID")
-                or ""
-            )
-            if not tid:
-                continue
-            quantity = self._to_int(
-                row.get("qty")
-                or row.get("quantity")
-                or row.get("QUANTITY")
-                or row.get("order_qty"),
-                0,
-            )
-            balance = self._to_int(
-                row.get("balance")
-                or row.get("BALANCE")
-                or row.get("qty_left")
-                or quantity,
-                quantity,
-            )
-            status = self._map_order_status(
-                str(row.get("status") or row.get("state") or row.get("STATUS") or "")
-            )
-            new_cache[tid] = {
-                "status": status,
-                "quantity": quantity,
-                "balance": max(0, balance),
-            }
-        with self._cache_lock:
-            self._orders_cache = new_cache
-            self._cache_last_sync = time.monotonic()
-        logger.debug(f"[QUIK] Кэш ордеров синхронизирован: {len(new_cache)} ордеров")
+        """Полная синхронизация кэша ордеров. Безопасно вызывать из любого потока."""
+        # Защита от параллельных синхронизаций
+        if self._sync_in_progress.is_set():
+            return
+        self._sync_in_progress.set()
+        try:
+            orders = self._fetch_orders()
+            new_cache: dict[str, dict] = {}
+            for row in orders:
+                tid = str(
+                    row.get("trans_id")
+                    or row.get("transid")
+                    or row.get("transaction_id")
+                    or row.get("TRANS_ID")
+                    or ""
+                )
+                if not tid:
+                    continue
+                quantity = self._to_int(
+                    row.get("qty")
+                    or row.get("quantity")
+                    or row.get("QUANTITY")
+                    or row.get("order_qty"),
+                    0,
+                )
+                balance = self._to_int(
+                    row.get("balance")
+                    or row.get("BALANCE")
+                    or row.get("qty_left")
+                    or quantity,
+                    quantity,
+                )
+                status = self._map_order_status(
+                    str(row.get("status") or row.get("state") or row.get("STATUS") or "")
+                )
+                new_cache[tid] = {
+                    "status": status,
+                    "quantity": quantity,
+                    "balance": max(0, balance),
+                }
+            with self._cache_lock:
+                self._orders_cache = new_cache
+                self._cache_last_sync = time.monotonic()
+            logger.debug(f"[QUIK] Кэш ордеров синхронизирован: {len(new_cache)} ордеров")
+        finally:
+            self._sync_in_progress.clear()
+
+    def _sync_orders_cache_async(self) -> None:
+        """Запускает синхронизацию кэша в фоновом потоке (не блокирует GUI)."""
+        if self._sync_in_progress.is_set():
+            return
+        t = threading.Thread(target=self._sync_orders_cache, daemon=True, name="quik-sync-cache")
+        t.start()
 
     def _map_order_status(self, raw: str) -> str:
         """Маппинг статусов QUIK в унифицированный формат.
@@ -435,14 +467,14 @@ class QuikConnector(BaseConnector):
         # Сначала ищем в кэше
         with self._cache_lock:
             cached = self._orders_cache.get(tid)
-            if cached is not None:
-                # Проверяем, нужна ли полная синхронизация
-                now = time.monotonic()
-                if now - self._cache_last_sync < self._cache_sync_interval:
-                    return cached  # кэш актуален
+            cache_fresh = (time.monotonic() - self._cache_last_sync) < self._cache_sync_interval
+            if cached is not None and cache_fresh:
+                return cached  # кэш актуален
 
-        # Кэш устарел или ордер не найден — обновляем кэш
-        self._sync_orders_cache()
+        # Кэш устарел или ордер не найден — запускаем фоновую синхронизацию
+        self._sync_orders_cache_async()
+        # Ждём завершения синхронизации (обычно < 1 сек)
+        self._sync_in_progress.wait(timeout=2.0)
 
         # Повторный поиск в обновлённом кэше
         with self._cache_lock:

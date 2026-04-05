@@ -140,12 +140,14 @@ def _rotate_backups(filepath: Path):
     """Ротация бэкапов: .bak → .bak2, текущий → .bak, новый записывается.
     
     Атомарное копирование: сначала во временный файл, потом rename.
+    Цепочка: .bak (последний) → .bak2 → .bak3
     """
     suffix = filepath.suffix
     base = filepath.with_suffix('')
     
-    # Сдвигаем существующие бэкапы: .bakN → .bak(N+1)
-    for i in range(_MAX_BACKUPS, 1, -1):
+    # Сдвигаем существующие бэкапы: .bak(N-1) → .bak(N)
+    # .bak2 → .bak3
+    for i in range(_MAX_BACKUPS, 2, -1):
         src = Path(f'{base}.bak{i - 1}{suffix}')
         dst = Path(f'{base}.bak{i}{suffix}')
         if src.exists():
@@ -153,6 +155,15 @@ def _rotate_backups(filepath: Path):
                 src.rename(dst)
             except OSError as e:
                 logger.debug(f'Не удалось переименовать {src.name} → {dst.name}: {e}')
+    
+    # .bak → .bak2
+    bak1 = Path(f'{base}.bak{suffix}')
+    bak2 = Path(f'{base}.bak2{suffix}')
+    if bak1.exists():
+        try:
+            bak1.rename(bak2)
+        except OSError as e:
+            logger.debug(f'Не удалось переименовать {bak1.name} → {bak2.name}: {e}')
     
     # Текущий файл → .bak (атомарно через .tmp → rename)
     if filepath.exists() and filepath.stat().st_size > 0:
@@ -465,16 +476,6 @@ def save_setting(key: str, value: Any):
             settings = {}
         settings[key] = value
         _write_unsafe_inner(SETTINGS_FILE, settings)
-
-
-def get_bool_setting(key: str, default: bool = False) -> bool:
-    """Безопасное чтение булевой настройки."""
-    val = get_setting(key)
-    if val is None:
-        return default
-    if isinstance(val, bool):
-        return val
-    return str(val).lower() == 'true'
 
 
 set_setting = save_setting  # alias для обратной совместимости

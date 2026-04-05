@@ -29,6 +29,7 @@ class MOEXClient:
     # Кэш для хранения данных инструментов: key → (data, monotonic_timestamp)
     _cache: Dict[str, tuple[Dict[str, Any], float]] = {}
     _cache_lock = Lock()
+    _MAX_CACHE_SIZE = 500  # максимальное количество записей в кэше
 
     # TTL для разных типов инструментов (секунды)
     _CACHE_TTL_FUTURES = 4 * 3600   # 4 часа (STEPPRICE меняется при клиринге)
@@ -61,6 +62,7 @@ class MOEXClient:
         # Проверяем кэш
         cache_key = f"futures:{ticker.upper()}"
         with cls._cache_lock:
+            cls._cleanup_expired()
             if cache_key in cls._cache:
                 data, cached_at = cls._cache[cache_key]
                 if _time.monotonic() - cached_at < cls._CACHE_TTL_FUTURES:
@@ -140,6 +142,26 @@ class MOEXClient:
         except Exception as e:
             logger.error(f"[MOEX] Unexpected error for futures {ticker}: {e}", exc_info=True)
             return None
+
+    @classmethod
+    def _cleanup_expired(cls):
+        """Удаляет просроченные записи и ограничивает размер кэша.
+        
+        Вызывать только внутри cls._cache_lock.
+        """
+        now = _time.monotonic()
+        to_remove = []
+        for key, (data, cached_at) in cls._cache.items():
+            ttl = cls._CACHE_TTL_FUTURES if key.startswith("futures:") else cls._CACHE_TTL_STOCKS
+            if now - cached_at >= ttl:
+                to_remove.append(key)
+        for key in to_remove:
+            del cls._cache[key]
+
+        # Если кэш всё ещё слишком большой — удаляем самые старые записи
+        while len(cls._cache) > cls._MAX_CACHE_SIZE:
+            oldest_key = min(cls._cache, key=lambda k: cls._cache[k][1])
+            del cls._cache[oldest_key]
     
     @classmethod
     def get_stock_info(cls, ticker: str) -> Optional[Dict[str, Any]]:
@@ -162,6 +184,7 @@ class MOEXClient:
         # Проверяем кэш
         cache_key = f"stock:{ticker.upper()}"
         with cls._cache_lock:
+            cls._cleanup_expired()
             if cache_key in cls._cache:
                 data, cached_at = cls._cache[cache_key]
                 if _time.monotonic() - cached_at < cls._CACHE_TTL_STOCKS:

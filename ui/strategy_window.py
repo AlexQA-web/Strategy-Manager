@@ -1133,4 +1133,9 @@ class StrategyWindow(QDialog):
         self._timer.start(3000)  # Каждые 3 сек
 
     def closeEvent(self, event):
+        # Останавливаем все таймеры чтобы избежать вызова callback'ов после уничтожения виджетов
+        if hasattr(self, '_lot_timer') and self._lot_timer:
+            self._lot_timer.stop()
+        if hasattr(self, '_timer') and self._timer:
+            self._timer.stop()
         event.accept()

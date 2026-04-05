@@ -505,22 +505,9 @@ class InstrumentsParamWidget(BaseParamWidget):
     def set_value(self, value: Any):
         """Устанавливает список инструментов"""
         if isinstance(value, list):
-            # Пересоздаём виджет с новым списком
-            from ui.instruments_widget import InstrumentsWidget
-
-            old_widget = self.instruments_widget
-            self.instruments_widget = InstrumentsWidget(
-                connector_id=self.connector_id or "finam",
-                instruments=value,
-                parent=self
-            )
-
-            # Заменяем виджет в layout родителя
-            # NOTE: self.layout() может вернуть None, поэтому используем parent.layout()
-            parent_layout = self.parent().layout() if self.parent() else None
-            if parent_layout:
-                parent_layout.replaceWidget(old_widget, self.instruments_widget)
-                old_widget.deleteLater()
+            # Вместо пересоздания виджета — просто обновляем значение
+            # Это безопаснее и не ломает layout
+            self.instruments_widget.set_value(value)
     
     def validate(self) -> Tuple[bool, str]:
         """Валидация списка инструментов"""

@@ -11,19 +11,16 @@
 
 Потребляется: LiveEngine (запись), UI (отображение), equity_tracker (realized PnL).
 
-NOTE: Race condition fix - добавлен _orders_lock для защиты read-modify-write цикла.
+NOTE: Race condition fix — используется единый _rwlock из storage.py для защиты
+read-modify-write цикла, что предотвращает потерю данных при параллельных save_order.
 """
-import threading
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from core.moex_api import MOEXClient
-from core.storage import read_json, write_json, DATA_DIR
-
-# Lock для защиты race condition при одновременной записи ордеров от разных стратегий
-_orders_lock = threading.Lock()
+from core.storage import read_json, write_json, DATA_DIR, _rwlock
 
 ORDERS_FILE = DATA_DIR / "order_history.json"
 
@@ -100,23 +97,22 @@ def _key(order: Dict[str, Any]) -> tuple[str, str, str]:
 
 
 def save_order(order: Dict[str, Any]) -> None:
-    """Сохраняет ордер в историю. Защищено от race condition через _orders_lock."""
-    with _orders_lock:
-        data = _load(use_cache=False)  # защита от устаревшего кэша при параллельных вставках
-        strategy_id = order["strategy_id"]
+    """Сохраняет ордер в историю. Защищено от race condition через _rwlock.write_lock()."""
+    strategy_id = order["strategy_id"]
+    exec_key = str(order.get("exec_key", "") or "")
+    if not exec_key:
+        logger.warning(f"[{strategy_id}] save_order: нет exec_key, запись пропущена")
+        return
+
+    with _rwlock.write_lock():
+        data = _load(use_cache=False)
         if strategy_id not in data:
             data[strategy_id] = []
-        exec_key = str(order.get("exec_key", "") or "")
-        if exec_key:
-            for existing in data[strategy_id]:
-                if str(existing.get("exec_key", "") or "") == exec_key:
-                    logger.debug(f"[{strategy_id}] duplicate execution ignored: exec_key={exec_key}")
-                    return
-        else:
-            logger.warning(f"[{strategy_id}] save_order: нет exec_key, запись пропущена")
-            return
+        for existing in data[strategy_id]:
+            if str(existing.get("exec_key", "") or "") == exec_key:
+                logger.debug(f"[{strategy_id}] duplicate execution ignored: exec_key={exec_key}")
+                return
         # Логирование chase-ордеров для отладки
-        order_type = order.get("source", "")
         if exec_key.startswith("chase:"):
             logger.info(
                 f"[{strategy_id}] Запись chase-ордера: exec_key={exec_key}, "
@@ -133,16 +129,15 @@ def save_order(order: Dict[str, Any]) -> None:
 
 def get_orders(strategy_id: str) -> List[Dict[str, Any]]:
     """Возвращает историю ордеров стратегии, сортированную по времени."""
-    with _orders_lock:
-        data = _load()
-        orders = data.get(strategy_id, [])
-        return sorted(orders, key=lambda o: o["timestamp"])
+    data = _load()
+    orders = data.get(strategy_id, [])
+    return sorted(orders, key=lambda o: o["timestamp"])
 
 
 def update_order_pnl(order_id: str, strategy_id: str, pnl: float) -> None:
     """Обновляет П/У закрывающего ордера. Защищено от race condition."""
-    with _orders_lock:
-        data = _load()
+    with _rwlock.write_lock():
+        data = _load(use_cache=False)
         for order in data.get(strategy_id, []):
             if order["id"] == order_id:
                 order["pnl"] = pnl
@@ -152,8 +147,8 @@ def update_order_pnl(order_id: str, strategy_id: str, pnl: float) -> None:
 
 def clear_orders(strategy_id: str) -> None:
     """Очищает историю ордеров стратегии. Защищено от race condition."""
-    with _orders_lock:
-        data = _load()
+    with _rwlock.write_lock():
+        data = _load(use_cache=False)
         data.pop(strategy_id, None)
         _save(data)
 

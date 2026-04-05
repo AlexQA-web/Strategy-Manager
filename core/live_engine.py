@@ -285,9 +285,9 @@ class LiveEngine:
 
     # === Вспомогательные методы ===
 
-    def _is_futures(self, ticker: str = None) -> bool:
+    def _is_futures(self, ticker: str = None, board: str = None) -> bool:
         t = ticker or self._ticker
-        b = self._board if ticker is None else ""
+        b = board if board is not None else (self._board if ticker is None else "")
         return instrument_classifier.is_futures(t, b)
 
     def _calculate_commission(self, ticker: str, qty: int, price: float, sec_type: str = None) -> float:

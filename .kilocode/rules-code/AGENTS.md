@@ -9,3 +9,6 @@
 - `point_cost` для фьючерсов: приоритет значения из MOEX API, данные TransAQ DLL — только fallback.
 - `FinamConnector.Initialize()` должен вызываться ровно один раз за lifecycle процесса (`self._initialized`).
 - Регистрация коннекторов происходит после создания UI (путь инициализации: `main.py` → `MainWindow()` → register_connectors), не на import-time.
+- Тесты в `tests/` используют pytest; тесты пишутся в отдельной директории, не рядом с кодом. Запуск: `python -m pytest tests/ -v`.
+- Стратегии: обязательные функции `get_info`, `get_params`, `on_start`, `on_stop`, `on_tick`; опциональные `on_precalc`, `on_bar`, `get_lookback`, `execute_signal`, `get_indicators`.
+- Синглтоны проекта импортируются из `core/connector_manager`, `core/commission_manager`, `core/instrument_classifier`, `core/position_manager`, `core/strategy_loader`, `core/scheduler`, `core/telegram_bot`, `core/finam_connector`, `core/quik_connector`.

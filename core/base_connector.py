@@ -6,14 +6,22 @@ from typing import Callable, Optional
 from loguru import logger
 
 
+# Sentinel-объекты для определения типа события в _fire
+_CONNECT_SENTINEL = object()
+_DISCONNECT_SENTINEL = object()
+_RECONNECT_SENTINEL = object()
+_ERROR_SENTINEL = object()
+_POSITIONS_SENTINEL = object()
+
+
 class BaseConnector(ABC):
 
     def __init__(self):
-        self._on_connect: Optional[Callable] = None
-        self._on_disconnect: Optional[Callable] = None
-        self._on_reconnect: Optional[Callable] = None
-        self._on_error: Optional[Callable] = None
-        self._on_positions_update: Optional[Callable] = None
+        self._on_connect: Optional[Callable] = _CONNECT_SENTINEL
+        self._on_disconnect: Optional[Callable] = _DISCONNECT_SENTINEL
+        self._on_reconnect: Optional[Callable] = _RECONNECT_SENTINEL
+        self._on_error: Optional[Callable] = _ERROR_SENTINEL
+        self._on_positions_update: Optional[Callable] = _POSITIONS_SENTINEL
         self._connect_listeners: list[Callable] = []
         self._disconnect_listeners: list[Callable] = []
         self._reconnect_listeners: list[Callable] = []
@@ -138,22 +146,22 @@ class BaseConnector(ABC):
 
     def _fire(self, cb: Optional[Callable], *args):
         """Безопасный вызов колбэка + всех подписчиков (обратная совместимость)."""
-        if cb:
+        if cb and not isinstance(cb, type):
             try:
                 cb(*args)
             except Exception as e:
                 logger.error(f"[{self.__class__.__name__}] callback error: {e}")
-        # Вызываем соответствующие списки слушателей
+        # Вызываем соответствующие списки слушателей по sentinel-объектам
         listeners: list[Callable] = []
-        if cb is self._on_connect:
+        if cb is _CONNECT_SENTINEL or cb is self._on_connect:
             listeners = list(self._connect_listeners)
-        elif cb is self._on_disconnect:
+        elif cb is _DISCONNECT_SENTINEL or cb is self._on_disconnect:
             listeners = list(self._disconnect_listeners)
-        elif cb is self._on_reconnect:
+        elif cb is _RECONNECT_SENTINEL or cb is self._on_reconnect:
             listeners = list(self._reconnect_listeners)
-        elif cb is self._on_error:
+        elif cb is _ERROR_SENTINEL or cb is self._on_error:
             listeners = list(self._error_listeners)
-        elif cb is self._on_positions_update:
+        elif cb is _POSITIONS_SENTINEL or cb is self._on_positions_update:
             listeners = list(self._positions_listeners)
 
         for listener in listeners:
@@ -181,9 +189,6 @@ class BaseConnector(ABC):
     def subscribe_connect(self, callback: Callable[[], None]):
         if callback not in self._connect_listeners:
             self._connect_listeners.append(callback)
-            # Устанавливаем dummy callback чтобы _fire мог определить тип события
-            if self._on_connect is None:
-                self._on_connect = lambda: None
 
     def unsubscribe_connect(self, callback: Callable[[], None]):
         self._connect_listeners = [cb for cb in self._connect_listeners if cb is not callback]
@@ -191,9 +196,6 @@ class BaseConnector(ABC):
     def subscribe_disconnect(self, callback: Callable[[], None]):
         if callback not in self._disconnect_listeners:
             self._disconnect_listeners.append(callback)
-            # Устанавливаем dummy callback чтобы _fire мог определить тип события
-            if self._on_disconnect is None:
-                self._on_disconnect = lambda: None
 
     def unsubscribe_disconnect(self, callback: Callable[[], None]):
         self._disconnect_listeners = [cb for cb in self._disconnect_listeners if cb is not callback]

@@ -167,6 +167,23 @@ def on_precalc(df, params: dict):
 _EXCLUDE_DATES = {220224, 220225, 250617}
 
 
+# ── Вспомогательные функции для проверки временных окон ────────────────────────
+
+def _in_open_window(time_min: int, time_open: int, time_limit: int) -> bool:
+    """Проверяет, находится ли time_min в окне торговли (с учётом перехода через полночь)."""
+    if time_open < time_limit:
+        # Обычный случай: окно в пределах одного дня
+        return time_open < time_min < time_limit
+    else:
+        # Окно через полночь (например, 2300–0200)
+        return time_min > time_open or time_min < time_limit
+
+
+def _in_close_window(time_min: int, time_close: int) -> bool:
+    """Проверяет, наступило ли время закрытия позиции."""
+    return time_min >= time_close
+
+
 # ── Сигнальная логика (общая для бэктеста и реала) ───────────────────────────
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:

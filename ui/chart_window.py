@@ -1536,11 +1536,14 @@ class ChartWindow(QWidget):
 
         Использует get_best_quote (LAST → offer → bid), fallback — get_last_price.
         Защита от параллельных вызовов: если предыдущий поток ещё работает — пропускаем.
+        Использует threading.Lock вместо простого флага для защиты от race condition.
         """
         import threading
-        if getattr(self, "_fetch_price_running", False):
-            return
-        self._fetch_price_running = True
+        # Инициализируем lock лениво
+        if not hasattr(self, "_fetch_price_lock"):
+            self._fetch_price_lock = threading.Lock()
+        if not self._fetch_price_lock.acquire(blocking=False):
+            return  # предыдущий запрос ещё выполняется
 
         def _worker():
             price = None
@@ -1561,7 +1564,7 @@ class ChartWindow(QWidget):
             except Exception as e:
                 logger.debug(f"[Chart] _fetch_price_async: {e}")
             finally:
-                self._fetch_price_running = False
+                self._fetch_price_lock.release()
             if price:
                 from PyQt6.QtCore import QTimer as _QTimer
                 _QTimer.singleShot(0, lambda: self._apply_tick_price(price))

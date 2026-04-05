@@ -458,10 +458,9 @@ class FinamConnector(BaseConnector):
                 if tradeno in self._processed_trades:
                     continue
                 self._processed_trades[tradeno] = time.time()
-            
-            # Периодическая очистка (раз в час)
-            if time.time() - self._last_cleanup > 3600:
-                self._cleanup_old_trades()
+                # Ограничиваем размер словаря — если больше 10000 записей, чистим старые
+                if len(self._processed_trades) > 10_000:
+                    self._cleanup_old_trades_unsafe()
 
             seccode = trade.findtext("seccode", "")
             buysell = trade.findtext("buysell", "")
@@ -514,15 +513,26 @@ class FinamConnector(BaseConnector):
                 f"x{quantity} @ {price} [{strategy_id}] tradeno={tradeno}"
             )
 
-    def _cleanup_old_trades(self):
-        """Удаляет записи старше 24 часов (сделки + ошибки)."""
+    def _cleanup_old_trades_unsafe(self):
+        """Удаляет записи старше 24 часов. Вызывать только внутри _processed_trades_lock."""
         cutoff = time.time() - 86400  # 24 часа
-        with self._processed_trades_lock:
-            to_remove = [tradeno for tradeno, ts in self._processed_trades.items() if ts < cutoff]
-            for tradeno in to_remove:
+        to_remove = [tradeno for tradeno, ts in self._processed_trades.items() if ts < cutoff]
+        for tradeno in to_remove:
+            del self._processed_trades[tradeno]
+        # Если всё ещё много записей — удаляем самые старые
+        if len(self._processed_trades) > 5000:
+            sorted_trades = sorted(self._processed_trades.items(), key=lambda x: x[1])
+            excess = len(self._processed_trades) - 5000
+            for tradeno, _ in sorted_trades[:excess]:
                 del self._processed_trades[tradeno]
         self._last_cleanup = time.time()
-        logger.debug(f"[Finam] Очищено {len(to_remove)} старых записей сделок")
+        if to_remove:
+            logger.debug(f"[Finam] Очищено {len(to_remove)} старых записей сделок")
+
+    def _cleanup_old_trades(self):
+        """Удаляет записи старше 24 часов (сделки + ошибки)."""
+        with self._processed_trades_lock:
+            self._cleanup_old_trades_unsafe()
 
         # Очистка _error_throttle старше 5 минут
         cutoff_errors = time.time() - 300  # 5 минут

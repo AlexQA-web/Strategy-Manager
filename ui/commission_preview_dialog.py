@@ -204,7 +204,7 @@ class CommissionPreviewDialog(QDialog):
             price=price,
             order_role=order_role,
             point_cost=point_cost if is_futures else None,
-            connector_id="transaq"  # Используем коннектор по умолчанию для предварительного просмотра
+            connector_id="finam"  # Используем основной коннектор для предварительного просмотра
         )
         
         # Отображаем результат
