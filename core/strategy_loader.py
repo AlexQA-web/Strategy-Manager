@@ -11,6 +11,13 @@ from loguru import logger
 
 REQUIRED_FUNCTIONS = ["get_info", "get_params", "on_start", "on_stop", "on_tick"]
 
+CUSTOM_EXECUTION_ADAPTERS = {
+    "achilles-basket": {
+        "allowed_files": {"achilles"},
+        "allowed_actions": frozenset({"snapshot", "signal", "close_limit", "close_market"}),
+    },
+}
+
 _TIMEOUT_START_STOP = 30  # секунд
 _CIRCUIT_BREAKER_THRESHOLD = 5  # последовательных ошибок до перехода в ERROR
 
@@ -26,6 +33,36 @@ class StrategyLoadError(Exception):
     pass
 
 
+def resolve_custom_execution_adapter(module, file_path: str) -> tuple[Optional[str], frozenset[str]]:
+    """Разрешает custom execution adapter только через явный registry.
+
+    Самообъявление стратегии недостаточно: adapter должен существовать в
+    CUSTOM_EXECUTION_ADAPTERS и быть разрешён для конкретного файла стратегии.
+    """
+    adapter_name = getattr(module, "__execution_adapter__", None)
+    if not adapter_name:
+        return None, frozenset()
+
+    adapter_meta = CUSTOM_EXECUTION_ADAPTERS.get(adapter_name)
+    if not adapter_meta:
+        logger.error(
+            f"[StrategyLoader] Неизвестный custom execution adapter: {adapter_name!r}. "
+            f"Стратегия будет работать только через стандартный execution path."
+        )
+        return None, frozenset()
+
+    file_stem = Path(file_path).stem.lower()
+    allowed_files = {name.lower() for name in adapter_meta.get("allowed_files", set())}
+    if allowed_files and file_stem not in allowed_files:
+        logger.error(
+            f"[StrategyLoader] Adapter {adapter_name!r} не разрешён для файла {file_stem!r}. "
+            f"Стратегия будет работать только через стандартный execution path."
+        )
+        return None, frozenset()
+
+    return adapter_name, frozenset(adapter_meta.get("allowed_actions", ()))
+
+
 class LoadedStrategy:
     def __init__(self, strategy_id: str, module, file_path: str):
         self.strategy_id = strategy_id
@@ -33,6 +70,9 @@ class LoadedStrategy:
         self.file_path = file_path
         self.info: dict = module.get_info()
         self.params_schema: dict = module.get_params()
+        self.custom_execution_adapter, self.custom_execution_actions = (
+            resolve_custom_execution_adapter(module, file_path)
+        )
         self._lock = threading.Lock()
         self.state = StrategyState.LOADED
         self._consecutive_errors = 0
@@ -221,6 +261,9 @@ class StrategyLoader:
 
     def load(self, strategy_id: str, file_path: str) -> LoadedStrategy:
         path = Path(file_path)
+        if not path.is_absolute():
+            from config.settings import BASE_DIR
+            path = BASE_DIR / path
         if not path.exists():
             raise StrategyLoadError(f"Файл не найден: {file_path}")
         if path.suffix != ".py":

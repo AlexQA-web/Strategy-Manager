@@ -16,6 +16,8 @@
 
 from loguru import logger
 
+from core.indicators import is_nan
+
 
 def get_info() -> dict:
     return {
@@ -214,13 +216,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     time_limit = int(params.get("time_limit", 900))
     qty        = int(params.get("qty", 1))
 
-    def _nan(v):
-        try:
-            return v != v
-        except Exception:
-            return True
-
-    if highest is None or lowest is None or _nan(highest) or _nan(lowest):
+    if is_nan(highest) or is_nan(lowest):
         return {"action": None}
 
     # EXIT — приоритет над входом
@@ -244,72 +240,3 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
         return {"action": "sell", "qty": qty, "comment": f"Short < {lowest:.4f}"}
 
     return {"action": None}
-
-
-# ── Реальное исполнение ───────────────────────────────────────────────────────
-
-def execute_signal(signal: dict, connector, params: dict, account_id: str) -> None:
-    """
-    Вызывается LiveEngine вместо _execute_signal при наличии этой функции в модуле.
-    Поддерживает все три режима заявок через параметр order_mode:
-      - "market"      — рыночная заявка (по умолчанию)
-      - "limit"       — лимитка по лучшей цене стакана (ChaseOrder)
-      - "limit_price" — лимитка по last price (висит до исполнения или до 23:45)
-
-    Для закрытия использует подтверждённую позицию из коннектора,
-    а не локальное оптимистичное состояние.
-    """
-    from core.order_placer import OrderPlacer
-
-    action     = signal.get("action")
-    qty        = int(signal.get("qty", 1))
-    comment    = signal.get("comment", "")
-    ticker     = params.get("ticker", "CNY")
-    board      = params.get("board", "SPBFUT")
-    order_mode = params.get("order_mode", "market")
-
-    placer = OrderPlacer(connector, agent_name="Бочка CNY")
-
-    if action == "buy":
-        placer.place(account_id, board, ticker, "buy", qty, order_mode, comment)
-
-    elif action == "sell":
-        placer.place(account_id, board, ticker, "sell", qty, order_mode, comment)
-
-    elif action == "close":
-        live_side, live_qty = _get_confirmed_position(connector, account_id, ticker, board)
-        if live_side == 0 or live_qty <= 0:
-            logger.warning('[Бочка CNY] close сигнал, но подтверждённая позиция отсутствует — пропуск')
-            return
-        close_side = "sell" if live_side > 0 else "buy"
-        placer.place(account_id, board, ticker, close_side, live_qty, order_mode, comment)
-
-
-def _get_confirmed_position(connector, account_id: str, ticker: str, board: str) -> tuple[int, int]:
-    """Возвращает подтверждённую позицию из коннектора: (side, abs_qty)."""
-    try:
-        if not hasattr(connector, 'get_positions'):
-            return 0, 0
-        positions = connector.get_positions(account_id) or []
-        for pos in positions:
-            if pos.get('ticker') != ticker:
-                continue
-            pos_board = str(pos.get('board', board) or board)
-            if pos_board != board:
-                continue
-
-            raw_qty = float(pos.get('quantity', 0) or 0)
-            if raw_qty > 0:
-                return 1, int(abs(raw_qty))
-            if raw_qty < 0:
-                return -1, int(abs(raw_qty))
-
-            side = str(pos.get('side', '')).lower()
-            qty = int(abs(float(pos.get('quantity', 0) or 0)))
-            if side == 'buy' and qty > 0:
-                return 1, qty
-            if side == 'sell' and qty > 0:
-                return -1, qty
-    except Exception as e:
-        logger.warning(f'[Бочка CNY] _get_confirmed_position {ticker}: {e}')
-    return 0, 0

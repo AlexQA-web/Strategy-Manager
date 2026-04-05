@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from core.moex_api import MOEXClient
-from core.storage import read_json, write_json, DATA_DIR, _rwlock
+from core.storage import read_json, DATA_DIR, _rwlock, _read as _storage_read, _write_unsafe_inner as _storage_write_unlocked
+from core.valuation_service import valuation_service
 
 ORDERS_FILE = DATA_DIR / "order_history.json"
 
@@ -42,6 +43,7 @@ def make_order(
     commission_total: float | None = None,  # абсолютная комиссия за всю сторону
     exec_key: str = "",
     source: str = "",
+    pnl_multiplier: float = 0.0,  # денежный множитель для PnL (0 = вычислять автоматически)
 ) -> Dict[str, Any]:
     qty_abs = abs(int(quantity or 0))
     commission_per_lot = float(commission or 0.0)
@@ -50,7 +52,7 @@ def make_order(
     else:
         commission_total = float(commission_total)
 
-    return {
+    order = {
         "id":                 str(uuid.uuid4()),
         "strategy_id":        strategy_id,
         "ticker":             ticker,
@@ -69,6 +71,9 @@ def make_order(
         "exec_key":           str(exec_key or ""),
         "source":             str(source or ""),
     }
+    if pnl_multiplier > 0:
+        order["pnl_multiplier"] = pnl_multiplier
+    return order
 
 
 # ─────────────────────────────────────────────
@@ -76,12 +81,21 @@ def make_order(
 # ─────────────────────────────────────────────
 
 def _load(use_cache: bool = True) -> Dict[str, Any]:
-    data = read_json(ORDERS_FILE)
+    """Читает order_history.json.
+
+    При use_cache=False читает с диска напрямую (без read_lock) —
+    безопасно вызывать внутри write_lock, не создавая deadlock.
+    """
+    data = _storage_read(ORDERS_FILE, use_cache=use_cache)
     return data if isinstance(data, dict) else {}
 
 
 def _save(data: Dict[str, Any]) -> None:
-    write_json(ORDERS_FILE, data)
+    """Пишет order_history.json без захвата lock.
+
+    Вызывать только внутри _rwlock.write_lock() — иначе не потокобезопасно.
+    """
+    _storage_write_unlocked(ORDERS_FILE, data)
 
 
 # Ключ FIFO: (strategy_id, ticker, board)
@@ -276,13 +290,13 @@ def get_order_pairs(strategy_id: str) -> List[Dict[str, Any]]:
     NOTE: Защищено от race condition через _orders_lock.
     """
     def _slice_commission(total_commission: float, slice_qty: int, source_qty: int) -> float:
-        if total_commission <= 0 or slice_qty <= 0 or source_qty <= 0:
-            return 0.0
-        return total_commission * (slice_qty / source_qty)
+        return valuation_service.slice_commission(total_commission, slice_qty, source_qty)
 
     # Защищаем всю обработку lock-ом для избежания race condition
-    with _orders_lock:
-        data = _load()
+    with _rwlock.read_lock():
+        data = _storage_read(ORDERS_FILE, use_cache=True)
+        if not isinstance(data, dict):
+            data = {}
         orders = data.get(strategy_id, [])
         orders = sorted(orders, key=lambda o: o["timestamp"])
 
@@ -315,15 +329,20 @@ def get_order_pairs(strategy_id: str) -> List[Dict[str, Any]]:
                 # Денежный множитель: для фьючерсов point_cost, для акций lot_size
                 pnl_multiplier = get_order_pnl_multiplier(open_order)
 
-                if is_long:
-                    gross_pnl = (close_price - open_price) * close_qty * pnl_multiplier
-                else:
-                    gross_pnl = (open_price - close_price) * close_qty * pnl_multiplier
-
                 open_commission_total = get_order_commission_total(open_order)
                 entry_commission = _slice_commission(open_commission_total, close_qty, open_qty)
                 exit_commission = _slice_commission(remaining_commission_total, close_qty, remaining_qty)
                 total_commission = entry_commission + exit_commission
+
+                gross_pnl = valuation_service.compute_closed_pnl(
+                    open_price=open_price,
+                    close_price=close_price,
+                    qty=close_qty,
+                    is_long=is_long,
+                    pnl_multiplier=pnl_multiplier,
+                    entry_commission=0.0,
+                    exit_commission=0.0,
+                )
                 net_pnl = gross_pnl - total_commission
 
                 open_pair_order = {

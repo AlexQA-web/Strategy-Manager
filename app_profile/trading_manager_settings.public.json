@@ -1,0 +1,352 @@
+{
+  "settings": {
+    "telegram_level": "off",
+    "finam_host": "tr1.finam.ru",
+    "finam_port": "3900",
+    "notify_connect": "false",
+    "notify_order": "false",
+    "notify_position": "false",
+    "notify_pnl": "false",
+    "notify_schedule": "false",
+    "notify_error": "true",
+    "notify_reconnect": "true",
+    "autoconnect": "true",
+    "minimize_to_tray": "false",
+    "autostart_strategies": "true",
+    "reconnect_attempts": "5",
+    "reconnect_delay": "5",
+    "connector_connect_time": "06:50",
+    "connector_disconnect_time": "23:45",
+    "connector_days": "0,1,2,3,4",
+    "quik_host": "localhost",
+    "quik_port": "34130",
+    "notify_POSITION_OPENED": "true",
+    "notify_POSITION_CLOSED": "true",
+    "notify_MISSED_ENTRY": "true",
+    "notify_MISSED_EXIT": "true",
+    "notify_STOP_LOSS_HIT": "true",
+    "notify_TAKE_PROFIT_HIT": "true",
+    "notify_ORDER_REJECTED": "true",
+    "notify_ORDER_TIMEOUT": "true",
+    "notify_ORDER_PARTIAL_FILL": "true",
+    "notify_CONNECTOR_CONNECTED": "true",
+    "notify_CONNECTOR_DISCONNECTED": "true",
+    "notify_CONNECTOR_ERROR": "true",
+    "notify_CONNECTOR_RECONNECTING": "true",
+    "notify_STRATEGY_STARTED": "false",
+    "notify_STRATEGY_STOPPED": "false",
+    "notify_STRATEGY_ERROR": "true",
+    "notify_STRATEGY_CRASHED": "true",
+    "notify_SCHEDULE_CONNECT": "false",
+    "notify_SCHEDULE_DISCONNECT": "false",
+    "notify_APP_STARTED": "false",
+    "notify_APP_STOPPED": "false",
+    "telegram_enabled": "true",
+    "ntfy_server_url": "https://ntfy.sh",
+    "ntfy_topic": "TradMan",
+    "ntfy_enabled": "false",
+    "notify_telegram_POSITION_OPENED": "false",
+    "notify_telegram_POSITION_CLOSED": "false",
+    "notify_telegram_MISSED_ENTRY": "false",
+    "notify_telegram_MISSED_EXIT": "false",
+    "notify_telegram_STOP_LOSS_HIT": "false",
+    "notify_telegram_TAKE_PROFIT_HIT": "false",
+    "notify_telegram_ORDER_REJECTED": "false",
+    "notify_telegram_ORDER_TIMEOUT": "false",
+    "notify_telegram_ORDER_PARTIAL_FILL": "false",
+    "notify_telegram_CONNECTOR_CONNECTED": "false",
+    "notify_telegram_CONNECTOR_DISCONNECTED": "false",
+    "notify_telegram_CONNECTOR_ERROR": "false",
+    "notify_telegram_CONNECTOR_RECONNECTING": "false",
+    "notify_telegram_STRATEGY_STARTED": "false",
+    "notify_telegram_STRATEGY_STOPPED": "false",
+    "notify_telegram_STRATEGY_ERROR": "false",
+    "notify_telegram_STRATEGY_CRASHED": "false",
+    "notify_telegram_SCHEDULE_CONNECT": "false",
+    "notify_telegram_SCHEDULE_DISCONNECT": "false",
+    "notify_telegram_APP_STARTED": "false",
+    "notify_telegram_APP_STOPPED": "false",
+    "notify_ntfy_POSITION_OPENED": "false",
+    "notify_ntfy_POSITION_CLOSED": "false",
+    "notify_ntfy_MISSED_ENTRY": "false",
+    "notify_ntfy_MISSED_EXIT": "false",
+    "notify_ntfy_STOP_LOSS_HIT": "false",
+    "notify_ntfy_TAKE_PROFIT_HIT": "false",
+    "notify_ntfy_ORDER_REJECTED": "false",
+    "notify_ntfy_ORDER_TIMEOUT": "false",
+    "notify_ntfy_ORDER_PARTIAL_FILL": "false",
+    "notify_ntfy_CONNECTOR_CONNECTED": "false",
+    "notify_ntfy_CONNECTOR_DISCONNECTED": "false",
+    "notify_ntfy_CONNECTOR_ERROR": "false",
+    "notify_ntfy_CONNECTOR_RECONNECTING": "false",
+    "notify_ntfy_STRATEGY_STARTED": "false",
+    "notify_ntfy_STRATEGY_STOPPED": "false",
+    "notify_ntfy_STRATEGY_ERROR": "false",
+    "notify_ntfy_STRATEGY_CRASHED": "false",
+    "notify_ntfy_SCHEDULE_CONNECT": "false",
+    "notify_ntfy_SCHEDULE_DISCONNECT": "false",
+    "notify_ntfy_APP_STARTED": "false",
+    "notify_ntfy_APP_STOPPED": "false"
+  },
+  "schedules": {
+    "finam": {
+      "connect_time": "06:50",
+      "disconnect_time": "00:01",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "is_active": true
+    },
+    "quik": {
+      "connect_time": "06:55",
+      "disconnect_time": "00:01",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "is_active": true
+    }
+  },
+  "commissions": {
+    "moex": {
+      "taker_pct": {
+        "currency_futures": 0.001,
+        "equity_futures": 0.003,
+        "index_futures": 0.001,
+        "commodity_futures": 0.005,
+        "stock": 0.003,
+        "bond": 0.003,
+        "etf": 0.003
+      },
+      "maker_pct": {
+        "currency_futures": 0.0,
+        "equity_futures": 0.0,
+        "index_futures": 0.0,
+        "commodity_futures": 0.0,
+        "stock": 0.0,
+        "bond": 0.0,
+        "etf": 0.0
+      }
+    },
+    "broker_transaq": {
+      "futures_rub": {
+        "currency_futures": 1.0,
+        "equity_futures": 0.45,
+        "index_futures": 0.87,
+        "commodity_futures": 2.1
+      },
+      "stock_pct": 0.04,
+      "bond_pct": 0.015,
+      "etf_pct": 0.04
+    },
+    "broker_quik": {
+      "futures_rub": {
+        "currency_futures": 1.0,
+        "equity_futures": 0.45,
+        "index_futures": 0.87,
+        "commodity_futures": 2.1
+      },
+      "stock_pct": 0.04,
+      "bond_pct": 0.015,
+      "etf_pct": 0.04
+    },
+    "default_order_role": "taker",
+    "manual_mapping": {
+      "Si": "currency_futures",
+      "BR": "commodity_futures",
+      "SBER": "stock"
+    },
+    "prefix_rules": {
+      "Si": "currency_futures",
+      "CR": "currency_futures",
+      "RI": "index_futures",
+      "MX": "index_futures",
+      "MM": "index_futures",
+      "BR": "commodity_futures",
+      "NG": "commodity_futures",
+      "GD": "commodity_futures",
+      "GLD": "commodity_futures",
+      "SIL": "commodity_futures"
+    },
+    "last_moex_update": "2026-03-22"
+  },
+  "strategies": {
+    "bochka_cny": {
+      "name": "Бочка CNY",
+      "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/bochka_cny.py",
+      "description": "Пробой Highest/Lowest за период. Инструмент: CNY фьючерс.",
+      "status": "stopped",
+      "finam_account": "802690RIIT6",
+      "is_enabled": true,
+      "params": {
+        "ticker": "CRM6",
+        "board": "FUT",
+        "period": 300,
+        "otstup": 2,
+        "time_open": 708,
+        "time_close": 693,
+        "qty": 1,
+        "commission": "auto",
+        "order_mode": "limit"
+      },
+      "connector": "finam",
+      "board": "FUT",
+      "timeframe": "1",
+      "lot_sizing": {
+        "dynamic": true,
+        "instances": 1,
+        "drawdown": 1300.0
+      },
+      "ticker": "CRM6"
+    },
+    "daytrend": {
+      "name": "DayTrend",
+      "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/daytrend.py",
+      "description": "Пробой сессионного хай/лоу с коэффициентом расширения. Лонг при Close > SessionHigh + Range*K, шорт при Close < SessionLow - Range*K. Стоп: Low[-1] - stop_long / уровень_шорта + stop_short.",
+      "status": "stopped",
+      "finam_account": "802690RIIT6",
+      "is_enabled": true,
+      "params": {
+        "ticker": "SiM6",
+        "board": "FUT",
+        "k_long": 0.3,
+        "k_short": 0.2,
+        "stop_long": 300.0,
+        "stop_short": 600.0,
+        "qty": 1,
+        "time_start": 605,
+        "time_end": 1080,
+        "commission": "auto"
+      },
+      "connector": "finam",
+      "ticker": "SiM6",
+      "board": "FUT",
+      "timeframe": "15",
+      "order_mode": "market"
+    },
+    "achilles": {
+      "name": "Achilles",
+      "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/achilles.py",
+      "description": "Mean Reversion на корзине инструментов. Снимок цен → сигнал по % изменению → закрытие по времени.",
+      "status": "stopped",
+      "finam_account": "112A6S",
+      "is_enabled": true,
+      "params": {
+        "time_snapshot": 600,
+        "time_signal": 720,
+        "time_close": 960,
+        "time_emergency": 1110,
+        "spread_offset": 2.0,
+        "long_percent": 1.0,
+        "short_percent": -3.0,
+        "order_mode": "limit_book",
+        "qty": 1,
+        "instruments": [
+          {
+            "ticker": "AFKS",
+            "board": "TQBR",
+            "allow_buy": true,
+            "allow_sell": false,
+            "order_mode": "limit_book"
+          },
+          {
+            "ticker": "GAZP",
+            "board": "TQBR",
+            "allow_buy": true,
+            "allow_sell": false,
+            "order_mode": "limit_book"
+          },
+          {
+            "ticker": "LKOH",
+            "board": "TQBR",
+            "allow_buy": true,
+            "allow_sell": false,
+            "order_mode": "limit_book"
+          },
+          {
+            "ticker": "ROSN",
+            "board": "TQBR",
+            "allow_buy": true,
+            "allow_sell": false,
+            "order_mode": "limit_book"
+          },
+          {
+            "ticker": "VTBR",
+            "board": "TQBR",
+            "allow_buy": true,
+            "allow_sell": false,
+            "order_mode": "limit_book"
+          }
+        ]
+      },
+      "connector": "quik",
+      "ticker": "SBER",
+      "board": "TQBR",
+      "timeframe": "1",
+      "order_mode": "limit_price",
+      "lot_sizing": {
+        "dynamic": true,
+        "lot": 1,
+        "instances": 1,
+        "drawdown": 0.0
+      }
+    },
+    "tracker": {
+      "name": "Tracker",
+      "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/tracker.py",
+      "description": "Канал SMA ± ATR*K. Вход лимиткой при пробое канала на старшем ТФ с подтверждением на 1-минутном. Выход при возврате в канал.",
+      "status": "stopped",
+      "finam_account": "802690RIIT6",
+      "is_enabled": true,
+      "params": {
+        "ticker": "OZON",
+        "board": "TQBR",
+        "compress_tf": 15,
+        "sma_period": 100,
+        "atr_period": 40,
+        "k": 0.9,
+        "time_open": 605,
+        "time_close": 1125,
+        "friday_close": 1005,
+        "qty": 1,
+        "shag": 1.0,
+        "commission": "auto"
+      },
+      "connector": "finam",
+      "ticker": "OZON",
+      "board": "TQBR",
+      "timeframe": "1",
+      "order_mode": "market"
+    },
+    "valera_trend": {
+      "name": "Valera Trend",
+      "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/valera_trend.py",
+      "description": "Вход в направлении тренда по SMA в заданное время. Фильтр: N баров подряд полностью по одну сторону от SMA (без касания). Выход по времени или при пересечении SMA.",
+      "status": "stopped",
+      "finam_account": "",
+      "is_enabled": true,
+      "params": {
+        "ticker": "T",
+        "board": "TQBR",
+        "sma_period": 200,
+        "candles": 12,
+        "time_open": 600,
+        "time_close": 1425,
+        "qty": 1,
+        "commission": "auto"
+      },
+      "connector": "quik",
+      "timeframe": "1",
+      "order_mode": "market",
+      "ticker": "T",
+      "board": "TQBR"
+    }
+  }
+}

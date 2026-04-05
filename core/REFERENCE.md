@@ -20,6 +20,11 @@ strategy_scheduler   = StrategyScheduler()    # core/scheduler.py
 notifier             = TelegramNotifier()     # core/telegram_bot.py
 finam_connector      = FinamConnector()       # core/finam_connector.py
 quik_connector       = QuikConnector()        # core/quik_connector.py
+
+# Новые после рефакторинга:
+valuation_service    = ValuationService()     # core/valuation_service.py
+fill_ledger          = FillLedger()           # core/fill_ledger.py
+reservation_ledger   = ReservationLedger()    # core/reservation_ledger.py
 ```
 
 > Не создавать дополнительные экземпляры. Не регистрировать коннекторы при импорте модуля — только в `register_connectors()`.
@@ -201,3 +206,154 @@ notifier.send(EventCode.ORDER_FILLED,
 - `>= 5` ошибок подряд → `state = StrategyState.ERROR`
 - `call_on_bar()` возвращает `{"action": None}` в состоянии ERROR
 - Сброс: `loaded.reset_error()`
+
+## valuation_service.py — единый денежный калькулятор
+
+```python
+from core.valuation_service import valuation_service
+
+# PnL multiplier: фьючерсы → point_cost, акции → lot_size
+mult = valuation_service.get_pnl_multiplier(is_futures=True, point_cost=13.7, lot_size=1)
+
+# Unrealized PnL (открытая позиция):
+pnl = valuation_service.compute_open_pnl(
+    entry_price=85000, current_price=86000, qty=2,
+    pnl_multiplier=1.0, entry_commission=1.9, exit_commission=1.9,
+)
+
+# Realized PnL (одна FIFO-пара):
+pnl = valuation_service.compute_closed_pnl(
+    open_price=100, close_price=120, qty=1,
+    is_long=True, pnl_multiplier=10.0,
+    entry_commission=1.3, exit_commission=1.3,
+)
+
+# Equity snapshot:
+eq = valuation_service.compute_equity_snapshot(
+    realized_pnl=500, entry_price=85000, current_price=86000,
+    position_qty=2, pnl_multiplier=1.0,
+)
+
+# Пропорциональное деление комиссии при partial FIFO:
+c = valuation_service.slice_commission(total_commission=50.0, slice_qty=4, source_qty=10)
+```
+
+> **Не дублировать** денежные формулы в других модулях. Все PnL/commission/equity — через ValuationService.
+
+## fill_ledger.py — canonical fill source
+
+```python
+from core.fill_ledger import fill_ledger
+
+# Записать fill (дедупликация по fill_id):
+ok = fill_ledger.record_fill(
+    fill_id="exec_001",        # уникальный execution_id от коннектора
+    strategy_id="my_strategy",
+    ticker="SBER", board="TQBR", side="buy",
+    qty=10, price=300.0,
+    agent_name="my_agent",
+    commission_total=6.45,
+    pnl_multiplier=10.0,
+)
+# ok=True → записан, ok=False → дубликат или пустой fill_id
+
+# Проверка дубликата:
+fill_ledger.is_duplicate("exec_001")  # True
+```
+
+> **Не записывать** fills напрямую через `save_order` / `append_trade` — только через FillLedger.
+
+## reservation_ledger.py — резервирование buying power
+
+```python
+from core.reservation_ledger import reservation_ledger
+
+# Зарезервировать перед submit ордера:
+reservation_ledger.reserve("strat_A:order_1", "account_123", 50000.0)
+
+# Доступные средства с учётом резервов:
+avail = reservation_ledger.available("account_123", gross_free=100000.0)  # 50000.0
+
+# Освободить при fill/cancel/reject:
+reservation_ledger.release("strat_A:order_1")
+
+# Stale eviction: резервы старше 5 мин автоматически удаляются
+```
+
+## position_tracker.py — матрица переходов
+
+```
+Разрешённые (trade path):
+    flat  → long     open_position("buy", qty, price)
+    flat  → short    open_position("sell", qty, price)
+    long  → flat     close_position(filled, total_qty)
+    short → flat     close_position(filled, total_qty)
+    long  → long*    close_position (partial — уменьшение qty)
+    short → short*   close_position (partial — уменьшение qty)
+
+Запрещённые (trade path):
+    long  → short    flip (confirm_open возвращает False)
+    short → long     flip (confirm_open возвращает False)
+    long  → long+    scale-in (confirm_open возвращает False)
+    short → short+   scale-in (confirm_open возвращает False)
+
+Sync path (update_position) — не ограничен, для reconcile с брокером.
+```
+
+## risk_guard.py — pre-trade risk + circuit breaker
+
+```python
+from core.risk_guard import RiskGuard
+
+rg = RiskGuard(
+    strategy_id="my_strat",
+    circuit_breaker_threshold=3,    # N ошибок → circuit open
+    circuit_breaker_timeout=60.0,   # сброс счётчика через N сек
+    max_position_size=10,           # макс. qty в одном ордере
+    daily_loss_limit=5000.0,        # дневной лимит убытка (абс. руб.)
+    get_total_pnl=get_total_pnl,    # callback для realized PnL
+)
+
+# Pre-trade check (вызывается в OrderExecutor перед submit):
+allowed, reason = rg.check_risk_limits("buy", qty=5)
+
+# Circuit breaker (hard-stop, только close разрешён):
+rg.is_circuit_open()       # True → запретить buy/sell
+rg.record_failure()        # ошибка → счётчик +1
+rg.record_success()        # успех → сброс счётчика
+rg.reset_circuit_breaker() # ручной сброс
+```
+
+## live_engine.py — sync_status и degraded state
+
+```
+sync_status:
+    unknown   → начальное состояние до первого reconcile
+    synced    → позиция подтверждена брокером
+    stale     → данные брокера устарели (>N сек без подтверждения)
+    degraded  → систематический отказ reconcile
+
+В degraded state:
+    - Открывающие ордера (buy/sell) ЗАБЛОКИРОВАНЫ
+    - Close и reconcile РАЗРЕШЕНЫ
+    - Торговля возобновляется только после успешного resync → synced
+```
+
+## Canonical order execution path
+
+```
+on_bar() → signal
+  → LiveEngine._process_bar()
+    → RiskGuard.is_circuit_open()          # hard-stop check
+    → RiskGuard.check_risk_limits()        # position size + daily loss
+    → OrderExecutor._check_account_risk_limits()  # gross exposure + positions count
+    → ReservationLedger.reserve()          # reserve buying power
+    → connector.place_order()              # submit to exchange
+    → OrderExecutor._monitor_*()           # poll order status
+      → FillLedger.record_fill()           # canonical fill → order_history + trades_history
+      → PositionTracker.confirm_open() / close_position()
+      → ReservationLedger.release()        # release buying power
+      → TradeRecorder._flush_equity()      # via ValuationService
+```
+
+> **Не обходить** этот путь из стратегий. Custom `execute_signal()` допускается только для зарегистрированных strategy adapters.

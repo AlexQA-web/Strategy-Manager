@@ -80,6 +80,42 @@ if sys.platform.startswith('win'):
 # ── Базовое чтение/запись JSON ─────────────────────────────────────────────────
 
 
+def cleanup_orphan_tmp(directory: Path = None):
+    """Удаляет orphan .tmp файлы, оставшиеся после аварийного завершения.
+
+    Вызывается при старте приложения. Если .tmp существует, а основной файл
+    повреждён или отсутствует, пытается восстановить из .tmp.
+    """
+    dirs = [directory] if directory else [DATA_DIR, APP_PROFILE_DIR]
+    for d in dirs:
+        if not d.exists():
+            continue
+        for tmp_file in d.glob("*.tmp"):
+            try:
+                # Определяем основной файл
+                main_file = tmp_file.with_suffix("")
+                if not main_file.suffix:
+                    # .json.tmp → .json
+                    main_file = tmp_file.with_name(tmp_file.stem)
+
+                if main_file.exists() and main_file.stat().st_size > 0:
+                    # Основной файл в порядке — orphan tmp не нужен
+                    tmp_file.unlink()
+                    logger.debug(f"Удалён orphan tmp: {tmp_file.name}")
+                else:
+                    # Основной файл повреждён/отсутствует — пробуем восстановить из tmp
+                    try:
+                        with open(tmp_file, "r", encoding="utf-8") as f:
+                            json.load(f)  # валидация JSON
+                        tmp_file.replace(main_file)
+                        logger.warning(f"Восстановлен из orphan tmp: {tmp_file.name} → {main_file.name}")
+                    except (json.JSONDecodeError, OSError):
+                        tmp_file.unlink()
+                        logger.warning(f"Удалён невалидный orphan tmp: {tmp_file.name}")
+            except OSError as e:
+                logger.warning(f"cleanup_orphan_tmp error: {tmp_file.name}: {e}")
+
+
 def _read(filepath: Path, use_cache: bool = True) -> Any:
     """Читает данные из файла или кэша.
 
@@ -141,6 +177,9 @@ def _rotate_backups(filepath: Path):
     
     Атомарное копирование: сначала во временный файл, потом rename.
     Цепочка: .bak (последний) → .bak2 → .bak3
+    
+    Каждый шаг обёрнут в try/except — частичная ротация допустима,
+    запись основного файла не должна прерываться из-за ошибки в бэкапах.
     """
     suffix = filepath.suffix
     base = filepath.with_suffix('')
@@ -170,7 +209,6 @@ def _rotate_backups(filepath: Path):
         bak = Path(f'{base}.bak{suffix}')
         bak_tmp = Path(f'{base}.bak{suffix}.tmp')
         try:
-            # Копируем во временный файл, потом атомарно переименовываем
             shutil.copy2(filepath, bak_tmp)
             bak_tmp.replace(bak)
         except OSError as e:
@@ -181,7 +219,10 @@ def _rotate_backups(filepath: Path):
                 pass
     
     # Очищаем старые бэкапы
-    _cleanup_old_backups(filepath)
+    try:
+        _cleanup_old_backups(filepath)
+    except Exception as e:
+        logger.debug(f'cleanup_old_backups error: {e}')
 
 
 def _read_backup(filepath: Path, n: int = 1) -> Optional[Any]:
@@ -215,19 +256,28 @@ def _read_backup(filepath: Path, n: int = 1) -> Optional[Any]:
 def _write_unsafe_inner(filepath: Path, data: Any):
     """Запись без захвата lock — вызывать только внутри write-блокировки.
 
-    Выполняет атомарную запись через .tmp с ротацией бэкапов.
+    Протокол: prepare → write tmp → flush → commit (rename) → cleanup.
+    При ошибке orphan .tmp удаляется.
     """
+    tmp = filepath.with_suffix('.tmp')
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         # Ротация бэкапов вместо простого копирования
         if filepath.exists() and filepath.stat().st_size > 0:
             _rotate_backups(filepath)
-        tmp = filepath.with_suffix('.tmp')
+        # Prepare + write
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+        # Commit
         tmp.replace(filepath)
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
         logger.error(f'Ошибка записи {filepath.name}: {e}')
+        # Cleanup orphan tmp
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     # Invalidation кэша происходит внутри write-блокировки вызывающего
     _cache.pop(str(filepath), None)

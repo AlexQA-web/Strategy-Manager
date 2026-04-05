@@ -42,7 +42,6 @@ class _NoScrollComboBox(QComboBox):
 
 from core.commission_manager import commission_manager
 from core.instrument_classifier import instrument_classifier
-from core.moex_commission_fetcher import moex_commission_fetcher
 from ui.commission_preview_dialog import CommissionPreviewDialog
 
 logger = logging.getLogger(__name__)
@@ -62,7 +61,6 @@ class CommissionSettingsWidget(QWidget):
         super().__init__(parent)
         self._build_ui()
         self._load_settings()
-        self._check_rates_freshness()
     
     def _build_ui(self):
         """Создаёт интерфейс виджета."""
@@ -152,16 +150,6 @@ class CommissionSettingsWidget(QWidget):
         note = QLabel("Ставки MOEX для мейкера всегда 0%")
         note.setStyleSheet("color: gray; font-size: 11px;")
         form.addRow("", note)
-        
-        # Кнопка обновления с MOEX
-        update_btn = QPushButton("🔄 Обновить с сайта MOEX")
-        update_btn.clicked.connect(self._update_from_moex)
-        form.addRow("", update_btn)
-        
-        # Дата последнего обновления
-        self.last_update_label = QLabel()
-        self.last_update_label.setStyleSheet("color: gray; font-size: 11px;")
-        form.addRow("Последнее обновление:", self.last_update_label)
         
         return group
     
@@ -434,13 +422,7 @@ class CommissionSettingsWidget(QWidget):
             combo.setCurrentText(inst_type)
             self.manual_table.setCellWidget(i, 1, combo)
         
-        # Обновляем дату последнего обновления
-        last_update = config.get("last_moex_update", "Неизвестно")
-        days = commission_manager.days_since_update()
-        if days is not None:
-            self.last_update_label.setText(f"{last_update} ({days} дн. назад)")
-        else:
-            self.last_update_label.setText(last_update)
+
     
     def _save_settings(self):
         """Сохраняет настройки."""
@@ -511,40 +493,11 @@ class CommissionSettingsWidget(QWidget):
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
             logger.error(f"[CommissionSettings] Ошибка сохранения: {e}")
     
-    def _update_from_moex(self):
-        """Обновляет ставки с сайта MOEX."""
-        QMessageBox.information(
-            self,
-            "В разработке",
-            "Автоматическое обновление ставок с сайта MOEX будет реализовано в следующей версии.\n\n"
-            "Пока обновляйте ставки вручную."
-        )
+
     
     def _show_preview(self):
         """Показывает диалог предпросмотра расчёта."""
         dialog = CommissionPreviewDialog(parent=self)
         dialog.exec()
     
-    def _check_rates_freshness(self):
-        """Проверяет актуальность ставок MOEX и показывает предупреждение при необходимости."""
-        age = moex_commission_fetcher.get_cache_age()
-        
-        if age is None:
-            # Кэш отсутствует - первый запуск
-            logger.info("[CommissionSettings] Кэш ставок MOEX отсутствует (первый запуск)")
-            return
-        
-        if moex_commission_fetcher.is_cache_outdated():
-            days = age.days
-            hours = age.seconds // 3600
-            
-            msg = (
-                f"⚠️ Ставки комиссий MOEX могли устареть\n\n"
-                f"Последнее обновление: {days} дн. {hours} ч. назад\n\n"
-                f"Рекомендуется проверить актуальность ставок на сайте MOEX:\n"
-                f"https://www.moex.com/ru/tariffs/\n\n"
-                f"При необходимости обновите ставки вручную в настройках."
-            )
-            
-            QMessageBox.warning(self, "Устаревшие ставки", msg)
-            logger.warning(f"[CommissionSettings] Ставки MOEX устарели (возраст: {age})")
+

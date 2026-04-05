@@ -44,6 +44,12 @@ def main():
 
     DATA_DIR.mkdir(exist_ok=True)
 
+    # Recovery: удаляем orphan .tmp файлы от предыдущего аварийного завершения
+    from core.storage import cleanup_orphan_tmp
+    cleanup_orphan_tmp()
+    from core.chart_cache import cleanup_tmp_files
+    cleanup_tmp_files()
+
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtGui import QIcon
     app = QApplication(sys.argv)
@@ -86,6 +92,12 @@ def main():
         try:
             from core.autostart import stop_engine_watchdog
             stop_engine_watchdog()
+        except Exception:
+            pass
+        # Останавливаем Telegram notifier
+        try:
+            from core.telegram_bot import get_notifier
+            get_notifier().stop()
         except Exception:
             pass
 

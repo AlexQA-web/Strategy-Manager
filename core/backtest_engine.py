@@ -11,6 +11,7 @@ from core.txt_loader import Bar, TXTLoader
 from core.commission_manager import commission_manager
 from core.moex_api import MOEXClient
 from core.instrument_classifier import instrument_classifier
+from config.settings import DEFAULT_STRATEGY_LOOKBACK
 
 
 @dataclass
@@ -115,11 +116,17 @@ class BacktestEngine:
         equity_curve: list[tuple[datetime, float]] = []
         cumulative_pnl = 0.0
 
-        # Стратегия определяет lookback через get_lookback(params), иначе — вся история
+        # Стратегия определяет lookback через get_lookback(params), иначе — default
         if callable(getattr(module, "get_lookback", None)):
-            lookback = module.get_lookback(params)
+            try:
+                lookback = module.get_lookback(params)
+            except Exception as e:
+                logger.warning(
+                    f"get_lookback() failed: {e}, using default={DEFAULT_STRATEGY_LOOKBACK}"
+                )
+                lookback = DEFAULT_STRATEGY_LOOKBACK
         else:
-            lookback = 0  # 0 = передавать всю историю
+            lookback = DEFAULT_STRATEGY_LOOKBACK
 
         for i in range(len(bars) - 1):
             if self.stop_flag():

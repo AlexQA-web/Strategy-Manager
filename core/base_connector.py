@@ -2,26 +2,24 @@ from abc import ABC, abstractmethod
 import threading
 import time
 import math
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
+
+# Общие типы для side / action / order_type
+Side = Literal["buy", "sell"]
+Action = Literal["buy", "sell", "close"]
+OrderType = Literal["market", "limit"]
+OrderMode = Literal["market", "limit", "limit_price", "limit_book"]
 from loguru import logger
-
-
-# Sentinel-объекты для определения типа события в _fire
-_CONNECT_SENTINEL = object()
-_DISCONNECT_SENTINEL = object()
-_RECONNECT_SENTINEL = object()
-_ERROR_SENTINEL = object()
-_POSITIONS_SENTINEL = object()
 
 
 class BaseConnector(ABC):
 
     def __init__(self):
-        self._on_connect: Optional[Callable] = _CONNECT_SENTINEL
-        self._on_disconnect: Optional[Callable] = _DISCONNECT_SENTINEL
-        self._on_reconnect: Optional[Callable] = _RECONNECT_SENTINEL
-        self._on_error: Optional[Callable] = _ERROR_SENTINEL
-        self._on_positions_update: Optional[Callable] = _POSITIONS_SENTINEL
+        self._on_connect: Optional[Callable] = None
+        self._on_disconnect: Optional[Callable] = None
+        self._on_reconnect: Optional[Callable] = None
+        self._on_error: Optional[Callable] = None
+        self._on_positions_update: Optional[Callable] = None
         self._connect_listeners: list[Callable] = []
         self._disconnect_listeners: list[Callable] = []
         self._reconnect_listeners: list[Callable] = []
@@ -30,6 +28,8 @@ class BaseConnector(ABC):
         self._reconnect_attempts: int  = 5
         self._reconnect_delay:    int  = 5   # базовая задержка (секунд)
         self._stop_reconnect = threading.Event()
+        self._health_check_event = threading.Event()
+        self._health_check_interval: int = 300  # периодическая глубокая проверка (секунд)
 
     # ── Обязательный интерфейс ──────────────────────────────────────────
 
@@ -51,9 +51,9 @@ class BaseConnector(ABC):
         self,
         account_id: str,
         ticker: str,
-        side: str,          # "buy" | "sell"
+        side: Side,
         quantity: int,
-        order_type: str,    # "market" | "limit"
+        order_type: OrderType,
         price: float = 0.0,
         board: str = "TQBR",
         agent_name: str = "",
@@ -104,7 +104,20 @@ class BaseConnector(ABC):
         ticker: str,
         quantity: int = 0,
         agent_name: str = "",
-    ) -> Optional[str]: ...
+    ) -> Optional[str]:
+        """Закрыть позицию по рыночной цене.
+
+        Канонический контракт:
+        - Определяет сторону (buy/sell) автоматически по текущей позиции.
+        - quantity=0 → закрыть всю позицию целиком.
+        - 0 < quantity <= abs(текущая позиция) → закрыть указанное кол-во лотов.
+        - Если позиция не найдена или нулевая — возвращает None (не ошибка).
+
+        Возвращает:
+            str — transaction_id размещённого ордера при успешной отправке.
+            None — позиция не найдена / ордер не принят.
+        """
+        ...
 
     def chase_order(
         self,
@@ -123,6 +136,22 @@ class BaseConnector(ABC):
         self._reconnect_attempts = attempts
         self._reconnect_delay    = delay
 
+    def request_health_check(self):
+        """Запросить немедленную проверку соединения из reconnect-loop.
+
+        Вызывать из путей обработки ошибок операций (place_order, get_history
+        и т.д.), чтобы не ждать следующего цикла опроса.
+        """
+        self._health_check_event.set()
+
+    def health_check(self) -> bool:
+        """Глубокая проверка соединения.
+
+        По умолчанию делегирует is_connected(). Подклассы переопределяют
+        для более надёжной проверки (ping, lightweight request и т.д.).
+        """
+        return self.is_connected()
+
     def _fire_event(self, event_type: str, *args):
         """Безопасный вызов колбэка + всех подписчиков по типу события."""
         mapping = {
@@ -133,7 +162,7 @@ class BaseConnector(ABC):
             'positions': (self._on_positions_update, self._positions_listeners),
         }
         cb, listeners = mapping.get(event_type, (None, []))
-        if cb:
+        if callable(cb):
             try:
                 cb(*args)
             except Exception as e:
@@ -146,22 +175,22 @@ class BaseConnector(ABC):
 
     def _fire(self, cb: Optional[Callable], *args):
         """Безопасный вызов колбэка + всех подписчиков (обратная совместимость)."""
-        if cb and not isinstance(cb, type):
+        if callable(cb):
             try:
                 cb(*args)
             except Exception as e:
                 logger.error(f"[{self.__class__.__name__}] callback error: {e}")
-        # Вызываем соответствующие списки слушателей по sentinel-объектам
+        # Вызываем соответствующие списки слушателей по типу колбэка
         listeners: list[Callable] = []
-        if cb is _CONNECT_SENTINEL or cb is self._on_connect:
+        if cb is self._on_connect:
             listeners = list(self._connect_listeners)
-        elif cb is _DISCONNECT_SENTINEL or cb is self._on_disconnect:
+        elif cb is self._on_disconnect:
             listeners = list(self._disconnect_listeners)
-        elif cb is _RECONNECT_SENTINEL or cb is self._on_reconnect:
+        elif cb is self._on_reconnect:
             listeners = list(self._reconnect_listeners)
-        elif cb is _ERROR_SENTINEL or cb is self._on_error:
+        elif cb is self._on_error:
             listeners = list(self._error_listeners)
-        elif cb is _POSITIONS_SENTINEL or cb is self._on_positions_update:
+        elif cb is self._on_positions_update:
             listeners = list(self._positions_listeners)
 
         for listener in listeners:
@@ -210,9 +239,6 @@ class BaseConnector(ABC):
     def subscribe_error(self, callback: Callable[[str], None]):
         if callback not in self._error_listeners:
             self._error_listeners.append(callback)
-            # Устанавливаем dummy callback чтобы _fire мог определить тип события
-            if self._on_error is None:
-                self._on_error = lambda msg: None
 
     def unsubscribe_error(self, callback: Callable[[str], None]):
         self._error_listeners = [cb for cb in self._error_listeners if cb is not callback]
@@ -220,9 +246,6 @@ class BaseConnector(ABC):
     def subscribe_positions(self, callback: Callable[[], None]):
         if callback not in self._positions_listeners:
             self._positions_listeners.append(callback)
-            # Устанавливаем dummy callback чтобы _fire мог определить тип события
-            if self._on_positions_update is None:
-                self._on_positions_update = lambda: None
 
     def unsubscribe_positions(self, callback: Callable[[], None]):
         self._positions_listeners = [cb for cb in self._positions_listeners if cb is not callback]
@@ -252,6 +275,13 @@ class BaseConnector(ABC):
         )
         self._reconnect_thread.start()
 
+    def _on_reconnect_success(self):
+        """Hook: вызывается после успешного переподключения.
+
+        Подклассы переопределяют для force-check ордеров и прочих действий.
+        """
+        pass
+
     def _reconnect_loop(self):
         from loguru import logger
         from core.scheduler import is_in_schedule
@@ -259,9 +289,30 @@ class BaseConnector(ABC):
         name = self.__class__.__name__
         connector_id = name.removesuffix('Connector').lower()
         attempt = 0
+        last_deep_check = time.time()
+
         while not self._stop_reconnect.is_set():
-            time.sleep(2)
-            if self.is_connected():
+            # Ждём polling-интервал, stop-сигнал или принудительную проверку
+            self._health_check_event.wait(timeout=2)
+            forced = self._health_check_event.is_set()
+            self._health_check_event.clear()
+
+            if self._stop_reconnect.is_set():
+                break
+
+            now = time.time()
+            connected = self.is_connected()
+
+            # Периодическая глубокая проверка даже если is_connected() == True
+            if connected and (now - last_deep_check >= self._health_check_interval or forced):
+                reason = "forced" if forced else "periodic"
+                if not self.health_check():
+                    logger.warning(f"[{name}] Глубокая проверка ({reason}) выявила обрыв соединения")
+                    connected = False
+                else:
+                    last_deep_check = now
+
+            if connected:
                 attempt = 0
                 continue
 
@@ -273,19 +324,36 @@ class BaseConnector(ABC):
                 continue
 
             if attempt >= self._reconnect_attempts:
-                logger.error(f"[{name}] Исчерпаны попытки переподключения")
+                logger.error(
+                    f"[{name}] Исчерпаны попытки переподключения ({attempt}), cooldown 120с"
+                )
                 self._fire_event(
                     'error',
-                    f"Не удалось переподключиться после {attempt} попыток"
+                    f"Не удалось переподключиться после {attempt} попыток, ожидаем cooldown"
                 )
-                break
+                self._stop_reconnect.wait(120)
+                if self._stop_reconnect.is_set():
+                    break
+                attempt = 0
+                logger.info(f"[{name}] Cooldown завершён, сбрасываем счётчик попыток")
+                continue
+
             attempt += 1
-            logger.info(f"[{name}] Переподключение {attempt}/{self._reconnect_attempts}…")
+            reason = "health-check fail" if forced else "polling detected disconnect"
+            logger.info(
+                f"[{name}] Переподключение {attempt}/{self._reconnect_attempts} "
+                f"(причина: {reason})…"
+            )
             try:
                 self.connect()
                 if self.is_connected():
                     logger.info(f"[{name}] Успешное переподключение")
                     self._fire_event('reconnect')
+                    last_deep_check = time.time()
+                    try:
+                        self._on_reconnect_success()
+                    except Exception as e:
+                        logger.warning(f"[{name}] _on_reconnect_success error: {e}")
             except Exception as e:
                 logger.error(f"[{name}] Исключение при connect(): {e}")
             if not self.is_connected():

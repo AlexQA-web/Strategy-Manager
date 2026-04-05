@@ -14,47 +14,73 @@ order_mode: limit_book (bid/ask ± offset) | limit_price (last price).
 
 from loguru import logger
 
-# ── Состояние (сбрасывается в on_start и каждый день) ────────────────────────
-# NOTE: Добавлен threading.Lock для защиты от race condition при одновременном
-# доступе из poll-loop и chase-потоков
+# Явная adapter-декларация: стратегия использует зарегистрированный
+# custom execution adapter для управления корзиной инструментов.
+__execution_adapter__ = "achilles-basket"
+
+# ── Контекст стратегии (инкапсулирует всё mutable state) ─────────────────────
 import threading
-_state_lock = threading.Lock()
-
-# Реестр состояний: {strategy_id: {...}}
-_agent_states: dict[str, dict] = {}
-_agent_states_lock = threading.Lock()
 
 
-def _get_state(strategy_id: str) -> dict:
-    """Возвращает состояние конкретного агента."""
-    with _agent_states_lock:
-        if strategy_id not in _agent_states:
-            _agent_states[strategy_id] = {
-                "reference_prices": {},
-                "positions": {},
-                "pending_orders": {},
-                "snapshot_done": False,
-                "signal_done": False,
-                "close_done": False,
-            }
-        return _agent_states[strategy_id]
+class AchillesContext:
+    """Контекст одного экземпляра стратегии Achilles.
+
+    Инкапсулирует всё mutable state и собственный lock.
+    Создаётся через get_context() при первом обращении.
+    """
+
+    _registry: dict[str, "AchillesContext"] = {}
+    _registry_lock = threading.Lock()
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.reference_prices: dict[str, float] = {}
+        self.positions: dict[str, dict] = {}
+        self.pending_orders: dict[str, dict] = {}
+        self.snapshot_done: bool = False
+        self.signal_done: bool = False
+        self.close_done: bool = False
+
+    def reset(self):
+        with self.lock:
+            self.reference_prices.clear()
+            self.positions.clear()
+            self.pending_orders.clear()
+            self.snapshot_done = False
+            self.signal_done = False
+            self.close_done = False
+
+    @classmethod
+    def get(cls, strategy_id: str) -> "AchillesContext":
+        """Возвращает контекст для strategy_id, создаёт при первом обращении."""
+        with cls._registry_lock:
+            if strategy_id not in cls._registry:
+                cls._registry[strategy_id] = AchillesContext()
+            return cls._registry[strategy_id]
+
+    @classmethod
+    def remove(cls, strategy_id: str):
+        with cls._registry_lock:
+            cls._registry.pop(strategy_id, None)
+
+    @classmethod
+    def clear_all(cls):
+        with cls._registry_lock:
+            cls._registry.clear()
+
+
+def _get_state(strategy_id: str) -> AchillesContext:
+    """Возвращает контекст конкретного агента."""
+    return AchillesContext.get(strategy_id)
 
 
 def reset_state(strategy_id: str = ""):
     """Сбрасывает состояние конкретного агента."""
-    with _agent_states_lock:
-        if strategy_id:
-            _agent_states[strategy_id] = {
-                "reference_prices": {},
-                "positions": {},
-                "pending_orders": {},
-                "snapshot_done": False,
-                "signal_done": False,
-                "close_done": False,
-            }
-        else:
-            # Обратная совместимость — если strategy_id не передан, очищаем всё
-            _agent_states.clear()
+    if strategy_id:
+        ctx = AchillesContext.get(strategy_id)
+        ctx.reset()
+    else:
+        AchillesContext.clear_all()
 
 
 def get_info() -> dict:
@@ -170,7 +196,7 @@ def on_tick(tick_data: dict, params: dict, connector) -> None:
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     strategy_id = params.get("_strategy_id", "default")
-    state = _get_state(strategy_id)
+    ctx = _get_state(strategy_id)
 
     if not bars:
         return {"action": None}
@@ -187,24 +213,24 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     time_close     = int(params.get("time_close",     960))
     time_emergency = int(params.get("time_emergency", 1110))
 
-    with _state_lock:
+    with ctx.lock:
         # Сброс флагов в начале нового дня
         if time_min < time_snapshot:
-            state["snapshot_done"] = False
-            state["signal_done"]   = False
-            state["close_done"]    = False
+            ctx.snapshot_done = False
+            ctx.signal_done   = False
+            ctx.close_done    = False
 
-        if time_min >= time_snapshot and not state["snapshot_done"]:
-            state["snapshot_done"] = True
+        if time_min >= time_snapshot and not ctx.snapshot_done:
+            ctx.snapshot_done = True
             return {"action": "snapshot"}
 
-        if time_min >= time_signal and not state["signal_done"] and state["snapshot_done"]:
-            state["signal_done"] = True
+        if time_min >= time_signal and not ctx.signal_done and ctx.snapshot_done:
+            ctx.signal_done = True
             return {"action": "signal"}
 
-        has_open_positions = any(pos.get("status", "open") == "open" for pos in state["positions"].values())
+        has_open_positions = any(pos.get("status", "open") == "open" for pos in ctx.positions.values())
 
-        if time_min >= time_close and not state["close_done"] and has_open_positions:
+        if time_min >= time_close and not ctx.close_done and has_open_positions:
             return {"action": "close_limit"}
 
         if time_min >= time_emergency and has_open_positions:
@@ -217,7 +243,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
 
 def execute_signal(signal: dict, connector, params: dict, account_id: str):
     strategy_id = params.get("_strategy_id", "default")
-    state = _get_state(strategy_id)
+    ctx = _get_state(strategy_id)
     action = signal.get("action")
     if action == "snapshot":
         _do_snapshot(connector, params, strategy_id)
@@ -225,8 +251,8 @@ def execute_signal(signal: dict, connector, params: dict, account_id: str):
         _do_signal(connector, params, account_id, strategy_id)
     elif action == "close_limit":
         _do_close_limit(connector, params, account_id, strategy_id)
-        with _state_lock:
-            state["close_done"] = True
+        with ctx.lock:
+            ctx.close_done = True
     elif action == "close_market":
         _do_close_market(connector, params, account_id, strategy_id)
 
@@ -285,7 +311,7 @@ def _calc_qty(connector, account_id: str, board: str, ticker: str,
         return qty
 
 
-def _record_trade(
+def _record_fill(
     ticker: str,
     board: str,
     side: str,
@@ -295,17 +321,16 @@ def _record_trade(
     strategy_id: str,
     connector_id: str,
     comment: str = "",
-    order_ref: str = "",
+    fill_id: str = "",
 ):
-    """Записывает исполненную сделку в order_history.json и trades_history.json.
+    """Записывает исполненную сделку через canonical FillLedger.
 
-    Зеркалит логику LiveEngine._record_trade():
-      - комиссия рассчитывается через commission_manager.calculate() (авто-режим)
-      - point_cost=1.0 (Ахиллес торгует только акции TQBR)
+    Комиссия рассчитывается через commission_manager.calculate() (авто-режим).
     """
     if qty <= 0 or price <= 0:
         return
     point_cost = 1.0
+    commission_rub = 0.0
     try:
         from core.commission_manager import commission_manager
         commission_rub = commission_manager.calculate(
@@ -318,77 +343,62 @@ def _record_trade(
             connector_id=connector_id or "transaq",
         )
     except Exception as e:
-        logger.warning(f"[Achilles] _record_trade комиссия {ticker}: {e}")
-        commission_rub = 0.0
+        logger.warning(f"[Achilles] _record_fill комиссия {ticker}: {e}")
 
     commission_per_lot = commission_rub / qty if qty > 0 else commission_rub
 
-    logger.info(
-        f"[Achilles] Запись сделки: {side.upper()} {ticker}x{qty} @{price:.4f} "
-        f"role={order_role} комиссия={commission_rub:.4f} руб "
-        f"({commission_per_lot:.4f} руб/лот)"
-    )
+    if not fill_id:
+        import time as _time_mod
+        fill_id = f"achilles:{strategy_id}:{ticker}:{side}:{int(_time_mod.time() * 1000)}"
 
     try:
-        from core.order_history import make_order, save_order
-        order = make_order(
+        from core.fill_ledger import fill_ledger
+        from core.valuation_service import valuation_service
+
+        pnl_mult = valuation_service.get_pnl_multiplier(
+            is_futures=(board == "SPBFUT"),
+            point_cost=point_cost,
+            lot_size=1,
+        )
+
+        fill_ledger.record_fill(
+            fill_id=fill_id,
             strategy_id=strategy_id,
             ticker=ticker,
-            side=side,
-            quantity=qty,
-            price=price,
             board=board,
+            side=side,
+            qty=qty,
+            price=price,
+            agent_name="Achilles",
             comment=comment,
-            commission=commission_per_lot,
+            order_type="market" if order_role == "taker" else "limit",
+            commission_per_lot=commission_per_lot,
             commission_total=commission_rub,
             point_cost=point_cost,
-            exec_key=(
-                f"achilles:{strategy_id}:{ticker}:{order_role}:{order_ref}:{side}:{qty}:{round(float(price), 8)}"
-                if order_ref else ""
-            ),
-            source="achilles_execute_signal",
+            pnl_multiplier=pnl_mult,
+            source="achilles",
         )
-        save_order(order)
     except Exception as e:
-        logger.warning(f"[Achilles] _record_trade (order_history) {ticker}: {e}")
-
-    try:
-        from datetime import datetime as _dt_now
-        from core.storage import append_trade
-        trade = {
-            "strategy_id": strategy_id,
-            "agent_name":  "Achilles",
-            "ticker":      ticker,
-            "board":       board,
-            "side":        side,
-            "qty":         qty,
-            "price":       price,
-            "commission":  commission_rub,
-            "order_type":  "market" if order_role == "taker" else "limit",
-            "comment":     comment,
-            "dt":          _dt_now.now().isoformat(),
-        }
-        append_trade(trade)
-    except Exception as e:
-        logger.warning(f"[Achilles] _record_trade (storage) {ticker}: {e}")
+        logger.error(f"[Achilles] _record_fill {ticker}: {e}")
 
 
 def _place(connector, account_id: str, board: str, ticker: str,
            side: str, qty: int, order_mode: str,
            spread_offset: float, agent_name: str = "Achilles",
            strategy_id: str = "", connector_id: str = "",
-           is_close: bool = False) -> bool:
+        is_close: bool = False, params: dict | None = None) -> bool:
     """Выставляет заявку через OrderPlacer с управлением состоянием."""
     from core.order_placer import OrderPlacer
 
-    state = _get_state(strategy_id) if strategy_id else None
+    ctx = _get_state(strategy_id) if strategy_id else None
     placer = OrderPlacer(connector, agent_name=agent_name)
+    params = params or {}
 
     # ── Проверка дубликатов ордеров (специфично для Achilles) ──
     if order_mode in ('limit_book', 'limit_price'):
-        with _state_lock:
-            if state is not None:
-                pending = state["pending_orders"].get(ticker)
+        if ctx is not None:
+            with ctx.lock:
+                pending = ctx.pending_orders.get(ticker)
                 if pending is not None:
                     logger.warning(
                         f"[Achilles] {ticker}: уже есть активный лимитный ордер "
@@ -397,7 +407,7 @@ def _place(connector, account_id: str, board: str, ticker: str,
                     return False
 
                 if is_close:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is None:
                         logger.warning(f"[Achilles] CLOSE LIMIT {ticker} пропущен: позиции нет")
                         return False
@@ -406,17 +416,17 @@ def _place(connector, account_id: str, board: str, ticker: str,
                         return False
                     current["status"] = "closing"
                 else:
-                    if ticker in state["positions"]:
+                    if ticker in ctx.positions:
                         logger.warning(f"[Achilles] {ticker}: позиция уже существует, повторный вход запрещён")
                         return False
-                    state["positions"][ticker] = {
+                    ctx.positions[ticker] = {
                         "side": side,
                         "qty": int(qty),
                         "board": board,
                         "status": "opening",
                     }
 
-                state["pending_orders"][ticker] = {
+                ctx.pending_orders[ticker] = {
                     "side": side,
                     "qty": int(qty),
                     "board": board,
@@ -425,27 +435,89 @@ def _place(connector, account_id: str, board: str, ticker: str,
                     "is_close": is_close,
                 }
 
+    reservation_key = ""
+    if not is_close:
+        current_price = _get_price(connector, board, ticker)
+
+        risk_check = params.get("_pretrade_risk_check")
+        if callable(risk_check):
+            allowed, reason = risk_check(side, int(qty))
+            if not allowed:
+                logger.warning(
+                    f"[Achilles] RISK REJECT {ticker}: {reason}, {side.upper()} x{qty} отклонён"
+                )
+                if ctx is not None:
+                    with ctx.lock:
+                        ctx.pending_orders.pop(ticker, None)
+                        current = ctx.positions.get(ticker)
+                        if current is not None and current.get("status") == "opening":
+                            ctx.positions.pop(ticker, None)
+                return False
+
+        account_risk_check = params.get("_account_risk_check")
+        if callable(account_risk_check):
+            reject_reason = account_risk_check(
+                side,
+                int(qty),
+                ticker=ticker,
+                board=board,
+                last_price=current_price,
+            )
+            if reject_reason:
+                logger.warning(
+                    f"[Achilles] ACCOUNT RISK REJECT {ticker}: {reject_reason}, "
+                    f"{side.upper()} x{qty} отклонён"
+                )
+                if ctx is not None:
+                    with ctx.lock:
+                        ctx.pending_orders.pop(ticker, None)
+                        current = ctx.positions.get(ticker)
+                        if current is not None and current.get("status") == "opening":
+                            ctx.positions.pop(ticker, None)
+                return False
+
+        reserve_capital = params.get("_reserve_capital")
+        if callable(reserve_capital):
+            reservation_key = reserve_capital(
+                side,
+                int(qty),
+                ticker=ticker,
+                board=board,
+                last_price=current_price,
+            )
+
+    release_capital = params.get("_release_capital")
+
+    def _release_reservation():
+        if reservation_key and callable(release_capital):
+            release_capital(reservation_key)
+
+    _order_tid = [""]
+
     def _on_placed(order_id: str):
-        if state is not None and order_id:
-            state["pending_orders"][ticker] = {
-                **state["pending_orders"].get(ticker, {}),
+        _order_tid[0] = order_id or ""
+        if ctx is not None and order_id:
+            ctx.pending_orders[ticker] = {
+                **ctx.pending_orders.get(ticker, {}),
                 "tid": order_id,
             }
 
     def _on_filled_market(filled_qty: int, avg_price: float):
         """Callback для market-ордеров — запись сделки и обновление состояния."""
+        _release_reservation()
         price = avg_price or _get_price(connector, board, ticker)
         if strategy_id:
-            _record_trade(
+            _record_fill(
                 ticker=ticker, board=board, side=side, qty=qty,
                 price=price, order_role="taker",
                 strategy_id=strategy_id, connector_id=connector_id,
                 comment=f"market filled={filled_qty}",
+                fill_id=_order_tid[0],
             )
-        with _state_lock:
-            if state is not None:
-                state["pending_orders"].pop(ticker, None)
-                state["positions"][ticker] = {
+        if ctx is not None:
+            with ctx.lock:
+                ctx.pending_orders.pop(ticker, None)
+                ctx.positions[ticker] = {
                     "side": side,
                     "qty": int(filled_qty) if filled_qty > 0 else int(qty),
                     "board": board,
@@ -454,30 +526,32 @@ def _place(connector, account_id: str, board: str, ticker: str,
 
     def _on_filled_chase(filled_qty: int, avg_price: float):
         """Callback для chase-ордеров — запись сделки и обновление состояния."""
+        _release_reservation()
         if filled_qty > 0 and strategy_id:
-            _record_trade(
+            _record_fill(
                 ticker=ticker, board=board, side=side,
                 qty=filled_qty, price=avg_price,
                 order_role="maker",
                 strategy_id=strategy_id, connector_id=connector_id,
                 comment=f"limit_book chase avg={avg_price:.4f}",
+                fill_id=_order_tid[0],
             )
-        with _state_lock:
-            if state is not None:
-                state["pending_orders"].pop(ticker, None)
+        if ctx is not None:
+            with ctx.lock:
+                ctx.pending_orders.pop(ticker, None)
                 if is_close:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is not None:
                         remaining_qty = max(int(current.get("qty", qty)) - int(filled_qty), 0)
                         if remaining_qty > 0:
                             current["qty"] = remaining_qty
                             current["status"] = "open"
                         else:
-                            state["positions"].pop(ticker, None)
+                            ctx.positions.pop(ticker, None)
                 else:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is None:
-                        state["positions"][ticker] = {
+                        ctx.positions[ticker] = {
                             "side": side,
                             "qty": int(filled_qty),
                             "board": board,
@@ -491,31 +565,33 @@ def _place(connector, account_id: str, board: str, ticker: str,
 
     def _on_filled_limit_price(filled_qty: int, avg_price: float):
         """Callback для limit_price-ордеров — запись сделки и обновление состояния."""
+        _release_reservation()
         if filled_qty > 0 and strategy_id:
-            _record_trade(
+            _record_fill(
                 ticker=ticker, board=board, side=side,
                 qty=filled_qty, price=avg_price,
                 order_role="maker",
                 strategy_id=strategy_id, connector_id=connector_id,
                 comment=f"limit_price filled={filled_qty}",
+                fill_id=_order_tid[0],
             )
-        with _state_lock:
-            if state is not None:
-                state["pending_orders"].pop(ticker, None)
+        if ctx is not None:
+            with ctx.lock:
+                ctx.pending_orders.pop(ticker, None)
                 if is_close:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is not None:
                         remaining_qty = max(int(current.get("qty", qty)) - int(filled_qty), 0)
                         if remaining_qty > 0:
                             current["qty"] = remaining_qty
                             current["status"] = "open"
                         else:
-                            state["positions"].pop(ticker, None)
+                            ctx.positions.pop(ticker, None)
                 else:
                     if filled_qty > 0:
-                        current = state["positions"].get(ticker)
+                        current = ctx.positions.get(ticker)
                         if current is None:
-                            state["positions"][ticker] = {
+                            ctx.positions[ticker] = {
                                 "side": side,
                                 "qty": int(filled_qty),
                                 "board": board,
@@ -527,56 +603,64 @@ def _place(connector, account_id: str, board: str, ticker: str,
                             current["board"] = board
                             current["status"] = "open"
                     else:
-                        current = state["positions"].get(ticker)
+                        current = ctx.positions.get(ticker)
                         if current is not None and current.get("status") == "opening":
-                            state["positions"].pop(ticker, None)
+                            ctx.positions.pop(ticker, None)
 
     def _on_failed():
         """Callback при неудаче — откат состояния."""
-        with _state_lock:
-            if state is not None:
-                state["pending_orders"].pop(ticker, None)
+        _release_reservation()
+        if ctx is not None:
+            with ctx.lock:
+                ctx.pending_orders.pop(ticker, None)
                 if is_close:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is not None and current.get("status") == "closing":
                         current["status"] = "open"
                 else:
-                    current = state["positions"].get(ticker)
+                    current = ctx.positions.get(ticker)
                     if current is not None and current.get("status") == "opening":
-                        state["positions"].pop(ticker, None)
+                        ctx.positions.pop(ticker, None)
 
     # Выбираем нужный callback в зависимости от режима
-    if order_mode == "market":
-        result = placer.place_with_state(
-            account_id, board, ticker, side, qty,
-            order_mode=order_mode,
-            on_placed=_on_placed,
-            on_filled=_on_filled_market,
-            on_failed=_on_failed,
-        )
-    elif order_mode == "limit_book":
-        result = placer.place_with_state(
-            account_id, board, ticker, side, qty,
-            order_mode=order_mode,
-            on_placed=_on_placed,
-            on_filled=_on_filled_chase,
-            on_failed=_on_failed,
-        )
-    else:  # limit_price
-        result = placer.place_with_state(
-            account_id, board, ticker, side, qty,
-            order_mode=order_mode,
-            on_placed=_on_placed,
-            on_filled=_on_filled_limit_price,
-            on_failed=_on_failed,
-        )
+    try:
+        if order_mode == "market":
+            result = placer.place_with_state(
+                account_id, board, ticker, side, qty,
+                order_mode=order_mode,
+                on_placed=_on_placed,
+                on_filled=_on_filled_market,
+                on_failed=_on_failed,
+            )
+        elif order_mode == "limit_book":
+            result = placer.place_with_state(
+                account_id, board, ticker, side, qty,
+                order_mode=order_mode,
+                on_placed=_on_placed,
+                on_filled=_on_filled_chase,
+                on_failed=_on_failed,
+            )
+        else:  # limit_price
+            result = placer.place_with_state(
+                account_id, board, ticker, side, qty,
+                order_mode=order_mode,
+                on_placed=_on_placed,
+                on_filled=_on_filled_limit_price,
+                on_failed=_on_failed,
+            )
+    except Exception:
+        _release_reservation()
+        raise
+
+    if not result.success:
+        _release_reservation()
 
     return result.success
 
 
 def _do_snapshot(connector, params: dict, strategy_id: str):
     """Фиксируем референсные цены."""
-    state = _get_state(strategy_id)
+    ctx = _get_state(strategy_id)
     instruments = _get_instruments(params)
     new_prices = {}
     for instr in instruments:
@@ -588,18 +672,18 @@ def _do_snapshot(connector, params: dict, strategy_id: str):
             logger.info(f"[Achilles] Снимок {ticker}: {price}")
         else:
             logger.warning(f"[Achilles] Снимок {ticker}: нет цены")
-    with _state_lock:
-        state["reference_prices"] = new_prices
+    with ctx.lock:
+        ctx.reference_prices = new_prices
 
 
 def _do_signal(connector, params: dict, account_id: str, strategy_id: str):
     """Считаем % изменение, входим в топ-рост и топ-падение."""
-    state = _get_state(strategy_id)
-    with _state_lock:
-        if not state["reference_prices"]:
+    ctx = _get_state(strategy_id)
+    with ctx.lock:
+        if not ctx.reference_prices:
             logger.warning("[Achilles] Нет референсных цен, сигнал пропущен")
             return
-        ref_copy = dict(state["reference_prices"])
+        ref_copy = dict(ctx.reference_prices)
 
     instruments    = _get_instruments(params)
     qty            = int(params.get("qty", 1))
@@ -644,11 +728,12 @@ def _do_signal(connector, params: dict, account_id: str, strategy_id: str):
             actual_qty = _calc_qty(connector, account_id, board, ticker, "buy", params)
             ok = _place(connector, account_id, board, ticker, "buy", actual_qty,
                         order_mode, spread_offset,
-                        strategy_id=strategy_id, connector_id=connector_id)
+                        strategy_id=strategy_id, connector_id=connector_id,
+                        params=params)
             if ok:
                 if order_mode == "market":
-                    with _state_lock:
-                        state["positions"][ticker] = {"side": "buy", "qty": actual_qty, "board": board, "status": "open"}
+                    with ctx.lock:
+                        ctx.positions[ticker] = {"side": "buy", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] BUY {ticker} (+{pct:.2f}%) qty={actual_qty} "
                     f"порог={long_percent:.2f}%"
@@ -674,11 +759,12 @@ def _do_signal(connector, params: dict, account_id: str, strategy_id: str):
             actual_qty = _calc_qty(connector, account_id, board, ticker, "sell", params)
             ok = _place(connector, account_id, board, ticker, "sell", actual_qty,
                         order_mode, spread_offset,
-                        strategy_id=strategy_id, connector_id=connector_id)
+                        strategy_id=strategy_id, connector_id=connector_id,
+                        params=params)
             if ok:
                 if order_mode == "market":
-                    with _state_lock:
-                        state["positions"][ticker] = {"side": "sell", "qty": actual_qty, "board": board, "status": "open"}
+                    with ctx.lock:
+                        ctx.positions[ticker] = {"side": "sell", "qty": actual_qty, "board": board, "status": "open"}
                 logger.info(
                     f"[Achilles] SELL {ticker} ({pct:.2f}%) qty={actual_qty} "
                     f"порог={short_percent:.2f}%"
@@ -694,13 +780,13 @@ def _do_signal(connector, params: dict, account_id: str, strategy_id: str):
 
 def _do_close_limit(connector, params: dict, account_id: str, strategy_id: str):
     """Плановое закрытие лимитками."""
-    state = _get_state(strategy_id)
+    ctx = _get_state(strategy_id)
     order_mode    = params.get("order_mode", "limit_book")
     spread_offset = float(params.get("spread_offset", 2.0))
     connector_id  = params.get("_connector_id", "")
 
-    with _state_lock:
-        positions_snapshot = list(state["positions"].items())
+    with ctx.lock:
+        positions_snapshot = list(ctx.positions.items())
 
     for ticker, pos in positions_snapshot:
         if pos.get("status", "open") != "open":
@@ -711,51 +797,54 @@ def _do_close_limit(connector, params: dict, account_id: str, strategy_id: str):
         ok = _place(connector, account_id, board, ticker, close_side, qty,
                     order_mode, spread_offset,
                     strategy_id=strategy_id, connector_id=connector_id,
-                    is_close=True)
+                    is_close=True, params=params)
         if ok:
             logger.info(f"[Achilles] CLOSE LIMIT {ticker}")
-            with _state_lock:
-                if ticker in state["positions"] and order_mode == "market":
-                    state["positions"].pop(ticker, None)
+            with ctx.lock:
+                if ticker in ctx.positions and order_mode == "market":
+                    ctx.positions.pop(ticker, None)
 
 
 def _do_close_market(connector, params: dict, account_id: str, strategy_id: str):
     """Аварийное закрытие рыночными ордерами."""
-    state = _get_state(strategy_id)
+    from core.order_placer import OrderPlacer
+
+    ctx = _get_state(strategy_id)
     connector_id = params.get("_connector_id", "")
+    placer = OrderPlacer(connector, agent_name="Achilles")
     # Закрываем ВСЕ позиции, включая те что уже в статусе "closing"
-    with _state_lock:
-        positions_snapshot = list(state["positions"].items())
+    with ctx.lock:
+        positions_snapshot = list(ctx.positions.items())
 
     for ticker, pos in positions_snapshot:
         board      = pos.get("board", "TQBR")
         qty        = pos["qty"]
         close_side = "sell" if pos["side"] == "buy" else "buy"
         try:
-            tid = connector.place_order(
+            result = placer.place_market(
                 account_id=account_id,
+                board=board,
                 ticker=ticker,
                 side=close_side,
-                quantity=qty,
-                order_type="market",
-                board=board,
-                agent_name="Achilles",
+                qty=qty,
+                comment=f"close_market {ticker}",
             )
-            if tid:
+            if result.success:
+                tid = result.order_id or ""
                 logger.info(f"[Achilles] CLOSE MARKET {ticker} tid={tid}")
                 if strategy_id:
                     price = _get_price(connector, board, ticker)
-                    _record_trade(
+                    _record_fill(
                         ticker=ticker, board=board, side=close_side, qty=qty,
                         price=price, order_role="taker",
                         strategy_id=strategy_id, connector_id=connector_id,
                         comment=f"close_market tid={tid}",
-                        order_ref=str(tid),
+                        fill_id=tid,
                     )
-                with _state_lock:
-                    state["pending_orders"].pop(ticker, None)
-                    state["positions"].pop(ticker, None)
+                with ctx.lock:
+                    ctx.pending_orders.pop(ticker, None)
+                    ctx.positions.pop(ticker, None)
             else:
-                logger.error(f"[Achilles] CLOSE MARKET {ticker} — не удалось")
+                logger.error(f"[Achilles] CLOSE MARKET {ticker} — не удалось: {result.error}")
         except Exception as e:
             logger.error(f"[Achilles] CLOSE MARKET {ticker}: {e}")

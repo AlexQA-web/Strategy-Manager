@@ -127,6 +127,7 @@ class ChaseOrder:
         Нужен после cancel_order() чтобы дождаться финальных fills.
         """
         deadline = time.monotonic() + timeout
+        delay = 0.05  # начинаем с 50ms
         while time.monotonic() < deadline:
             try:
                 info = self._connector.get_order_status(tid)
@@ -136,7 +137,8 @@ class ChaseOrder:
                         return status
             except Exception:
                 pass
-            time.sleep(0.05)
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.3)  # backoff до 300ms
         return "unknown"
 
     def _get_target_price(self) -> Optional[float]:
@@ -177,49 +179,6 @@ class ChaseOrder:
         except Exception as e:
             logger.warning(f"[Chase] get_best_quote error: {e}")
             return None
-
-    def _check_liquidity(self, price: float, qty: int) -> bool:
-        """
-        Проверяет достаточность ликвидности на уровне цены.
-        
-        Args:
-            price: Целевая цена для размещения ордера
-            qty: Требуемый объём в лотах
-            
-        Returns:
-            True если проверка пройдена или стакан недоступен (не блокируем)
-            False не используется - метод только логирует warning
-        """
-        try:
-            book = self._connector.get_order_book(self._board, self._ticker)
-            if not book:
-                # Стакан недоступен - не блокируем ордер
-                return True
-            
-            levels = book.get('bids' if self._side == "buy" else 'asks', [])
-            if not levels:
-                return True
-            
-            # Проверяем первый уровень (лучшая цена)
-            best_price, best_volume = levels[0]
-            
-            # Порог 80% от требуемого объёма
-            threshold = qty * 0.8
-            
-            if best_volume >= threshold:
-                return True
-            
-            # Логируем warning о недостаточной ликвидности
-            logger.warning(
-                f"[ChaseOrder] Недостаточная ликвидность для {self._ticker}: "
-                f"требуется {qty} лотов, доступно {best_volume:.0f} лотов на уровне {best_price}"
-            )
-            
-        except Exception as e:
-            logger.debug(f"[ChaseOrder] _check_liquidity error: {e}")
-        
-        # Всегда возвращаем True - проверка информативная, не блокирующая
-        return True
 
     def _place(self, price: float, qty: int) -> Optional[str]:
         """Выставляет лимитную заявку. Возвращает tid или None."""
@@ -327,9 +286,6 @@ class ChaseOrder:
                 remaining = self.remaining_qty
                 if remaining <= 0:
                     break
-
-                # Проверяем ликвидность перед размещением ордера
-                self._check_liquidity(target_price, remaining)
 
                 tid = self._place(target_price, remaining)
                 if tid:

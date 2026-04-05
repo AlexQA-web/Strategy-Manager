@@ -32,6 +32,10 @@ POSITIONS_REFRESH_INTERVAL = 5
 # Используется для автоматического снятия лимитных ордеров перед клирингом
 TRADING_END_TIME_MIN = 1425
 
+# Дефолтный lookback (баров) для стратегий без get_lookback() или при ошибке.
+# Используется и в LiveEngine, и в BacktestEngine.
+DEFAULT_STRATEGY_LOOKBACK = 300
+
 # Комиссии брокера для расчета PnL
 # Комиссия за лот фьючерса в рублях (абсолютное значение за открытие/закрытие позиции)
 COMMISSION_FUTURES = 2.0

@@ -155,3 +155,99 @@
 - Торговые данные имеют нерегулярные gaps (18:50–19:00 клиринг, 23:50–00:00 ночной)
 - Числовой индекс = плотный график без разрывов, как в торговых терминалах
 - `DateAxisItem` кастомно переводит индекс → дату/время для отображения на оси
+
+---
+
+## 11. Почему единый ValuationService, а не локальные формулы
+
+**Контекст:** PnL, комиссии и equity рассчитывались в нескольких местах (LiveEngine, TradeRecorder, OrderHistory).
+
+**Решение:** `core/valuation_service.py` — единственный модуль с денежными формулами.
+
+**Причины:**
+- Локальные формулы расходились: LiveEngine считал unrealized PnL через `point_cost`, а OrderHistory — через `lot_size` для акций
+- Разнящиеся множители приводили к тому, что UI, risk и ledger показывали разные цифры
+- Единый `get_pnl_multiplier()` гарантирует одинаковый множитель во всех слоях
+- Все потребители вызывают `compute_open_pnl`, `compute_closed_pnl`, `compute_equity_snapshot`
+
+**Не добавлять** локальные `(price - entry) * qty * ...` формулы за пределами ValuationService.
+
+---
+
+## 12. Почему FillLedger, а не прямая запись в order_history и trades_history
+
+**Контекст:** Fills приходят из коннектора (callback) и из order monitoring (polling).
+
+**Решение:** `core/fill_ledger.py` — canonical source of truth для исполнений.
+
+**Причины:**
+- order_history и trades_history дублировали факт исполнения и расходились при partial failure
+- Дедупликация по `fill_id` в одном месте исключает двойную запись поздних fills
+- Атомарная проекция: save_order → append_trade из одного вызова record_fill
+- order_history и trades_history остались как производные представления для обратной совместимости
+
+**Не записывать** fills напрямую в order_history или trades_history — только через FillLedger.
+
+---
+
+## 13. Почему ReservationLedger для buying power, а не snapshot free_money
+
+**Контекст:** Несколько стратегий на одном счёте одновременно рассчитывают размер позиции.
+
+**Решение:** `core/reservation_ledger.py` — потокобезопасный учёт зарезервированного капитала.
+
+**Причины:**
+- Без резервирования две стратегии могут одновременно посчитать, что им доступна одинаковая сумма
+- Контракт: reserve before submit, release on fill/cancel/reject/timeout
+- Stale eviction (default 5 мин) защищает от утечек при потере событий
+- `available(account_id, gross_free)` = gross_free − total_reserved, never < 0
+
+**Не использовать** `connector.get_free_money()` напрямую для sizing — только через ReservationLedger.
+
+---
+
+## 14. Почему матрица переходов позиции вместо свободного update
+
+**Контекст:** PositionTracker управлял позицией без формальных ограничений переходов.
+
+**Решение:** Явная матрица: flat→long, flat→short, long→flat, short→flat, partial close. Flip и scale-in запрещены.
+
+**Причины:**
+- Неявные перевороты (flip) через повторные close/open создавали гонки в параллельных потоках
+- Scale-in без явной поддержки ломал среднюю цену входа и PnL-расчёт
+- `confirm_open()` — trade path с проверкой; `update_position()` — sync path без ограничений (для reconcile)
+- flip требует явное закрытие, затем новое открытие на следующем баре
+
+**Не добавлять** flip/scale-in без обновления state machine, PnL-калькулятора и regression tests.
+
+---
+
+## 15. Почему pre-trade risk gate и circuit breaker на уровне OrderExecutor
+
+**Контекст:** RiskGuard проверял лимиты, но не стоял на пути реальной отправки ордера.
+
+**Решение:** Обязательные проверки перед каждым submit order в OrderExecutor:
+1. `circuit_breaker` — hard stop при открытом breaker (пропускает только close)
+2. `check_risk_limits` — max_position_size, daily_loss_limit
+3. `_check_account_risk_limits` — max_gross_exposure, max_account_positions
+
+**Причины:**
+- Стратегии с custom execute_signal обходили risk gate — теперь это запрещено
+- Account-level limits ловят суммарную экспозицию нескольких стратегий на одном счёте
+- Дневной лимит убытков привязан к baseline equity на старт дня, а не к абсолютному PnL
+
+**Не обходить** risk gate даже для «проверенных» стратегий — весь ордер-поток идёт через один path.
+
+---
+
+## 16. Почему degraded trading state при stale broker data
+
+**Контекст:** При потере связи с брокером позиция на бирже может отличаться от локальной.
+
+**Решение:** `sync_status` в LiveEngine: unknown → synced → stale → degraded.
+
+**Причины:**
+- Деструктивный reset позиции при ошибке чтения создавал ложное «позиции нет»
+- В degraded state разрешены только reconcile и close-risk actions
+- Обычная торговля возобновляется только после подтверждённого resync
+- Это явное состояние, а не неявная деградация с продолжением торговли

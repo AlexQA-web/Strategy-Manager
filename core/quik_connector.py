@@ -40,7 +40,7 @@ class QuikConnector(BaseConnector):
         self._cache_lock = threading.Lock()
         self._cache_last_sync = 0.0
         self._cache_sync_interval = 30.0  # полная синхронизация раз в 30 секунд
-        self._sync_in_progress = threading.Event()  # защита от параллельных синхронизаций
+        self._sync_lock = threading.Lock()  # защита от параллельных синхронизаций
         # Кэш статуса брокера для is_connected() — чтобы не делать сетевой запрос каждый раз
         self._broker_online_cache: bool = False
         self._broker_cache_time: float = 0.0
@@ -79,6 +79,14 @@ class QuikConnector(BaseConnector):
         except Exception as e:
             logger.warning(f"[QUIK] _load_securities_cache error: {e}")
             return []
+
+    def health_check(self) -> bool:
+        """Глубокая проверка соединения через ping (QUIK-specific)."""
+        return self.ping()
+
+    def _on_reconnect_success(self):
+        """Force check всех активных ордеров при реконнекте."""
+        self._force_check_orders()
 
     def _force_check_orders(self):
         """Force check всех активных ордеров при реконнекте."""
@@ -153,16 +161,11 @@ class QuikConnector(BaseConnector):
                     self._connected = False
                     self._fire_event('disconnect')
                     return False
-                was_connected = self._connected  # запоминаем для reconnet detection
                 self._connected = True
                 self._stop_reconnect.clear()
                 self.start_reconnect_loop()
                 # Инициализируем кэш ордеров при подключении
                 self._sync_orders_cache()
-
-                # Force check orders при реконнекте (аналог OsEngine ForceCheckOrdersAfterReconnectEvent)
-                if was_connected:
-                    self._force_check_orders()
 
                 logger.info("[QUIK] ✅ Подключён к серверу брокера")
                 self._fire_event('connect')
@@ -353,26 +356,24 @@ class QuikConnector(BaseConnector):
     def _fetch_orders(self) -> list[dict]:
         if not self._connected or not self._client:
             return []
-        for method_name in ("get_orders", "get_all_orders"):
-            method = getattr(self._client, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                with self._lock:
-                    result = method()
-                rows = result.get("data", [])
-                if isinstance(rows, list):
-                    return rows
-            except Exception as e:
-                logger.debug(f"[QUIK] {method_name} error: {e}")
+        method = getattr(self._client, "get_all_orders", None)
+        if not callable(method):
+            return []
+        try:
+            with self._lock:
+                result = method()
+            rows = result.get("data", [])
+            if isinstance(rows, list):
+                return rows
+        except Exception as e:
+            logger.debug(f"[QUIK] get_all_orders error: {e}")
         return []
 
     def _sync_orders_cache(self) -> None:
         """Полная синхронизация кэша ордеров. Безопасно вызывать из любого потока."""
         # Защита от параллельных синхронизаций
-        if self._sync_in_progress.is_set():
+        if not self._sync_lock.acquire(blocking=False):
             return
-        self._sync_in_progress.set()
         try:
             orders = self._fetch_orders()
             new_cache: dict[str, dict] = {}
@@ -413,12 +414,10 @@ class QuikConnector(BaseConnector):
                 self._cache_last_sync = time.monotonic()
             logger.debug(f"[QUIK] Кэш ордеров синхронизирован: {len(new_cache)} ордеров")
         finally:
-            self._sync_in_progress.clear()
+            self._sync_lock.release()
 
     def _sync_orders_cache_async(self) -> None:
         """Запускает синхронизацию кэша в фоновом потоке (не блокирует GUI)."""
-        if self._sync_in_progress.is_set():
-            return
         t = threading.Thread(target=self._sync_orders_cache, daemon=True, name="quik-sync-cache")
         t.start()
 
@@ -474,7 +473,12 @@ class QuikConnector(BaseConnector):
         # Кэш устарел или ордер не найден — запускаем фоновую синхронизацию
         self._sync_orders_cache_async()
         # Ждём завершения синхронизации (обычно < 1 сек)
-        self._sync_in_progress.wait(timeout=2.0)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if self._sync_lock.acquire(blocking=False):
+                self._sync_lock.release()
+                break
+            time.sleep(0.05)
 
         # Повторный поиск в обновлённом кэше
         with self._cache_lock:
@@ -626,8 +630,9 @@ class QuikConnector(BaseConnector):
         if not pos:
             return None
         pos_qty = int(pos.get("quantity", 0))
-        # Если quantity = 0, закрываем всю позицию, иначе - частично
-        close_qty = abs(quantity) if quantity != 0 else abs(pos_qty)
+        if pos_qty == 0:
+            return None
+        close_qty = abs(quantity) if 0 < quantity <= abs(pos_qty) else abs(pos_qty)
         side = "sell" if pos_qty > 0 else "buy"
         tid = self.place_order(
             account_id=account_id,

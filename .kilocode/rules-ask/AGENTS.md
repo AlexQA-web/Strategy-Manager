@@ -1,9 +1,0 @@
-# Project Documentation Rules (Non-Obvious Only)
-
-- Источник «как делать правильно» в этом проекте — не README, а `docs/patterns.md` (рабочие паттерны) и `docs/known_issues.md` (типовые поломки + фикс).
-- Тесты: pytest в `tests/`, запуск `python -m pytest tests/ -v`; один тест — `python -m pytest tests/test_commission_manager.py::test_futures_taker_commission -v`.
-- Данные состояния приложения хранятся в JSON (`data/*.json`) с атомарной записью через `core/storage.py`; прямое редактирование JSON вручную может ломать конкурентные обновления.
-- Архитектура коннекторов асимметричная: Finam — callback через DLL (`ctypes`), QUIK — polling через QuikPy; поэтому одинаковые симптомы в UI могут иметь разные корни.
-- Для фьючерсов `point_cost` контринтуитивно берётся сначала из MOEX API, и только затем из DLL (это защита от неверных значений DLL).
-- Коннекторы не должны регистрироваться при импорте модулей; фактический путь инициализации: `main.py` → `MainWindow()` → `register_connectors()`.
-- Обновление UI из фоновых потоков в документации и коде жёстко ограничено: только `ui_signals`/`QTimer.singleShot`, иначе ловятся нестабильные падения Qt.

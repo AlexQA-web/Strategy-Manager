@@ -1,7 +1,7 @@
 {
   "bochka_cny": {
     "name": "Бочка CNY",
-    "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/bochka_cny.py",
+    "file_path": "strategies/bochka_cny.py",
     "description": "Пробой Highest/Lowest за период. Инструмент: CNY фьючерс.",
     "status": "stopped",
     "finam_account": "802690RIIT6",
@@ -29,7 +29,7 @@
   },
   "daytrend": {
     "name": "DayTrend",
-    "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/daytrend.py",
+    "file_path": "strategies/daytrend.py",
     "description": "Пробой сессионного хай/лоу с коэффициентом расширения. Лонг при Close > SessionHigh + Range*K, шорт при Close < SessionLow - Range*K. Стоп: Low[-1] - stop_long / уровень_шорта + stop_short.",
     "status": "stopped",
     "finam_account": "802690RIIT6",
@@ -54,7 +54,7 @@
   },
   "achilles": {
     "name": "Achilles",
-    "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/achilles.py",
+    "file_path": "strategies/achilles.py",
     "description": "Mean Reversion на корзине инструментов. Снимок цен → сигнал по % изменению → закрытие по времени.",
     "status": "stopped",
     "finam_account": "112A6S",
@@ -121,7 +121,7 @@
   },
   "tracker": {
     "name": "Tracker",
-    "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/tracker.py",
+    "file_path": "strategies/tracker.py",
     "description": "Канал SMA ± ATR*K. Вход лимиткой при пробое канала на старшем ТФ с подтверждением на 1-минутном. Выход при возврате в канал.",
     "status": "stopped",
     "finam_account": "802690RIIT6",
@@ -152,7 +152,7 @@
   },
   "valera_trend": {
     "name": "Valera Trend",
-    "file_path": "C:/Users/Alex_qA/PycharmProjects/trading_manager/strategies/valera_trend.py",
+    "file_path": "strategies/valera_trend.py",
     "description": "Вход в направлении тренда по SMA в заданное время. Фильтр: N баров подряд полностью по одну сторону от SMA (без касания). Выход по времени или при пересечении SMA.",
     "status": "stopped",
     "finam_account": "802690RIIT6",

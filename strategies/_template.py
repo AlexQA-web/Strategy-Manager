@@ -228,6 +228,12 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
 # исполнение сам. Добавляй execute_signal() только если действительно нужен
 # special-case: например, мультиинструментальная стратегия или свой lifecycle
 # лимитных заявок.
+#
+# ОБЯЗАТЕЛЬНО: для использования custom execute_signal стратегия должна быть
+# зарегистрированным execution adapter в core.strategy_loader.
+# Самообъявления в модуле недостаточно.
+
+# __execution_adapter__ = "my-registered-adapter"
 
 # def execute_signal(signal: dict, connector, params: dict, account_id: str) -> None:
 #     action = signal.get('action')

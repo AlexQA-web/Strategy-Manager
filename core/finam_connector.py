@@ -1,4 +1,5 @@
-﻿import ctypes
+﻿import concurrent.futures
+import ctypes
 import platform
 import threading
 import time
@@ -26,11 +27,29 @@ class FinamConnector(BaseConnector):
     DLL ищется в корне проекта.
     """
 
+    # ── Lock Hierarchy ──────────────────────────────────────────────────
+    # _state_lock         — _connected, _securities, _positions, _accounts
+    # _lock               — DLL SendCommand() serialization
+    # _processed_trades_lock
+    # _order_status_lock
+    # _quotes_lock
+    # _sec_info_lock      — _sec_info, _sec_info_pending
+    # _candle_callbacks_lock
+    # _history_waiters_lock
+    # _client_limits_lock
+    # _throttle_lock      — _error_throttle, _sec_info_failures
+    #
+    # Правила:
+    #  1. Не захватывать два lock-а одновременно без документированной причины.
+    #  2. Публичные геттеры возвращают snapshot-копии (copy-on-read).
+    #  3. Callback DLL работает в чужом потоке — все shared writes только под lock.
+
     def __init__(self):
         super().__init__()
         self._connected = False
         self._dll = None
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()   # _connected, _securities, _positions, _accounts
         self._initialized = False
         # Храним ссылку на callback чтобы GC не собрал
         self._callback_ref = None
@@ -48,6 +67,7 @@ class FinamConnector(BaseConnector):
         self._sec_info_failure_ttl = 300.0
         self._error_throttle: dict[str, float] = {}  # {message: monotonic_ts}
         self._error_throttle_ttl = 300.0
+        self._throttle_lock = threading.Lock()  # _error_throttle, _sec_info_failures
         # Для get_history — пер-запросный контекст
         self._history_waiters: dict[tuple[str, int], dict] = {}  # key -> {buffer: list, event: Event}
         self._history_waiters_lock = threading.Lock()
@@ -69,7 +89,8 @@ class FinamConnector(BaseConnector):
         # Информация по инструментам (sec_info / sec_info_upd)
         self._sec_info: dict[str, dict] = {}  # seccode → {buy_deposit, sell_deposit, point_cost, ...}
         self._sec_info_lock = threading.Lock()
-        self._sec_info_event = threading.Event()  # для синхронного ожидания get_securities_info
+        # Per-key pending requests: seccode → Future (coalescing concurrent callers)
+        self._sec_info_pending: dict[str, concurrent.futures.Future] = {}
         # Лимиты клиента (clientlimits)
         self._client_limits: dict[str, dict] = {}  # client_id → {money_free, money_current, ...}
         self._client_limits_lock = threading.Lock()
@@ -169,21 +190,26 @@ class FinamConnector(BaseConnector):
             if tag == "server_status":
                 connected = root.get("connected", "")
                 if connected == "true":
-                    if not self._connected:
+                    with self._state_lock:
+                        was_disconnected = not self._connected
                         self._connected = True
+                    if was_disconnected:
                         logger.info("[Finam] ✅ Подключён к серверу")
                         self._fire_event('connect')
                         # Запрашиваем лимиты клиентов после подключения
                         threading.Thread(target=self._request_client_limits, daemon=True).start()
                 elif connected == "false":
-                    if self._connected:
+                    with self._state_lock:
+                        was_connected = self._connected
                         self._connected = False
+                    if was_connected:
                         logger.info("[Finam] Соединение с сервером потеряно")
                         self._fire_event('disconnect')
                 elif connected == "error":
                     err_text = root.text or "Ошибка соединения"
                     logger.error(f"[Finam] Ошибка сервера: {err_text}")
-                    self._connected = False
+                    with self._state_lock:
+                        self._connected = False
                     self._fire_event('error', err_text)
 
             elif tag == "securities":
@@ -270,7 +296,8 @@ class FinamConnector(BaseConnector):
             result.append(entry)
         if result:
             # НЕ extend — заменяем полностью (как в OsEngine)
-            self._securities = result
+            with self._state_lock:
+                self._securities = result
             logger.debug(f"[Finam] Получено {len(result)} инструментов")
             # Обновляем кэш sec_info minstep/point_cost если запись уже есть
             with self._sec_info_lock:
@@ -286,8 +313,10 @@ class FinamConnector(BaseConnector):
         try:
             cache_dir = self._securities_cache_path.parent
             cache_dir.mkdir(parents=True, exist_ok=True)
+            with self._state_lock:
+                snapshot = list(self._securities)
             with open(self._securities_cache_path, "w", encoding="utf-8") as f:
-                json.dump(self._securities, f, ensure_ascii=False, indent=2)
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
             logger.debug(f"[Finam] Кэш инструментов сохранён: {self._securities_cache_path}")
         except Exception as e:
             logger.warning(f"[Finam] _save_securities_cache error: {e}")
@@ -300,7 +329,8 @@ class FinamConnector(BaseConnector):
             with open(self._securities_cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list) and len(data) > 0:
-                self._securities = data
+                with self._state_lock:
+                    self._securities = data
                 logger.info(f"[Finam] Загружено {len(data)} инструментов из кэша")
                 return True
             return False
@@ -313,7 +343,9 @@ class FinamConnector(BaseConnector):
         market = self._BOARD_TO_MARKET.get(board, "1")
         ticker = (ticker or '').strip()
         board = (board or '').strip().upper()
-        for sec in self._securities:
+        with self._state_lock:
+            securities = list(self._securities)
+        for sec in securities:
             sec_ticker = str(sec.get('ticker', '')).strip().upper()
             sec_board = str(sec.get('board', '')).strip().upper()
             sec_market = str(sec.get('market', '')).strip()
@@ -325,31 +357,35 @@ class FinamConnector(BaseConnector):
 
     def _remember_sec_info_failure(self, ticker: str, board: str):
         key = ((ticker or '').strip(), (board or '').strip().upper())
-        self._sec_info_failures[key] = time.monotonic()
+        with self._throttle_lock:
+            self._sec_info_failures[key] = time.monotonic()
 
     def _has_recent_sec_info_failure(self, ticker: str, board: str) -> bool:
         key = ((ticker or '').strip(), (board or '').strip().upper())
-        ts = self._sec_info_failures.get(key)
-        if ts is None:
+        with self._throttle_lock:
+            ts = self._sec_info_failures.get(key)
+            if ts is None:
+                return False
+            if time.monotonic() - ts < self._sec_info_failure_ttl:
+                return True
+            self._sec_info_failures.pop(key, None)
             return False
-        if time.monotonic() - ts < self._sec_info_failure_ttl:
-            return True
-        self._sec_info_failures.pop(key, None)
-        return False
 
     def _clear_sec_info_failure(self, ticker: str, board: str):
         key = ((ticker or '').strip(), (board or '').strip().upper())
-        self._sec_info_failures.pop(key, None)
+        with self._throttle_lock:
+            self._sec_info_failures.pop(key, None)
 
     def _should_emit_error(self, err_text: str) -> bool:
         now = time.monotonic()
-        last_ts = self._error_throttle.get(err_text)
-        if last_ts is not None and now - last_ts < self._error_throttle_ttl:
-            return False
-        self._error_throttle[err_text] = now
-        stale = [msg for msg, ts in self._error_throttle.items() if now - ts >= self._error_throttle_ttl]
-        for msg in stale:
-            self._error_throttle.pop(msg, None)
+        with self._throttle_lock:
+            last_ts = self._error_throttle.get(err_text)
+            if last_ts is not None and now - last_ts < self._error_throttle_ttl:
+                return False
+            self._error_throttle[err_text] = now
+            stale = [msg for msg, ts in self._error_throttle.items() if now - ts >= self._error_throttle_ttl]
+            for msg in stale:
+                self._error_throttle.pop(msg, None)
         return True
 
     def _parse_positions(self, root):
@@ -386,7 +422,8 @@ class FinamConnector(BaseConnector):
                 "current_price": 0.0,
                 "pnl": float(pos.findtext("varmargin", "0") or "0"),
             })
-        self._positions = result
+        with self._state_lock:
+            self._positions = result
         self._fire_event('positions')
 
         # forts_money — свободные средства FORTS
@@ -419,7 +456,8 @@ class FinamConnector(BaseConnector):
         currency = root.findtext("currency", "")
 
         if remove:
-            self._accounts = [a for a in self._accounts if a["id"] != union]
+            with self._state_lock:
+                self._accounts = [a for a in self._accounts if a["id"] != union]
             return
 
         forts_acc = root.findtext("forts_acc", "")
@@ -430,23 +468,23 @@ class FinamConnector(BaseConnector):
             return
 
         # Ищем существующий юнион
-        existing = next((a for a in self._accounts if a["id"] == union), None)
-        if existing:
-            # Добавляем субсчёт если ещё нет
-            subs = existing.setdefault("sub_accounts", [])
-            if not any(s["client_id"] == cid for s in subs):
-                subs.append(sub)
-        else:
-            self._accounts.append({
-                "id": union,
-                "name": union,
-                "sub_accounts": [sub],
-            })
-            pass
+        with self._state_lock:
+            existing = next((a for a in self._accounts if a["id"] == union), None)
+            if existing:
+                # Добавляем субсчёт если ещё нет
+                subs = existing.setdefault("sub_accounts", [])
+                if not any(s["client_id"] == cid for s in subs):
+                    subs.append(sub)
+            else:
+                self._accounts.append({
+                    "id": union,
+                    "name": union,
+                    "sub_accounts": [sub],
+                })
 
     def _parse_trades(self, root):
-        """Парсит исполненные сделки из callback и сохраняет в order_history."""
-        from core.order_history import make_order, save_order, get_orders
+        """Парсит исполненные сделки из callback и записывает через canonical FillLedger."""
+        from core.fill_ledger import fill_ledger
 
         for trade in root.findall("trade"):
             tradeno = trade.findtext("tradeno", "")
@@ -458,8 +496,8 @@ class FinamConnector(BaseConnector):
                 if tradeno in self._processed_trades:
                     continue
                 self._processed_trades[tradeno] = time.time()
-                # Ограничиваем размер словаря — если больше 10000 записей, чистим старые
-                if len(self._processed_trades) > 10_000:
+                # Ограничиваем размер словаря — если больше 2000 записей, чистим старые
+                if len(self._processed_trades) > 2_000:
                     self._cleanup_old_trades_unsafe()
 
             seccode = trade.findtext("seccode", "")
@@ -479,13 +517,8 @@ class FinamConnector(BaseConnector):
             if not strategy_id:
                 continue
 
-            # Дедупликация: проверяем нет ли уже ордера с этим tradeno в истории
-            existing = get_orders(strategy_id)
-            if any(f"tradeno={tradeno}" in o.get("comment", "") for o in existing):
-                continue
-
             # Парсим реальное время сделки из DLL
-            trade_timestamp = None
+            trade_timestamp = ""
             if time_str:
                 try:
                     trade_timestamp = datetime.strptime(time_str, "%d.%m.%Y %H:%M:%S.%f").isoformat()
@@ -495,19 +528,22 @@ class FinamConnector(BaseConnector):
                     except (ValueError, TypeError):
                         pass
 
-            order = make_order(
+            # Canonical fill через FillLedger (order_history + trades_history)
+            fill_id = f"tradeno:{tradeno}"
+            fill_ledger.record_fill(
+                fill_id=fill_id,
                 strategy_id=strategy_id,
                 ticker=seccode,
-                side=side,
-                quantity=quantity,
-                price=price,
                 board=board,
+                side=side,
+                qty=quantity,
+                price=price,
+                agent_name=strategy_id,
                 comment=f"tradeno={tradeno} time={time_str}",
+                order_type="market",
+                source="finam_callback",
+                timestamp=trade_timestamp,
             )
-            # Подменяем timestamp на реальное время сделки
-            if trade_timestamp:
-                order["timestamp"] = trade_timestamp
-            save_order(order)
             logger.debug(
                 f"[Finam] Сделка записана: {side.upper()} {seccode} "
                 f"x{quantity} @ {price} [{strategy_id}] tradeno={tradeno}"
@@ -520,9 +556,9 @@ class FinamConnector(BaseConnector):
         for tradeno in to_remove:
             del self._processed_trades[tradeno]
         # Если всё ещё много записей — удаляем самые старые
-        if len(self._processed_trades) > 5000:
+        if len(self._processed_trades) > 1000:
             sorted_trades = sorted(self._processed_trades.items(), key=lambda x: x[1])
-            excess = len(self._processed_trades) - 5000
+            excess = len(self._processed_trades) - 1000
             for tradeno, _ in sorted_trades[:excess]:
                 del self._processed_trades[tradeno]
         self._last_cleanup = time.time()
@@ -594,7 +630,11 @@ class FinamConnector(BaseConnector):
             cached = self._sec_info.get(seccode, {})
             board = str(cached.get('board', ''))
         self._clear_sec_info_failure(seccode, board)
-        self._sec_info_event.set()
+        # Resolve pending future for this seccode
+        with self._sec_info_lock:
+            fut = self._sec_info_pending.pop(seccode, None)
+        if fut and not fut.done():
+            fut.set_result(True)
 
     def _parse_sec_info_upd(self, root):
         """Парсит <sec_info_upd> — инкрементальное обновление.
@@ -650,6 +690,26 @@ class FinamConnector(BaseConnector):
                 self._remember_sec_info_failure(ticker, board)
                 return None
 
+            # Coalesce: если запрос по этому тикеру уже в полёте, подключаемся к нему
+            with self._sec_info_lock:
+                existing_fut = self._sec_info_pending.get(ticker)
+            if existing_fut is not None:
+                try:
+                    existing_fut.result(timeout=5)
+                except Exception:
+                    pass
+                with self._sec_info_lock:
+                    cached = self._sec_info.get(ticker)
+                    result = dict(cached) if cached else None
+                if result is None:
+                    self._remember_sec_info_failure(ticker, board)
+                return result
+
+            # Создаём Future для этого запроса
+            fut: concurrent.futures.Future = concurrent.futures.Future()
+            with self._sec_info_lock:
+                self._sec_info_pending[ticker] = fut
+
             # Запрашиваем у DLL
             market = self._BOARD_TO_MARKET.get(board, "1")
             cmd = (
@@ -657,16 +717,23 @@ class FinamConnector(BaseConnector):
                 f'<security><market>{market}</market><seccode>{ticker}</seccode></security>'
                 f'</command>'
             )
-            self._sec_info_event.clear()
             response = self._send_command(cmd)
             err = self._parse_error(response)
             if err:
+                with self._sec_info_lock:
+                    self._sec_info_pending.pop(ticker, None)
+                if not fut.done():
+                    fut.set_result(False)
                 self._remember_sec_info_failure(ticker, board)
                 logger.debug(f'[Finam] get_sec_info rejected for {ticker} board={board}: {err}')
                 return None
 
-            # Ждём callback sec_info
-            if not self._sec_info_event.wait(timeout=5):
+            # Ждём callback sec_info (Future resolves в _parse_sec_info)
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                with self._sec_info_lock:
+                    self._sec_info_pending.pop(ticker, None)
                 self._remember_sec_info_failure(ticker, board)
                 logger.debug(f'[Finam] get_sec_info timeout for {ticker} board={board}')
                 return None
@@ -810,7 +877,9 @@ class FinamConnector(BaseConnector):
 
             # Берём client_id из sub_accounts
             all_clients = set()
-            for acc in self._accounts:
+            with self._state_lock:
+                accounts_snapshot = [dict(a) for a in self._accounts]
+            for acc in accounts_snapshot:
                 for sub in acc.get("sub_accounts", []):
                     cid = sub.get("client_id")
                     if cid:
@@ -852,27 +921,30 @@ class FinamConnector(BaseConnector):
             return dict(cached) if cached else None
 
     def get_free_money(self, account_id: str) -> Optional[float]:
-        """Свободные средства на счёте (money_free из clientlimits/forts_money)."""
+        """Свободные средства на счёте (money_free из clientlimits/forts_money).
+
+        Резолвит account_id строго: точное совпадение по client_id,
+        затем поиск через forts_acc.  При неоднозначном маппинге
+        возвращает None — execution layer должен отвергнуть dynamic sizing.
+        """
+        with self._state_lock:
+            accounts_snapshot = list(self._accounts)
         with self._client_limits_lock:
             # Точное совпадение по client_id
             if account_id in self._client_limits:
                 return self._client_limits[account_id].get("money_free")
             # Поиск по forts_acc: ищем client у которого forts_acc == account_id
-            for acc in self._accounts:
+            for acc in accounts_snapshot:
                 for sub in acc.get("sub_accounts", []):
                     if sub.get("forts_acc") == account_id:
                         cid = sub["client_id"]
                         if cid in self._client_limits:
                             return self._client_limits[cid].get("money_free")
-            # Поиск по подстроке
-            for cid, limits in self._client_limits.items():
-                if account_id in cid or cid in account_id:
-                    return limits.get("money_free")
-            # Fallback: первый ненулевой money_free
-            for limits in self._client_limits.values():
-                v = limits.get("money_free")
-                if v is not None and v != 0.0:
-                    return v
+            # Не удалось однозначно привязать account_id к лимитам
+            logger.warning(
+                f"[Finam] get_free_money: не удалось однозначно "
+                f"разрешить account_id='{account_id}' → возвращаем None"
+            )
         return None
 
     def subscribe_quotes(self, board: str, seccode: str):
@@ -1015,7 +1087,9 @@ class FinamConnector(BaseConnector):
                     logger.warning(f"[Finam] order watcher error: {e}")
 
         # Периодическая очистка старых ордеров (не чаще раза в час)
-        if now - self._last_order_cleanup > 3600:
+        with self._order_status_lock:
+            need_cleanup = now - self._last_order_cleanup > 3600
+        if need_cleanup:
             self._cleanup_old_order_status(now)
 
     def _cleanup_old_order_status(self, now: float):
@@ -1045,8 +1119,7 @@ class FinamConnector(BaseConnector):
                 self._order_watchers.pop(tid, None)
                 self._order_status_timestamps.pop(tid, None)
                 removed += 1
-        
-        self._last_order_cleanup = now
+            self._last_order_cleanup = now
         if removed:
             logger.debug(f"[Finam] Очищено {removed} старых записей _order_status")
 
@@ -1067,11 +1140,32 @@ class FinamConnector(BaseConnector):
             except ValueError:
                 pass
 
+    def health_check(self) -> bool:
+        """Глубокая проверка соединения (Finam-specific).
+
+        Finam использует callback-модель: server_status обновляет
+        self._connected автоматически. Дополнительно отправляем
+        лёгкую команду server_status для верификации.
+        """
+        with self._state_lock:
+            if not self._connected:
+                return False
+        try:
+            self._send_command('<command id="server_status"/>')
+        except Exception:
+            return False
+        with self._state_lock:
+            return self._connected
+
+    def _on_reconnect_success(self):
+        """Force check всех активных ордеров при реконнекте."""
+        self._force_check_orders()
+
     def _force_check_orders(self):
-        """Force check всех активных ордеров при реконнекте (аналог OsEngine ForceCheckOrdersAfterReconnectEvent).
+        """Force check всех активных ордеров (аналог OsEngine ForceCheckOrdersAfterReconnectEvent).
         
-        Запускает фоновый поток, который перепроверяет статусы всех ордеров
-        с активными watchers. Вызывается при reconnet для надёжности.
+        Отправляет ОДИН запрос get_orders к DLL. Callback _parse_orders обновит
+        статусы и уведомит watchers по всем ордерам из ответа.
         """
         def _check():
             with self._order_status_lock:
@@ -1079,14 +1173,11 @@ class FinamConnector(BaseConnector):
             if not active_tids:
                 return
             logger.info(f"[Finam] Force check {len(active_tids)} active orders after reconnect")
-            for tid in active_tids:
-                try:
-                    # Запрашиваем статус через DLL — ответ придёт через callback
-                    cmd = f'<command id="get_orders"/>'
-                    self._send_command(cmd)
-                    time.sleep(0.1)  # небольшая задержка между запросами
-                except Exception as e:
-                    logger.warning(f"[Finam] Force check order {tid} error: {e}")
+            try:
+                cmd = '<command id="get_orders"/>'
+                self._send_command(cmd)
+            except Exception as e:
+                logger.warning(f"[Finam] Force check orders error: {e}")
 
         threading.Thread(target=_check, daemon=True, name="finam-force-check-orders").start()
 
@@ -1110,17 +1201,16 @@ class FinamConnector(BaseConnector):
             # Загружаем кэш инструментов если есть (ускорение подключения)
             if not self._load_securities_cache():
                 # Кэша нет — очищаем для fresh загрузки
-                self._securities.clear()
+                with self._state_lock:
+                    self._securities.clear()
             else:
-                logger.info(f"[Finam] Использован кэш инструментов ({len(self._securities)} записей)")
+                with self._state_lock:
+                    sec_count = len(self._securities)
+                logger.info(f"[Finam] Использован кэш инструментов ({sec_count} записей)")
 
-            self._accounts.clear()
-            self._positions.clear()
-
-            # Force check orders при реконнекте — перепроверяем активные ордера
-            if self._connected:
-                logger.info("[Finam] Reconnet: force check active orders")
-                self._force_check_orders()
+            with self._state_lock:
+                self._accounts.clear()
+                self._positions.clear()
 
             # Инициализация DLL (один раз)
             if not self._initialized:
@@ -1166,7 +1256,8 @@ class FinamConnector(BaseConnector):
                 if 'соединение уже установлено' in err_lc or 'connection already established' in err_lc:
                     # Server may still reject commands in this state.
                     # Keep connector disconnected until server_status=true callback.
-                    self._connected = False
+                    with self._state_lock:
+                        self._connected = False
                     try:
                         self._send_command('<command id="disconnect"/>')
                     except Exception:
@@ -1202,12 +1293,14 @@ class FinamConnector(BaseConnector):
         except Exception as e:
             logger.warning(f"[Finam] disconnect error: {e}")
         finally:
-            self._connected = False
+            with self._state_lock:
+                self._connected = False
             logger.info("[Finam] Отключён")
             self._fire_event('disconnect')
 
     def is_connected(self) -> bool:
-        return self._connected
+        with self._state_lock:
+            return self._connected
 
     # ── Маппинг board → market для резолва субсчёта ─────────────────────
     _BOARD_TO_MARKET = {
@@ -1221,7 +1314,9 @@ class FinamConnector(BaseConnector):
     def _resolve_client_id(self, account_id: str, board: str) -> str:
         """Находит client_id субсчёта по union-счёту и борду."""
         market = self._BOARD_TO_MARKET.get(board, "1")
-        account = next((a for a in self._accounts if a["id"] == account_id), None)
+        with self._state_lock:
+            accounts_snapshot = [dict(a) for a in self._accounts]
+        account = next((a for a in accounts_snapshot if a["id"] == account_id), None)
         if not account:
             logger.warning(f"[Finam] Счёт {account_id} не найден в кэше")
             return account_id
@@ -1333,7 +1428,9 @@ class FinamConnector(BaseConnector):
         if not pos:
             return None
         total_qty = int(abs(float(pos.get("quantity", 0))))
-        close_qty = quantity if 0 < quantity < total_qty else total_qty
+        if total_qty == 0:
+            return None
+        close_qty = quantity if 0 < quantity <= total_qty else total_qty
         side = "sell" if float(pos.get("quantity", 0)) > 0 else "buy"
         tid = self.place_order(
             account_id=account_id,
@@ -1349,24 +1446,29 @@ class FinamConnector(BaseConnector):
     # ── Позиции / счета ───────────────────────────────────────────────────
 
     def get_positions(self, account_id: str) -> list[dict]:
-        """Возвращает кэшированные позиции (обновляются через callback)."""
-        return self._positions
+        """Возвращает snapshot позиций (copy-on-read)."""
+        with self._state_lock:
+            return [dict(p) for p in self._positions]
 
     def get_all_positions(self) -> dict:
         """Возвращает позиции в формате {account_id: [positions]} для PositionManager."""
-        if self._accounts and self._positions:
-            return {acc["id"]: self._positions for acc in self._accounts}
+        with self._state_lock:
+            if self._accounts and self._positions:
+                positions_copy = [dict(p) for p in self._positions]
+                return {acc["id"]: positions_copy for acc in self._accounts}
         return {}
 
     def get_accounts(self) -> list[dict]:
-        """Возвращает кэшированные счета (обновляются через callback)."""
-        return self._accounts
+        """Возвращает snapshot счетов (copy-on-read)."""
+        with self._state_lock:
+            return [dict(a) for a in self._accounts]
 
     def get_securities(self, board: str = "") -> list[dict]:
-        """Возвращает кэшированные бумаги, опционально фильтруя по борду."""
-        if board:
-            return [s for s in self._securities if s.get("board") == board]
-        return self._securities
+        """Возвращает snapshot бумаг (copy-on-read), опционально фильтруя по борду."""
+        with self._state_lock:
+            if board:
+                return [dict(s) for s in self._securities if s.get("board") == board]
+            return [dict(s) for s in self._securities]
 
     def get_last_price(self, ticker: str, board: str = "TQBR") -> Optional[float]:
         if not self._connected:

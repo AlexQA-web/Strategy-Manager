@@ -224,11 +224,66 @@ class TelegramNotifier:
         self._chat_id: Optional[str] = None
         self._level: str = NotificationLevel.ALL
         self._enabled: bool = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._started: bool = False
+        self._stopped: bool = False
+
+    def _ensure_loop(self):
+        """Запускает event loop при первом использовании (lazy start)."""
+        if self._started:
+            return
+        if self._stopped:
+            logger.warning("[Telegram] Notifier уже остановлен, повторный старт запрещён")
+            return
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="TelegramLoop"
         )
         self._thread.start()
+        self._started = True
+
+    def stop(self):
+        """Корректно завершает event loop и освобождает ресурсы.
+
+        Безопасен для повторного вызова.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        self._enabled = False
+
+        if self._loop and self._loop.is_running():
+            # Drain pending tasks
+            async def _shutdown():
+                tasks = [t for t in asyncio.all_tasks(self._loop)
+                         if t is not asyncio.current_task()]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                # Закрываем HTTP-сессию бота
+                if self._bot:
+                    try:
+                        await self._bot.shutdown()
+                    except Exception:
+                        pass
+
+            try:
+                future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
+                future.result(timeout=5)
+            except Exception as e:
+                logger.debug(f"[Telegram] shutdown drain error: {e}")
+
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
+        if self._loop and not self._loop.is_closed():
+            self._loop.close()
+
+        self._bot = None
+        logger.info("[Telegram] Notifier остановлен")
 
     def _run_loop(self):
         """Запускает asyncio event loop в отдельном потоке."""
@@ -305,6 +360,7 @@ class TelegramNotifier:
         
         # Отправка в Telegram
         if tg_ok:
+            self._ensure_loop()
             future = asyncio.run_coroutine_threadsafe(
                 self._send_message(text), self._loop
             )
@@ -325,6 +381,7 @@ class TelegramNotifier:
         
         # Отправка в Telegram
         if self._enabled:
+            self._ensure_loop()
             future = asyncio.run_coroutine_threadsafe(
                 self._send_message(text), self._loop
             )
@@ -365,6 +422,7 @@ class TelegramNotifier:
 
     def test_connection_sync(self) -> tuple[bool, str]:
         """Синхронная обёртка для вызова из UI (не async)."""
+        self._ensure_loop()
         future = asyncio.run_coroutine_threadsafe(
             self.test_connection(), self._loop
         )

@@ -1,5 +1,8 @@
 # core/scheduler.py
 
+from datetime import time as dtime
+from typing import Optional
+
 from loguru import logger
 from apscheduler.schedulers.background import BackgroundScheduler
 from core.storage import get_all_schedules
@@ -7,24 +10,61 @@ from core.storage import get_all_schedules
 DAYS_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
 
 
+def parse_schedule_window(sched: dict) -> Optional[tuple[dtime, dtime, list[int]]]:
+    """Парсит расписание и возвращает (connect_time, disconnect_time, days).
+
+    Возвращает None при невалидном расписании.
+    """
+    if not isinstance(sched, dict):
+        return None
+    try:
+        ch, cm = map(int, sched.get("connect_time", "06:50").split(":"))
+        dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
+    except Exception:
+        return None
+    connect_t = dtime(ch, cm)
+    disconnect_t = dtime(dh, dm)
+    days = sched.get("days", [0, 1, 2, 3, 4])
+    return connect_t, disconnect_t, days
+
+
+def is_in_time_window(
+    connect_t: dtime,
+    disconnect_t: dtime,
+    days: list[int],
+    now_weekday: int,
+    now_time: dtime,
+) -> bool:
+    """Проверяет, попадает ли (now_weekday, now_time) в окно расписания.
+
+    Overnight логика (connect_t > disconnect_t):
+    - now_time >= connect_t И today входит в days → True
+    - now_time <= disconnect_t И yesterday входит в days → True
+    """
+    if connect_t <= disconnect_t:
+        # Обычное окно в пределах одного дня
+        return now_weekday in days and connect_t <= now_time <= disconnect_t
+    else:
+        # Overnight: переход через полночь
+        if now_time >= connect_t and now_weekday in days:
+            return True
+        yesterday = (now_weekday - 1) % 7
+        if now_time <= disconnect_t and yesterday in days:
+            return True
+        return False
+
+
 def is_in_schedule(connector_id: str) -> bool:
     """Возвращает True если коннектор сейчас находится в окне работы по расписанию.
 
-    Используется в autostart для проверки перед запуском LiveEngine.
+    Используется в autostart и reconnect-loop для проверки допустимости работы.
     Если расписание не найдено или неактивно — возвращает True (не блокируем).
-
-    NOTE: overnight логика:
-    - connect_time <= disconnect_time: окно в пределах одного дня (06:50-23:45)
-    - connect_time > disconnect_time: окно с переходом через полночь
-      (06:50-00:01 означает "с 06:50 до конца дня ИЛИ с начала дня до 00:01")
-      Это НЕ "с 06:50 до 00:01 следующего дня" — для этого нужно ставить
-      connect_time="06:50", disconnect_time="23:59" + отдельное расписание на следующий день.
     """
     try:
         from zoneinfo import ZoneInfo
     except ImportError:
         from backports.zoneinfo import ZoneInfo
-    from datetime import datetime, time as dtime
+    from datetime import datetime
 
     schedules = get_all_schedules()
     sched = schedules.get(connector_id)
@@ -33,37 +73,15 @@ def is_in_schedule(connector_id: str) -> bool:
     if not sched.get("is_active", True):
         return True
 
-    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
-    today = now_msk.weekday()
-    if today not in sched.get("days", [0, 1, 2, 3, 4]):
-        return False
-
-    now_t = now_msk.time().replace(second=0, microsecond=0)
-    try:
-        ch, cm = map(int, sched.get("connect_time",    "06:50").split(":"))
-        dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
-    except Exception as e:
-        logger.warning(f"[Scheduler] is_in_schedule({connector_id}): ошибка парсинга времени: {e}")
+    parsed = parse_schedule_window(sched)
+    if parsed is None:
+        logger.warning(f"[Scheduler] is_in_schedule({connector_id}): ошибка парсинга времени")
         return True
 
-    connect_t    = dtime(ch, cm)
-    disconnect_t = dtime(dh, dm)
-
-    # Информационное сообщение об overnight-расписании (переход через полночь)
-    if connect_t > disconnect_t and disconnect_t.hour == 0 and disconnect_t.minute <= 5:
-        logger.debug(
-            f"[Scheduler] is_in_schedule({connector_id}): "
-            f"overnight-расписание connect={connect_t} disconnect={disconnect_t}. "
-            f"Окно: 'с {connect_t} до конца дня ИЛИ с начала дня до {disconnect_t}'."
-        )
-
-    if connect_t <= disconnect_t:
-        # Обычное окно в пределах одного дня
-        return connect_t <= now_t <= disconnect_t
-    else:
-        # Overnight: connect_t > disconnect_t
-        # Работаем: с connect_t до конца дня ИЛИ с начала дня до disconnect_t
-        return now_t >= connect_t or now_t <= disconnect_t
+    connect_t, disconnect_t, days = parsed
+    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
+    now_time = now_msk.time().replace(second=0, microsecond=0)
+    return is_in_time_window(connect_t, disconnect_t, days, now_msk.weekday(), now_time)
 
 
 class StrategyScheduler:
@@ -98,28 +116,30 @@ class StrategyScheduler:
             if not connector:
                 continue
 
-            days         = sched.get("days", [0, 1, 2, 3, 4])
-            connect_t    = sched.get("connect_time", "06:50")
-            disconnect_t = sched.get("disconnect_time", "23:45")
+            parsed = parse_schedule_window(sched)
+            if parsed is None:
+                logger.error(f"[Scheduler] {cid}: неверный формат времени")
+                continue
 
+            connect_t, disconnect_t, days = parsed
             if not days:
                 logger.debug(f"[Scheduler] {cid}: нет дней — пропуск")
                 continue
 
-            try:
-                ch, cm = map(int, connect_t.split(":"))
-                dh, dm = map(int, disconnect_t.split(":"))
-            except ValueError:
-                logger.error(f"[Scheduler] {cid}: неверный формат времени")
-                continue
+            connect_day_str = ",".join(str(d) for d in days)
 
-            day_str = ",".join(str(d) for d in days)
+            # Для overnight-расписания disconnect fires на следующий день
+            if connect_t > disconnect_t:
+                disconnect_days = [(d + 1) % 7 for d in days]
+            else:
+                disconnect_days = list(days)
+            disconnect_day_str = ",".join(str(d) for d in disconnect_days)
 
             self._scheduler.add_job(
                 connector.connect,
                 trigger="cron",
-                day_of_week=day_str,
-                hour=ch, minute=cm,
+                day_of_week=connect_day_str,
+                hour=connect_t.hour, minute=connect_t.minute,
                 id=f"{cid}_connect",
                 replace_existing=True,
                 misfire_grace_time=60,
@@ -127,16 +147,16 @@ class StrategyScheduler:
             self._scheduler.add_job(
                 connector.disconnect,
                 trigger="cron",
-                day_of_week=day_str,
-                hour=dh, minute=dm,
+                day_of_week=disconnect_day_str,
+                hour=disconnect_t.hour, minute=disconnect_t.minute,
                 id=f"{cid}_disconnect",
                 replace_existing=True,
                 misfire_grace_time=60,
             )
             logger.info(
                 f"[Scheduler] {cid}: "
-                f"connect {connect_t}, disconnect {disconnect_t}, "
-                f"days={[DAYS_RU[d] for d in days]}"
+                f"connect {connect_t.strftime('%H:%M')} days={[DAYS_RU[d] for d in days]}, "
+                f"disconnect {disconnect_t.strftime('%H:%M')} days={[DAYS_RU[d] for d in disconnect_days]}"
             )
 
     def get_next_events(self, limit: int = 5) -> list[dict]:

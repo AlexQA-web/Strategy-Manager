@@ -18,6 +18,8 @@ import threading
 import time
 import traceback
 import warnings
+import weakref
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from typing import Optional
 
@@ -25,8 +27,9 @@ import pandas as pd
 from loguru import logger
 
 from core.equity_tracker import flush_all as equity_flush_all, record_equity, get_max_drawdown
-from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK, TRADING_END_TIME_MIN
+from config.settings import COMMISSION_FUTURES, COMMISSION_STOCK, TRADING_END_TIME_MIN, DEFAULT_STRATEGY_LOOKBACK
 from core.commission_manager import commission_manager
+from core.valuation_service import valuation_service
 from core.connector_manager import connector_manager
 from core.instrument_classifier import instrument_classifier
 from core.order_history import get_total_pnl, get_order_pairs
@@ -100,8 +103,6 @@ class LiveEngine:
                 self._connector_id = "quik"
             elif isinstance(connector, FinamConnector):
                 self._connector_id = "finam"
-            elif isinstance(connector, PaperConnector):
-                self._connector_id = "paper"
             else:
                 self._connector_id = "finam"
         else:
@@ -147,6 +148,19 @@ class LiveEngine:
         self._consecutive_timeouts: int = 0
         self._MAX_CONSECUTIVE_TIMEOUTS = 5
 
+        # Статус синхронизации с брокером: "unknown" | "synced" | "stale"
+        # При stale запрещены открывающие сделки, разрешены только close/reconcile
+        self._sync_status: str = "unknown"
+
+        # Bounded executor для get_history (max 1, чтобы не плодить потоки при timeout)
+        self._history_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"history-{strategy_id}"
+        )
+        self._history_pool_closed = False
+        self._history_pool_finalizer = weakref.finalize(
+            self, LiveEngine._shutdown_executor, self._history_pool
+        )
+
         # Параметры для point_cost и lot_size
         self._last_price: float = 0.0
         self._point_cost: float = 1.0
@@ -165,6 +179,7 @@ class LiveEngine:
             max_position_size=int(params.get("max_position_size", 0) or 0),
             daily_loss_limit=float(params.get("daily_loss_limit", 0.0) or 0.0),
             get_total_pnl=get_total_pnl,
+            get_current_equity=self._get_current_equity_metric,
         )
 
         # 3. TradeRecorder
@@ -201,6 +216,7 @@ class LiveEngine:
             is_futures=lambda: self._is_futures(),
             calculate_commission=self._calculate_commission,
             on_reconcile=self._detect_position,
+            on_circuit_break=self._on_circuit_break,
         )
 
         # 5. Reconciler
@@ -214,6 +230,7 @@ class LiveEngine:
             detect_position=self._detect_position,
             reconcile_interval_sec=60.0,
             alert_cooldown_sec=300.0,
+            on_broker_unavailable=self._on_broker_unavailable,
         )
 
     # === Legacy-прокси для обратной совместимости ===
@@ -283,6 +300,11 @@ class LiveEngine:
     def _active_chase_orders(self):
         return self._order_executor._active_chase_orders
 
+    @property
+    def sync_status(self) -> str:
+        """Текущий статус синхронизации с брокером: unknown | synced | stale."""
+        return self._sync_status
+
     # === Вспомогательные методы ===
 
     def _is_futures(self, ticker: str = None, board: str = None) -> bool:
@@ -319,14 +341,127 @@ class LiveEngine:
         return self._calculate_commission_manual(ticker, abs_qty, price, sec_type)
 
     def _calculate_commission_manual(self, ticker: str, abs_qty: int, price: float, sec_type: str) -> float:
-        """Рассчитывает комиссию вручную."""
+        """Рассчитывает комиссию вручную.
+
+        Для нефьючерсных инструментов trade_value считается с учётом lot_size,
+        чтобы результат совпадал с auto-mode при эквивалентных тарифах.
+        """
         if sec_type == 'futures':
             commission_per_lot = self._commission_rub if self._commission_rub > 0 else COMMISSION_FUTURES
             return commission_per_lot * abs_qty
         else:
             commission_pct = self._commission_pct if self._commission_pct > 0 else COMMISSION_STOCK
-            trade_value = price * abs_qty
+            lot_size = self._lot_size if self._lot_size > 0 else 1
+            trade_value = price * abs_qty * lot_size
             return trade_value * (commission_pct / 100.0)
+
+    def _get_pnl_multiplier(self) -> float:
+        """Возвращает денежный множитель для расчёта PnL.
+
+        Делегирует в ValuationService.get_pnl_multiplier.
+        """
+        return valuation_service.get_pnl_multiplier(
+            is_futures=self._is_futures(),
+            point_cost=self._point_cost,
+            lot_size=self._lot_size,
+        )
+
+    @staticmethod
+    def _shutdown_executor(executor: ThreadPoolExecutor):
+        """Аккуратно останавливает executor даже если stop() не был вызван явно."""
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
+
+    def _cleanup_history_pool(self):
+        if self._history_pool_closed:
+            return
+        self._history_pool_closed = True
+        self._shutdown_executor(self._history_pool)
+        if hasattr(self, "_history_pool_finalizer") and self._history_pool_finalizer.alive:
+            self._history_pool_finalizer.detach()
+
+    def _get_current_equity_metric(self) -> Optional[float]:
+        """Возвращает текущий equity = realized + unrealized для risk gate."""
+        try:
+            realized = get_total_pnl(self._strategy_id) or 0.0
+            position_qty = self._position_tracker.get_position_qty()
+            entry_price = self._position_tracker.get_entry_price()
+
+            last_price = self._last_price
+            if not last_price and hasattr(self._connector, "get_last_price"):
+                try:
+                    last_price = self._connector.get_last_price(self._ticker, self._board) or 0.0
+                except Exception:
+                    last_price = 0.0
+
+            entry_commission = 0.0
+            exit_commission = 0.0
+            if position_qty and last_price and entry_price:
+                entry_commission = self._calculate_commission(
+                    self._ticker, position_qty, entry_price
+                )
+                exit_commission = self._calculate_commission(
+                    self._ticker, position_qty, last_price
+                )
+
+            return valuation_service.compute_equity_snapshot(
+                realized_pnl=realized,
+                entry_price=entry_price or 0.0,
+                current_price=last_price or 0.0,
+                position_qty=position_qty or 0,
+                pnl_multiplier=self._get_pnl_multiplier(),
+                entry_commission=entry_commission,
+                exit_commission=exit_commission,
+            )
+        except Exception:
+            return None
+
+    def _custom_pretrade_risk_check(self, action: str, qty: int) -> tuple[bool, str]:
+        """Общий pre-trade risk gate для явно зарегистрированных custom adapters."""
+        if action not in ("buy", "sell"):
+            return True, ""
+        if self._risk_guard.is_circuit_open():
+            return False, "circuit breaker открыт"
+        return self._risk_guard.check_risk_limits(action, qty)
+
+    def _custom_account_risk_check(
+        self,
+        action: str,
+        qty: int,
+        ticker: str = "",
+        board: str = "",
+        last_price: float = 0.0,
+    ) -> Optional[str]:
+        return self._order_executor.check_account_risk_limits_for_order(
+            action=action,
+            qty=qty,
+            ticker=ticker or self._ticker,
+            board=board or self._board,
+            last_price=last_price or 0.0,
+        )
+
+    def _custom_reserve_capital(
+        self,
+        action: str,
+        qty: int,
+        ticker: str = "",
+        board: str = "",
+        last_price: float = 0.0,
+    ) -> str:
+        return self._order_executor.reserve_capital_for_order(
+            action=action,
+            qty=qty,
+            ticker=ticker or self._ticker,
+            board=board or self._board,
+            last_price=last_price or 0.0,
+        )
+
+    def _custom_release_capital(self, reservation_key: str):
+        self._order_executor.release_reserved_capital(reservation_key)
 
     def _load_point_cost(self) -> bool:
         """Загружает стоимость пункта из коннектора с повторными попытками."""
@@ -424,12 +559,18 @@ class LiveEngine:
             }
 
         entry_price = self._position_tracker.get_entry_price()
-        point_cost = self._point_cost
+        pnl_multiplier = self._get_pnl_multiplier()
 
-        gross_pnl = (price - entry_price) * qty * point_cost
         entry_commission = self._calculate_commission(self._ticker, qty, entry_price)
         exit_commission = self._calculate_commission(self._ticker, qty, price)
-        net_pnl = gross_pnl - entry_commission - exit_commission
+        net_pnl = valuation_service.compute_open_pnl(
+            entry_price=entry_price,
+            current_price=price,
+            qty=qty,
+            pnl_multiplier=pnl_multiplier,
+            entry_commission=entry_commission,
+            exit_commission=exit_commission,
+        )
 
         return {
             "ticker": self._ticker,
@@ -469,19 +610,25 @@ class LiveEngine:
         """Записывает текущий equity."""
         try:
             realized = get_total_pnl(self._strategy_id) or 0.0
-            unrealized = 0.0
-
             position_qty = self._position_tracker.get_position_qty()
             last_price = self._last_price
             entry_price = self._position_tracker.get_entry_price()
 
+            entry_commission = 0.0
+            exit_commission = 0.0
             if position_qty and last_price and entry_price:
-                gross_unrealized = (last_price - entry_price) * position_qty * self._point_cost
                 entry_commission = self._calculate_commission(self._ticker, position_qty, entry_price)
                 exit_commission = self._calculate_commission(self._ticker, position_qty, last_price)
-                unrealized = gross_unrealized - entry_commission - exit_commission
 
-            equity = realized + unrealized
+            equity = valuation_service.compute_equity_snapshot(
+                realized_pnl=realized,
+                entry_price=entry_price or 0.0,
+                current_price=last_price or 0.0,
+                position_qty=position_qty or 0,
+                pnl_multiplier=self._get_pnl_multiplier(),
+                entry_commission=entry_commission,
+                exit_commission=exit_commission,
+            )
             record_equity(self._strategy_id, equity, position_qty or 0)
         except Exception as e:
             logger.debug(f"[LiveEngine:{self._strategy_id}] equity_tracker error: {e}")
@@ -534,7 +681,13 @@ class LiveEngine:
         logger.info(f"[LiveEngine:{self._strategy_id}] Запущен, позиция={self._position_tracker.get_position()}")
 
     def stop(self, close_position: bool = None):
-        """Останавливает поток поллинга и выполняет graceful shutdown."""
+        """Останавливает поток поллинга и выполняет graceful shutdown.
+
+        Если close_position_on_stop=True и есть открытая позиция:
+        1. Отправляет аварийный close-ордер
+        2. Ждёт подтверждения flat (до 30 секунд)
+        3. Логирует, подтверждено ли закрытие или позиция может остаться на бирже
+        """
         if not self._running:
             return
 
@@ -544,6 +697,7 @@ class LiveEngine:
             data = get_strategy(self._strategy_id) or {}
             should_close = data.get("close_position_on_stop", False)
 
+        flat_confirmed = True  # True если нет позиции или закрытие подтверждено
         if should_close:
             qty = self._position_tracker.get_position_qty()
             pos = self._position_tracker.get_position()
@@ -554,11 +708,26 @@ class LiveEngine:
                 )
                 self._emergency_close_position()
 
+                # Ждём подтверждения flat
+                flat_confirmed = self._wait_for_flat(timeout=30)
+                if flat_confirmed:
+                    logger.info(
+                        f"[LiveEngine:{self._strategy_id}] "
+                        f"Flat подтверждён перед остановкой"
+                    )
+                else:
+                    logger.warning(
+                        f"[LiveEngine:{self._strategy_id}] "
+                        f"⚠️ ВНИМАНИЕ: flat НЕ подтверждён за 30с — "
+                        f"позиция может остаться открытой на бирже!"
+                    )
+
         self._running = False
         self._stop_event.set()
 
         # Останавливаем компоненты
         self._order_executor.stop()
+        self._cleanup_history_pool()
 
         # Ждём завершения основного потока
         if self._thread and self._thread.is_alive():
@@ -567,7 +736,46 @@ class LiveEngine:
         self._unsubscribe_quotes()
         equity_flush_all()
 
-        logger.info(f"[LiveEngine:{self._strategy_id}] Остановлен")
+        status = "остановлен" if flat_confirmed else "остановлен (RISK: позиция не подтверждена flat)"
+        logger.info(f"[LiveEngine:{self._strategy_id}] {status}")
+
+    def _wait_for_flat(self, timeout: float = 30) -> bool:
+        """Ожидает пока позиция станет нулевой (flat).
+
+        Returns:
+            True — позиция подтверждённо закрыта.
+            False — таймаут, позиция всё ещё открыта.
+        """
+        import time
+        deadline = time.time() + timeout
+        interval = 1.0
+
+        while time.time() < deadline:
+            qty = self._position_tracker.get_position_qty()
+            if qty == 0:
+                return True
+            # Попробуем reconcile через коннектор
+            try:
+                positions = self._connector.get_positions(self._account_id)
+                found = False
+                for p in (positions or []):
+                    if p.get("ticker") == self._ticker:
+                        broker_qty = int(float(p.get("quantity", 0)))
+                        if broker_qty == 0:
+                            self._position_tracker.update_position(0, 0)
+                            return True
+                        found = True
+                        break
+                if not found:
+                    # Тикер не найден в позициях — значит flat
+                    self._position_tracker.update_position(0, 0)
+                    return True
+            except Exception as e:
+                logger.debug(
+                    f"[LiveEngine:{self._strategy_id}] _wait_for_flat reconcile error: {e}"
+                )
+            time.sleep(interval)
+        return False
 
     def _subscribe_quotes(self):
         """Подписывается на котировки тикера."""
@@ -626,12 +834,30 @@ class LiveEngine:
 
             self._position_tracker.update_position(new_position, new_qty, new_entry_price)
             self._last_price = new_last_price
+            if self._sync_status != "synced":
+                logger.info(
+                    f"[LiveEngine:{self._strategy_id}] sync_status: "
+                    f"{self._sync_status} → synced"
+                )
+            self._sync_status = "synced"
         except Exception as e:
+            prev = self._sync_status
+            self._sync_status = "stale"
             logger.warning(f"[LiveEngine:{self._strategy_id}] "
-                           f"Не удалось определить позицию: {e}")
-            self._position_tracker.update_position(0, 0, 0.0)
-            self._last_price = 0.0
-            raise RuntimeError("Position detection failed — reconcile required")
+                           f"Не удалось определить позицию: {e} — "
+                           f"сохраняю последнюю подтверждённую: "
+                           f"pos={self._position_tracker.get_position()} "
+                           f"qty={self._position_tracker.get_position_qty()} "
+                           f"sync_status: {prev} → stale")
+
+    def _on_broker_unavailable(self):
+        """Callback из Reconciler: данные брокера недоступны → degraded state."""
+        if self._sync_status != "stale":
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] sync_status: "
+                f"{self._sync_status} → stale (broker unavailable в reconcile)"
+            )
+            self._sync_status = "stale"
 
     def _get_entry_price_from_history(self) -> float:
         """Берёт цену входа из последней незакрытой пары ордеров."""
@@ -645,11 +871,23 @@ class LiveEngine:
         return 0.0
 
     def _emergency_close_position(self):
-        """Экстренное закрытие позиции при circuit breaker."""
+        """Экстренное закрытие позиции при circuit breaker.
+
+        Использует guarded ownership: проверяет order_in_flight, чтобы
+        не отправлять параллельный close, если мониторинг уже ведёт закрытие.
+        """
         qty = self._position_tracker.get_position_qty()
         pos = self._position_tracker.get_position()
 
         if qty == 0 or pos == 0:
+            return
+
+        # Проверяем, не ведётся ли уже закрытие
+        if self._position_tracker.is_order_in_flight():
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] "
+                f"Аварийное закрытие пропущено — ордер уже в работе"
+            )
             return
 
         close_side = "sell" if pos == 1 else "buy"
@@ -704,9 +942,12 @@ class LiveEngine:
         if hasattr(self._module, "get_lookback"):
             try:
                 return int(self._module.get_lookback(self._params))
-            except Exception:
-                pass
-        return 300
+            except Exception as e:
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] get_lookback() failed: {e}, "
+                    f"using default={DEFAULT_STRATEGY_LOOKBACK}"
+                )
+        return DEFAULT_STRATEGY_LOOKBACK
 
     def _poll_loop(self):
         """Основной цикл: загрузка истории → поллинг новых баров."""
@@ -747,27 +988,43 @@ class LiveEngine:
             except Exception:
                 pass
 
-        result = {'df': None, 'error': None}
+        result_lock = threading.Lock()
+        result = {'df': None, 'error': None, 'done': False}
 
         def _fetch_history():
             try:
-                result['df'] = self._connector.get_history(
+                df = self._connector.get_history(
                     ticker=self._ticker,
                     board=self._board,
                     period=self._period_str,
                     days=days,
                 )
+                with result_lock:
+                    result['df'] = df
             except Exception as e:
-                result['error'] = e
-
-        fetch_thread = threading.Thread(target=_fetch_history, daemon=True)
-        fetch_thread.start()
+                with result_lock:
+                    result['error'] = e
+            finally:
+                with result_lock:
+                    result['done'] = True
 
         connector_id = getattr(self._connector, '_connector_id', 'finam')
         timeout = 30 if connector_id == 'quik' else 10
-        fetch_thread.join(timeout=timeout)
 
-        if fetch_thread.is_alive():
+        future = self._history_pool.submit(_fetch_history)
+        try:
+            future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            pass
+        except Exception:
+            pass
+
+        with result_lock:
+            done = result['done']
+            fetch_error = result['error']
+            df = result['df']
+
+        if not done:
             self._consecutive_timeouts += 1
             logger.warning(
                 f"[LiveEngine:{self._strategy_id}] get_history тайм-аут "
@@ -784,13 +1041,12 @@ class LiveEngine:
         else:
             self._consecutive_timeouts = 0
 
-        if result['error']:
+        if fetch_error:
             logger.error(
-                f"[LiveEngine:{self._strategy_id}] Ошибка get_history: {result['error']}"
+                f"[LiveEngine:{self._strategy_id}] Ошибка get_history: {fetch_error}"
             )
             return
 
-        df = result['df']
         if df is None or df.empty:
             return
 
@@ -870,6 +1126,14 @@ class LiveEngine:
         if action:
             self._last_signal_ts = time.monotonic()
 
+            # Degraded state: запрещаем открывающие сделки при stale broker data
+            if action in ("buy", "sell") and self._sync_status != "synced":
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] DEGRADED: sync_status={self._sync_status}, "
+                    f"{action.upper()} отклонён — ожидаем resync с брокером"
+                )
+                return
+
             # Защита от двойного входа
             if action in ("buy", "sell"):
                 if self._position_tracker.is_in_position():
@@ -883,36 +1147,64 @@ class LiveEngine:
 
             logger.info(f"[LiveEngine:{self._strategy_id}] Сигнал: {signal}")
 
-            # Делегируем execute_signal стратегии или order_executor
-            if hasattr(self._module, "execute_signal"):
+            # Делегируем execute_signal стратегии или order_executor.
+            # Custom execute_signal разрешён ТОЛЬКО для explicit adapters,
+            # валидированных через core.strategy_loader.
+            adapter_name = getattr(self._loaded, "custom_execution_adapter", None)
+            adapter_actions = getattr(self._loaded, "custom_execution_actions", frozenset())
+            has_custom_exec = hasattr(self._module, "execute_signal") and bool(adapter_name)
+
+            if hasattr(self._module, "execute_signal") and not adapter_name:
+                logger.error(
+                    f"[LiveEngine:{self._strategy_id}] Стратегия определяет execute_signal, "
+                    f"но не зарегистрирована как explicit execution adapter. "
+                    f"Custom execution заблокирован — используем стандартный OrderExecutor"
+                )
+
+            if has_custom_exec:
                 try:
-                    allowed_actions = {"buy", "sell", "close"}
                     signal_action = signal.get("action")
-                    if signal_action not in allowed_actions:
+                    if signal_action not in adapter_actions:
                         logger.warning(
                             f"[LiveEngine:{self._strategy_id}] Некорректный action={signal_action!r} "
-                            f"в сигнале custom execute_signal, сигнал пропущен"
+                            f"для adapter={adapter_name}, сигнал пропущен"
                         )
                         return
-                    try:
-                        signal_qty = int(signal.get("qty", 1))
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            f"[LiveEngine:{self._strategy_id}] Некорректный qty в сигнале "
-                            f"custom execute_signal: {signal.get('qty')!r}"
-                        )
-                        return
-                    if signal_qty <= 0:
-                        logger.warning(
-                            f"[LiveEngine:{self._strategy_id}] qty <= 0 в сигнале "
-                            f"custom execute_signal: {signal_qty}"
-                        )
-                        return
+                    if signal_action in ("buy", "sell", "close"):
+                        try:
+                            signal_qty = int(signal.get("qty", 1))
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                f"[LiveEngine:{self._strategy_id}] Некорректный qty в сигнале "
+                                f"custom adapter={adapter_name}: {signal.get('qty')!r}"
+                            )
+                            return
+                        if signal_qty <= 0:
+                            logger.warning(
+                                f"[LiveEngine:{self._strategy_id}] qty <= 0 в сигнале "
+                                f"custom adapter={adapter_name}: {signal_qty}"
+                            )
+                            return
 
-                    self._params["_strategy_id"] = self._strategy_id
-                    self._params["_connector_id"] = self._connector_id
+                        if signal_action in ("buy", "sell"):
+                            allowed, reason = self._custom_pretrade_risk_check(signal_action, signal_qty)
+                            if not allowed:
+                                logger.warning(
+                                    f"[LiveEngine:{self._strategy_id}] RISK REJECT: {reason}, "
+                                    f"custom {signal_action.upper()} x{signal_qty} отклонён"
+                                )
+                                return
+
+                    custom_params = dict(self._params)
+                    custom_params["_strategy_id"] = self._strategy_id
+                    custom_params["_connector_id"] = self._connector_id
+                    custom_params["_execution_adapter"] = adapter_name
+                    custom_params["_pretrade_risk_check"] = self._custom_pretrade_risk_check
+                    custom_params["_account_risk_check"] = self._custom_account_risk_check
+                    custom_params["_reserve_capital"] = self._custom_reserve_capital
+                    custom_params["_release_capital"] = self._custom_release_capital
                     self._module.execute_signal(
-                        signal, self._connector, self._params, self._account_id
+                        signal, self._connector, custom_params, self._account_id
                     )
                 except Exception as e:
                     logger.error(f"[LiveEngine:{self._strategy_id}] "
@@ -923,15 +1215,19 @@ class LiveEngine:
 
     # === Legacy прокси-методы для обратной совместимости ===
 
+    def _on_circuit_break(self):
+        """Вызывается из OrderExecutor при срабатывании circuit breaker."""
+        logger.error(
+            f"[LiveEngine:{self._strategy_id}] CIRCUIT BREAKER: "
+            f"{self._risk_guard.consecutive_failures} ошибок подряд — аварийное закрытие позиции"
+        )
+        self._emergency_close_position()
+        self.stop()
+
     def _record_failure(self):
         """Прокси к risk_guard.record_failure()."""
         if self._risk_guard.record_failure():
-            logger.error(
-                f"[LiveEngine:{self._strategy_id}] CIRCUIT BREAKER: "
-                f"{self._risk_guard.consecutive_failures} ошибок подряд — аварийное закрытие позиции"
-            )
-            self._emergency_close_position()
-            self.stop()
+            self._on_circuit_break()
 
     def _record_success(self):
         """Прокси к risk_guard.record_success()."""

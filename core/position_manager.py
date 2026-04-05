@@ -45,12 +45,12 @@ class PositionManager:
         """Отписывается от старого коннектора перед переключением."""
         old_connector = self._connector()
         if old_connector:
-            old_connector.off_positions_update()
+            old_connector.unsubscribe_positions(self._on_positions_update)
 
     def _subscribe(self):
         connector = self._connector()
         if connector:
-            connector.on_positions_update(self._on_positions_update)
+            connector.subscribe_positions(self._on_positions_update)
 
     def _connector(self):
         from core.connector_manager import connector_manager
@@ -144,7 +144,7 @@ class PositionManager:
             )
             return False
 
-        close_qty = quantity if 0 < quantity < total_qty else total_qty
+        close_qty = quantity if 0 < quantity <= total_qty else total_qty
         result = connector.close_position(
             account_id=account_id,
             ticker=ticker,

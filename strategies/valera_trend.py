@@ -4,6 +4,8 @@
 
 from loguru import logger
 
+from core.indicators import is_nan
+
 
 def get_info() -> dict:
     return {
@@ -35,14 +37,14 @@ def get_params() -> dict:
             "description": "Минимальное кол-во баров подряд полностью по одну сторону от SMA",
         },
         "time_open": {
-            "type": "time", "default": 600,
+            "type": "time", "default": 830,
             "label": "Время входа (мин)",
-            "description": "Время входа в минутах от полуночи (600 = 10:00)",
+            "description": "Время входа в минутах от полуночи (830 = 13:50)",
         },
         "time_close": {
-            "type": "time", "default": 1425,
+            "type": "time", "default": 810,
             "label": "Время выхода (мин)",
-            "description": "Время выхода в минутах от полуночи (1425 = 23:45)",
+            "description": "Время выхода в минутах от полуночи (810 = 13:30). Позиция закрывается на следующий день.",
         },
         "qty": {
             "type": "int", "default": 1, "min": 1, "max": 100,
@@ -118,12 +120,11 @@ def on_precalc(df, params: dict):
 
 def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     """
-    Логика VALERA_TREND в overnight-режиме:
+    Логика VALERA_TREND:
     - Лонг:  time == time_open && open > sma && candle_count >= candles && !pos && не пятница/суббота/воскресенье
     - Шорт:  time == time_open && open < sma && candle_count >= candles && !pos && не пятница
-    - Выход: в окне time_close <= time < time_open для уже открытой позиции
-
-    В стратегии не реализованы дополнительные выходы по слому фильтра или пересечению SMA.
+    - Выход: позиция держится ~24ч, закрывается в окне [time_close, time_open)
+      Пример: вход 13:50 (time_open=830), выход 13:30 следующего дня (time_close=810)
     """
     if len(bars) < 2:
         return {"action": None}
@@ -142,21 +143,22 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     candles_min = int(params.get("candles", 12))
     qty = int(params.get("qty", 1))
 
-    def _nan(v):
-        try:
-            return v != v or v is None
-        except Exception:
-            return True
-
-    if _nan(sma):
+    if is_nan(sma):
         return {"action": None}
 
     filtr = candle_count >= candles_min
 
-    # Выход в overnight-окне следующего дня: закрываем после time_close,
-    # но не на баре нового входа time_open.
+    # Выход по времени: окно закрытия [time_close, time_open)
+    # Поддерживает overnight-окна (time_close > time_open),
+    # например time_close=1425 (23:45), time_open=600 (10:00)
     if position != 0:
-        if time_close <= time_min < time_open:
+        if time_close <= time_open:
+            # Обычное окно в пределах одного дня
+            in_close_window = time_close <= time_min < time_open
+        else:
+            # Overnight-окно: закрываем после time_close ИЛИ до time_open
+            in_close_window = time_min >= time_close or time_min < time_open
+        if in_close_window:
             return {"action": "close", "qty": qty, "comment": f"Close by time window {time_min}"}
 
     # Вход — только в заданное время

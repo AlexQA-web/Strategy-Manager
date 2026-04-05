@@ -3,7 +3,10 @@
 # Портировано из TSLab
 
 import math
+
 from loguru import logger
+
+from core.indicators import is_nan
 
 
 def get_info() -> dict:
@@ -172,15 +175,7 @@ def on_bar(bars: list[dict], position: int, params: dict) -> dict:
     level_long = cur.get("_level_long")
     level_short = cur.get("_level_short")
 
-    def _bad(v):
-        if v is None:
-            return True
-        try:
-            return math.isnan(v)
-        except (TypeError, ValueError):
-            return True
-
-    if _bad(level_long) or _bad(level_short):
+    if is_nan(level_long) or is_nan(level_short):
         return {"action": None}
 
     # Фильтр: только будни

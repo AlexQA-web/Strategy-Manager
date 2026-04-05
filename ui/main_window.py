@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QSettings
 from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QIcon
 from ui.icons import apply_icon
+from ui.sec_info_cache import SecInfoCache
+from ui.log_mixin import LogMixin
 from loguru import logger
 
 from config.settings import APP_NAME, APP_VERSION
@@ -477,7 +479,7 @@ class AgentTable(QTableWidget):
 # ─────────────────────────────────────────────
 # Главное окно
 # ─────────────────────────────────────────────
-class MainWindow(QMainWindow):
+class MainWindow(LogMixin, QMainWindow):
 
     def __init__(self):
         super().__init__()
@@ -490,13 +492,17 @@ class MainWindow(QMainWindow):
         self._row_order: list = []   # порядок sid агентов (in-memory, синхронизируется с QSettings)
 
         # Кэш для sec_info (чтобы не блокировать GUI при запросах к QUIK)
-        self._sec_info_cache: dict = {}  # {(connector_id, ticker, board): (sec_info, timestamp)}
-        self._refreshing_sec_info: set = set()  # множество ключей, которые уже загружаются
-        self._SEC_INFO_TTL = 60  # обновлять раз в 60 секунд
+        self._sec_info_cache = SecInfoCache(ttl=60, max_age=300)
 
         # Кэш состояния таблицы для diff-based обновления (Пункт 17)
-        self._table_state: dict = {}  # {row_key: {col_name: hash_value}}
+        self._table_state: dict = {}  # {row_key: hash_string}
         self._widget_cache: dict = {}  # {row_key: {col_name: widget}} для переиспользования виджетов
+
+        # Кэши данных order_history для избежания O(n) чтений файла (Пункт 6)
+        self._pnl_cache: dict[str, float | None] = {}
+        self._open_commission_cache: dict[str, float | None] = {}
+        self._total_commission_cache: dict[str, float] = {}
+        self._pnl_by_ticker_cache: dict[str, dict[str, float]] = {}
 
         self._setup_core()
         self._build_ui()
@@ -563,11 +569,14 @@ class MainWindow(QMainWindow):
 
         Возвращает строку-хэш на основе всех данных, отображаемых в строке.
         Если хэш не изменился — строку можно пропустить при обновлении.
+
+        NOTE: Использует кэши _pnl_cache, _open_commission_cache, _total_commission_cache,
+        _pnl_by_ticker_cache, заполняемые в _refresh_table для избежания O(n) чтений файла.
         """
         import hashlib
 
         if is_child:
-            pnl_by_ticker = get_pnl_by_ticker(sid)
+            pnl_by_ticker = self._pnl_by_ticker_cache.get(sid, {})
             t_pnl = pnl_by_ticker.get(child_ticker)
             parts = [
                 "child", sid, child_ticker,
@@ -613,9 +622,10 @@ class MainWindow(QMainWindow):
                 cur_price = f"{pos['current_price']:.3f}" if pos else "—"
                 pnl = pos["pnl"] if pos else None
 
-            total_pnl = get_total_pnl(sid)
-            open_commission = get_open_commission(sid)
-            total_commission = get_total_commission(sid)
+            # Берём из кэша вместо прямых вызовов (Пункт 6)
+            total_pnl = self._pnl_cache.get(sid)
+            open_commission = self._open_commission_cache.get(sid)
+            total_commission = self._total_commission_cache.get(sid, 0.0)
 
             # П.Лот
             pot_lot_str = ""
@@ -1030,50 +1040,7 @@ class MainWindow(QMainWindow):
 
     def _get_sec_info_cached(self, connector, connector_id: str, ticker: str, board: str):
         """Возвращает sec_info из кэша или None, не блокируя GUI."""
-        import time
-        key = (connector_id, ticker, board)
-        cached = self._sec_info_cache.get(key)
-        
-        if cached:
-            sec_info, ts = cached
-            if time.monotonic() - ts < self._SEC_INFO_TTL:
-                return sec_info  # отдаём из кэша
-        
-        # Кэш устарел — обновляем в фоне, возвращаем старое значение если есть
-        if cached:
-            self._refresh_sec_info_background(connector, connector_id, ticker, board)
-            return cached[0]
-        
-        # Первый запрос — тоже в фоне
-        self._refresh_sec_info_background(connector, connector_id, ticker, board)
-        return None
-
-    def _refresh_sec_info_background(self, connector, connector_id: str, ticker: str, board: str):
-        """Обновляет sec_info в фоновом потоке.
-        
-        Использует _refreshing_sec_info для предотвращения дублирующих потоков.
-        """
-        import threading
-        import time
-        key = (connector_id, ticker, board)
-        
-        # Проверяем, не запущен ли уже поток для этого ключа
-        if key in self._refreshing_sec_info:
-            return  # уже в процессе
-        
-        self._refreshing_sec_info.add(key)
-        
-        def _fetch():
-            try:
-                sec_info = connector.get_sec_info(ticker, board)
-                if sec_info:
-                    self._sec_info_cache[key] = (sec_info, time.monotonic())
-            except Exception:
-                pass
-            finally:
-                self._refreshing_sec_info.discard(key)
-        
-        threading.Thread(target=_fetch, daemon=True).start()
+        return self._sec_info_cache.get(connector, connector_id, ticker, board)
 
     def _refresh_table(self):
         """Diff-based обновление таблицы.
@@ -1082,11 +1049,24 @@ class MainWindow(QMainWindow):
         Если структура таблицы не изменилась (те же строки, те же хэши) —
         метод возвращается сразу, без каких-либо операций с виджетами.
         """
+        self._sec_info_cache.evict_stale()
+
         from core.autostart import get_live_engines
         from core.connector_manager import connector_manager
 
         strategies = get_all_strategies()
         engines = get_live_engines()
+
+        # Собираем данные order_history один раз для всех стратегий (Пункт 6)
+        self._pnl_cache.clear()
+        self._open_commission_cache.clear()
+        self._total_commission_cache.clear()
+        self._pnl_by_ticker_cache.clear()
+        for sid in strategies:
+            self._pnl_cache[sid] = get_total_pnl(sid)
+            self._open_commission_cache[sid] = get_open_commission(sid)
+            self._total_commission_cache[sid] = get_total_commission(sid)
+            self._pnl_by_ticker_cache[sid] = get_pnl_by_ticker(sid)
 
         # Применяем сохранённый порядок строк
         saved_order = self._row_order
@@ -1849,105 +1829,8 @@ class MainWindow(QMainWindow):
         self._tray.set_connected(any_connected)
 
     # ─────────────────────────────────────────────
-    # Лог
+    # Лог (реализация в LogMixin)
     # ─────────────────────────────────────────────
-
-    def _handle_log(self, message):
-        try:
-            record = message.record
-            ui_signals.log_message.emit(
-                record["message"], record["level"].name.lower()
-            )
-        except RuntimeError:
-            # Qt объект уже удалён при завершении программы — игнорируем
-            pass
-
-    def _log(self, text: str, level: str = 'info'):
-        ui_signals.log_message.emit(text, level)
-
-    def _append_log(self, text: str, level: str):
-        colors = {
-            'debug': '#6c7086',
-            'info': '#cdd6f4',
-            'warning': '#f9e2af',
-            'error': '#f38ba8',
-            'critical': '#fab387',
-        }
-        color = colors.get(level, '#cdd6f4')
-        html = self._format_log_html(text, color)
-
-        if level != 'debug':
-            self._append_log_to_view(self._log_views['Общий'], html)
-        if self._is_connection_log(text):
-            self._append_log_to_view(self._log_views['Соединение'], html)
-        if self._is_position_log(text):
-            self._append_log_to_view(self._log_views['Позиции'], html)
-        if level == 'debug':
-            self._append_log_to_view(self._log_views['Дебаг'], html)
-        if self._is_error_log(text, level):
-            self._append_log_to_view(self._log_views['Ошибки'], html)
-
-    def _format_log_html(self, text: str, color: str) -> str:
-        t = datetime.now().strftime('%H:%M:%S')
-        safe_text = escape(text)
-        return (
-            f'<span style="color:#45475a">{t}</span>  '
-            f'<span style="color:{color}">{safe_text}</span>'
-        )
-
-    def _append_log_to_view(self, view: QTextEdit, html: str):
-        view.append(html)
-        self._trim_log_view(view)
-        sb = view.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def _trim_log_view(self, view: QTextEdit, max_blocks: int = 5000):
-        doc = view.document()
-        if doc.blockCount() <= max_blocks:
-            return
-        cursor = view.textCursor()
-        cursor.movePosition(cursor.MoveOperation.Start)
-        cursor.movePosition(
-            cursor.MoveOperation.Down,
-            cursor.MoveMode.KeepAnchor,
-            doc.blockCount() - max_blocks,
-        )
-        cursor.removeSelectedText()
-
-    def _clear_logs(self):
-        for view in self._log_views.values():
-            view.clear()
-
-    def _is_connection_log(self, text: str) -> bool:
-        text_lower = text.lower()
-        keywords = (
-            '[quik]', '[финам]', '[finam]', '[connectormanager]',
-            'подключение', 'подключён', 'подключен', 'отключение', 'отключён', 'отключен',
-            'коннектор', 'disconnect', 'reconnect', 'connect', 'lua-скрипт', 'серверу брокера',
-        )
-        return any(keyword in text_lower for keyword in keywords)
-
-    def _is_position_log(self, text: str) -> bool:
-        text_lower = text.lower()
-        keywords = (
-            'позиц', 'positionmanager', 'ордер', 'заявк', 'close_position', 'place_manual_order',
-            'limit ', 'market ', ' chase ', 'filled=', 'tid=', ' buy ', ' sell ', ' close ', 'qty=',
-        )
-        return any(keyword in text_lower for keyword in keywords)
-
-    def _is_error_log(self, text: str, level: str) -> bool:
-        if level in {'error', 'critical'}:
-            return True
-        text_lower = text.lower()
-        return 'ошиб' in text_lower or 'exception' in text_lower or 'traceback' in text_lower
-
-    def _toggle_log(self):
-        self._log_visible = not self._log_visible
-        self.log_tabs.setVisible(self._log_visible)
-        self.logbar.setFixedHeight(160 if self._log_visible else 26)
-        self.btn_log_toggle.setText(
-            'Свернуть' if self._log_visible else 'Развернуть'
-        )
 
     # ─────────────────────────────────────────────
     # Настройки

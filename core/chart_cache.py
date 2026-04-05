@@ -9,12 +9,25 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 import pickle
+import threading
 import pandas as pd
 from loguru import logger
 
 from config.settings import DATA_DIR
 
 CACHE_DIR = DATA_DIR / 'chart_cache'
+
+# Per-key lock для конкурентных save/load по одному ключу
+_key_locks: dict[str, threading.Lock] = {}
+_key_locks_guard = threading.Lock()
+
+
+def _get_key_lock(key: str) -> threading.Lock:
+    """Возвращает lock для конкретного cache-ключа (board/ticker/timeframe)."""
+    with _key_locks_guard:
+        if key not in _key_locks:
+            _key_locks[key] = threading.Lock()
+        return _key_locks[key]
 
 
 def _safe_path_part(value: str) -> str:
@@ -42,59 +55,68 @@ def _quarantine_bad_cache(path: Path, board: str, ticker: str, timeframe: str, r
 
 def load(ticker: str, timeframe: str, board: str = 'TQBR') -> Optional[pd.DataFrame]:
     """Загружает кеш с диска. Возвращает None если кеша нет."""
-    path = _path(ticker, timeframe, board)
-    if not path.exists():
-        return None
-    try:
-        with open(path, 'rb') as f:
-            df = pickle.load(f)
-    except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as e:
-        logger.warning(f'[Cache] Битый кеш {board}/{ticker}/{timeframe}: {e}')
-        _quarantine_bad_cache(path, board, ticker, timeframe, 'pickle')
-        return None
-    except Exception as e:
-        logger.warning(f'[Cache] Ошибка чтения {board}/{ticker}/{timeframe}: {e}')
-        return None
+    key = f"{board}/{ticker}/{timeframe}"
+    lock = _get_key_lock(key)
+    with lock:
+        path = _path(ticker, timeframe, board)
+        if not path.exists():
+            return None
+        try:
+            with open(path, 'rb') as f:
+                df = pickle.load(f)
+        except (pickle.UnpicklingError, EOFError, AttributeError, ValueError) as e:
+            logger.warning(f'[Cache] Битый кеш {key}: {e}')
+            _quarantine_bad_cache(path, board, ticker, timeframe, 'pickle')
+            return None
+        except Exception as e:
+            logger.warning(f'[Cache] Ошибка чтения {key}: {e}')
+            return None
 
-    if not isinstance(df, pd.DataFrame):
-        logger.warning(f'[Cache] Некорректный тип кеша {board}/{ticker}/{timeframe}: {type(df).__name__}')
-        _quarantine_bad_cache(path, board, ticker, timeframe, 'type')
-        return None
+        if not isinstance(df, pd.DataFrame):
+            logger.warning(f'[Cache] Некорректный тип кеша {key}: {type(df).__name__}')
+            _quarantine_bad_cache(path, board, ticker, timeframe, 'type')
+            return None
 
-    if df.empty:
-        return None
+        if df.empty:
+            return None
 
-    try:
-        df.index = pd.to_datetime(df.index)
-    except Exception as e:
-        logger.warning(f'[Cache] Некорректный индекс кеша {board}/{ticker}/{timeframe}: {e}')
-        _quarantine_bad_cache(path, board, ticker, timeframe, 'index')
-        return None
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception as e:
+            logger.warning(f'[Cache] Некорректный индекс кеша {key}: {e}')
+            _quarantine_bad_cache(path, board, ticker, timeframe, 'index')
+            return None
 
-    logger.debug(f'[Cache] Загружен {board}/{ticker}/{timeframe}: {len(df)} баров, '
-                 f'последний: {df.index[-1]}')
-    return df
+        logger.debug(f'[Cache] Загружен {key}: {len(df)} баров, '
+                     f'последний: {df.index[-1]}')
+        return df
 
 
 def save(ticker: str, timeframe: str, df: pd.DataFrame, board: str = 'TQBR'):
-    """Сохраняет df в кеш."""
+    """Сохраняет df в кеш. Per-key lock предотвращает конкурентную запись."""
     if df is None or df.empty:
         return
-    temp_path = None
-    try:
-        path = _path(ticker, timeframe, board)
-        temp_path = path.with_suffix(path.suffix + '.tmp')
-        # Сохраняем только OHLCV + индикаторные колонки (_*)
-        cols = [c for c in df.columns if c in ('Open', 'High', 'Low', 'Close', 'Volume')
-                or c.startswith('_')]
-        with open(temp_path, 'wb') as f:
-            pickle.dump(df[cols], f, protocol=pickle.HIGHEST_PROTOCOL)
-        temp_path.replace(path)
-        logger.debug(f"[Cache] Сохранён {board}/{ticker}/{timeframe}: {len(df)} баров")
-    except Exception as e:
-        logger.warning(f"[Cache] Ошибка записи {board}/{ticker}/{timeframe}: {e}")
-        if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+    key = f"{board}/{ticker}/{timeframe}"
+    lock = _get_key_lock(key)
+    with lock:
+        temp_path = None
+        try:
+            path = _path(ticker, timeframe, board)
+            temp_path = path.with_suffix(path.suffix + '.tmp')
+            # Сохраняем только OHLCV + индикаторные колонки (_*)
+            cols = [c for c in df.columns if c in ('Open', 'High', 'Low', 'Close', 'Volume')
+                    or c.startswith('_')]
+            with open(temp_path, 'wb') as f:
+                pickle.dump(df[cols], f, protocol=pickle.HIGHEST_PROTOCOL)
+            temp_path.replace(path)
+            logger.debug(f"[Cache] Сохранён {key}: {len(df)} баров")
+        except Exception as e:
+            logger.warning(f"[Cache] Ошибка записи {key}: {e}")
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def merge(cached: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
@@ -131,3 +153,18 @@ def last_bar_time(ticker: str, timeframe: str, board: str = 'TQBR') -> Optional[
     if df is None or df.empty:
         return None
     return df.index[-1].to_pydatetime()
+
+
+def cleanup_tmp_files():
+    """Удаляет orphan .tmp файлы из chart_cache при старте."""
+    if not CACHE_DIR.exists():
+        return
+    count = 0
+    for tmp_file in CACHE_DIR.rglob("*.tmp"):
+        try:
+            tmp_file.unlink()
+            count += 1
+        except OSError as e:
+            logger.warning(f"[Cache] Не удалось удалить {tmp_file.name}: {e}")
+    if count:
+        logger.info(f"[Cache] Удалено {count} orphan .tmp файлов")

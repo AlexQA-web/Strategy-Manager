@@ -241,18 +241,28 @@ def on_start(params, connector) -> None:
 - служебные расчёты, которые не нужны на графике, лучше не публиковать;
 - обычно индикаторные колонки в стратегиях называют с префиксом `_`.
 
-## `execute_signal()` — только для special-case исполнения
+## `execute_signal()` — ограниченный custom execution (TASK-043)
 
-По умолчанию `LiveEngine` сам исполняет сигнал, который вернул `on_bar()`.
+По умолчанию `LiveEngine` сам исполняет сигнал через canonical execution path:
+`on_bar() → OrderExecutor → RiskGuard → FillLedger → PositionTracker`.
 
-`execute_signal()` добавлять только если стандартного исполнения недостаточно, например:
+**Обычным стратегиям `execute_signal()` НЕ НУЖЕН.** Его наличие обходит:
+- pre-trade risk gate (RiskGuard)
+- circuit breaker hard-stop
+- account-level exposure limits
+- canonical fill ledger (дедупликация)
+- reservation ledger (buying power)
 
-- мультиинструментальная стратегия;
-- собственный lifecycle лимитных заявок;
-- особая логика подтверждения позиции или закрытия;
-- стратегия, которая осознанно берёт реальное исполнение на себя.
+`execute_signal()` допускается **только** для зарегистрированных strategy adapters.
+Самообъявления вида `__execution_mode__ = "custom"` больше недостаточно.
+Примеры:
+- мультиинструментальная стратегия (achilles: корзина тикеров);
+- стратегия с собственным lifecycle лимитных заявок (bochka_cny).
 
-Обычной bar-based стратегии `execute_signal()` обычно не нужен.
+При наличии `execute_signal()` стратегия **обязана**:
+1. Записывать fills через `FillLedger.record_fill()` (не напрямую в order_history)
+2. Использовать `ValuationService` для PnL-калькуляции
+3. Не обходить RiskGuard/circuit breaker — проверять самостоятельно
 
 Базовый каркас:
 
@@ -266,33 +276,31 @@ def execute_signal(signal, connector, params, account_id):
 
 ## Запись сделок из `execute_signal()`
 
-Если стратегия обходит стандартное исполнение движка и исполняет сделки сама, она обязана сама же корректно писать историю сделок.
+Стратегии с custom execution записывают fills через canonical FillLedger:
 
 ```python
-from core.order_history import make_order, save_order
+from core.fill_ledger import fill_ledger
 from core.commission_manager import commission_manager
+from core.valuation_service import valuation_service
 
 comm = commission_manager.calculate(
-    ticker=ticker,
-    board=board,
-    quantity=qty,
-    price=price,
-    order_role='taker',
-    point_cost=1.0,
-    connector_id=connector_id,
+    ticker=ticker, board=board, quantity=qty, price=price,
+    order_role='taker', point_cost=point_cost, connector_id=connector_id,
 )
-order = make_order(
-    strategy_id,
-    ticker,
-    side,
-    qty,
-    price,
-    board,
-    comment=comment,
-    commission=comm / qty,
-    point_cost=1.0,
+
+pnl_mult = valuation_service.get_pnl_multiplier(
+    is_futures=is_futures, point_cost=point_cost, lot_size=lot_size,
 )
-save_order(order)
+
+fill_ledger.record_fill(
+    fill_id=execution_id,      # уникальный ID от коннектора
+    strategy_id=strategy_id,
+    ticker=ticker, board=board, side=side,
+    qty=qty, price=price,
+    agent_name=agent_name,
+    commission_total=comm,
+    pnl_multiplier=pnl_mult,
+)
 ```
 
 ## Исключённые даты

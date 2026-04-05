@@ -10,8 +10,7 @@ def autoconnect_connectors() -> None:
     """Автоподключение коннекторов по расписанию."""
     from core.storage import get_bool_setting, get_all_schedules
     from core.connector_manager import connector_manager, register_connectors
-    from core.scheduler import strategy_scheduler
-    from datetime import datetime, time as dtime
+    from core.scheduler import strategy_scheduler, is_in_schedule
 
     # Регистрируем коннекторы (отложенная инициализация)
     register_connectors()
@@ -22,55 +21,29 @@ def autoconnect_connectors() -> None:
     if not get_bool_setting("autoconnect"):
         return
 
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        from backports.zoneinfo import ZoneInfo
-
     schedules = get_all_schedules()
-    now_msk = datetime.now(ZoneInfo("Europe/Moscow"))
-    now_t = now_msk.time().replace(second=0, microsecond=0)
-    today = now_msk.weekday()
 
     for cid, sched in schedules.items():
         if not isinstance(sched, dict) or not sched.get("is_active", True):
             continue
-        if today not in sched.get("days", [0, 1, 2, 3, 4, 5, 6]):
-            logger.info(f"Автозапуск [{cid}]: не торговый день — пропуск")
-            continue
 
-        try:
-            ch, cm = map(int, sched.get("connect_time", "06:50").split(":"))
-            dh, dm = map(int, sched.get("disconnect_time", "23:45").split(":"))
-            t_open, t_close = dtime(ch, cm), dtime(dh, dm)
-            if t_open <= t_close:
-                in_window = t_open <= now_t <= t_close
-            else:
-                in_window = now_t >= t_open or now_t <= t_close
-        except Exception as e:
-            logger.warning(f"Автозапуск [{cid}]: ошибка парсинга расписания, пропуск: {e}")
-            in_window = False
-
-        if in_window:
+        if is_in_schedule(cid):
             connector = connector_manager.get(cid)
             if connector:
                 logger.info(f"Автозапуск: подключаем [{cid}]...")
                 threading.Thread(target=connector.connect, daemon=True).start()
-        else:
-            logger.info(f"Автозапуск [{cid}]: вне окна работы — пропуск")
-
-
 _live_engines: Dict[str, Any] = {}  # strategy_id → LiveEngine
-_live_engines_lock = threading.Lock()  # защита от race condition
+
+# Единый lock для атомарных проверок состояния движков
+_engine_state_lock = threading.Lock()
 
 # Защита от двойного запуска: стратегии "в процессе запуска"
 _launching_engines: Dict[str, bool] = {}
-_launching_engines_lock = threading.Lock()
 
 
 def get_live_engines() -> Dict[str, Any]:
     """Возвращает копию словаря запущенных LiveEngine (потокобезопасно)."""
-    with _live_engines_lock:
+    with _engine_state_lock:
         return dict(_live_engines)
 
 
@@ -84,7 +57,7 @@ def stop_live_engine(strategy_id: str) -> bool:
     from core.strategy_loader import strategy_loader
     from core.connector_manager import connector_manager
 
-    with _live_engines_lock:
+    with _engine_state_lock:
         engine = _live_engines.get(strategy_id)
         if engine is None:
             logger.warning(f"[autostart] LiveEngine для стратегии '{strategy_id}' не найден")
@@ -144,14 +117,11 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
         params['order_mode'] = order_mode
         logger.info(f"[autostart] [{strategy_id}] order_mode мигрирован в params: {params['order_mode']}")
 
-    with _live_engines_lock:
-        existing = _live_engines.get(strategy_id)
-    if existing is not None:
-        logger.info(f"[autostart] [{strategy_id}] LiveEngine уже запущен")
-        return True
-
-    # Защита от двойного запуска: проверяем, не запущен ли уже процесс
-    with _launching_engines_lock:
+    # Атомарная проверка: уже запущен или в процессе запуска
+    with _engine_state_lock:
+        if strategy_id in _live_engines:
+            logger.info(f"[autostart] [{strategy_id}] LiveEngine уже запущен")
+            return True
         if _launching_engines.get(strategy_id, False):
             logger.info(f"[autostart] [{strategy_id}] LiveEngine уже в процессе запуска — пропуск")
             return False
@@ -212,7 +182,7 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
                     lot_sizing=data.get('lot_sizing', {}),
                 )
                 engine.start()
-                with _live_engines_lock:
+                with _engine_state_lock:
                     _live_engines[strategy_id] = engine
                 logger.info(f"Автозапуск: [{strategy_id}] LiveEngine запущен")
             except Exception as e:
@@ -222,7 +192,7 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
         return True
     finally:
         # Снимаем флаг запуска независимо от результата
-        with _launching_engines_lock:
+        with _engine_state_lock:
             _launching_engines.pop(strategy_id, None)
 
 
