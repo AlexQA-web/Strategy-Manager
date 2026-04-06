@@ -28,6 +28,29 @@ _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 
 
+def _default_state() -> dict:
+    return {
+        "peak": None,
+        "max_drawdown": 0.0,
+        "max_drawdown_per_unit": 0.0,
+        "last_equity": 0.0,
+        "samples": 0,
+    }
+
+
+def _normalize_state(state: dict | None) -> dict:
+    raw = dict(state or {})
+    normalized = _default_state()
+    normalized.update(raw)
+
+    if "max_drawdown_per_unit" not in raw:
+        legacy_per_unit = float(raw.get("max_drawdown", 0.0) or 0.0)
+        if legacy_per_unit > 0:
+            normalized["max_drawdown_per_unit"] = round(legacy_per_unit, 2)
+            normalized["max_drawdown"] = 0.0
+    return normalized
+
+
 def _ensure_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -40,10 +63,10 @@ def _load_from_disk(strategy_id: str) -> dict:
     path = _file_path(strategy_id)
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return _normalize_state(json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             pass
-    return {"peak": None, "max_drawdown": 0.0, "last_equity": 0.0, "samples": 0}
+    return _default_state()
 
 
 def _flush_to_disk(strategy_id: str, state: dict):
@@ -72,7 +95,7 @@ def record_equity(strategy_id: str, equity: float, position_qty: int = 1, force_
     """Записывает текущий equity и обновляет peak / max_drawdown.
 
     equity = реализованный P/L (закрытые сделки) + плавающий P/L (открытая позиция).
-    position_qty = кол-во контрактов/лотов в текущей позиции (для нормализации dd к 1 лоту).
+    position_qty = кол-во контрактов/лотов в текущей позиции (для secondary-метрики dd на 1 лот).
     force_flush = принудительный сброс на диск сразу (для сохранения данных после сделки).
     """
     with _cache_lock:
@@ -95,12 +118,14 @@ def record_equity(strategy_id: str, equity: float, position_qty: int = 1, force_
             state["peak"] = peak
 
         dd = peak - equity
-        # Нормализуем dd к 1 лоту/контракту
+        if dd > state.get("max_drawdown", 0.0):
+            state["max_drawdown"] = round(dd, 2)
+
         if position_qty != 0:
             qty = abs(position_qty)
             dd_per_lot = dd / qty
-            if dd_per_lot > state.get("max_drawdown", 0.0):
-                state["max_drawdown"] = round(dd_per_lot, 2)
+            if dd_per_lot > state.get("max_drawdown_per_unit", 0.0):
+                state["max_drawdown_per_unit"] = round(dd_per_lot, 2)
 
         entry["dirty"] = True
 
@@ -113,7 +138,7 @@ def record_equity(strategy_id: str, equity: float, position_qty: int = 1, force_
 
 
 def get_max_drawdown(strategy_id: str) -> Optional[float]:
-    """Возвращает реальную макс. просадку агента на 1 лот/контракт."""
+    """Возвращает абсолютную максимальную просадку по equity curve."""
     state = _get_cached(strategy_id)
     dd = state.get("max_drawdown", 0.0)
     return round(dd, 2) if dd > 0 else None

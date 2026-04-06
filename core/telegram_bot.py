@@ -14,6 +14,7 @@ except ImportError:
     logger.warning("python-telegram-bot не установлен. Уведомления отключены.")
 
 from core.storage import get_setting, get_bool_setting
+from core.notification_gateway import notification_gateway, webhook_notifier
 from core.ntfy_notifier import ntfy_notifier
 
 
@@ -320,6 +321,7 @@ class TelegramNotifier:
         
         # Загружаем настройки для NTFY
         ntfy_notifier.load_from_settings()
+        webhook_notifier.load_from_settings()
 
     def send(self, event_code: str, **kwargs) -> bool:
         """
@@ -332,11 +334,6 @@ class TelegramNotifier:
                           ticker="SBER",
                           reason="нет ликвидности")
         """
-        tg_ok = self._should_send_telegram(event_code)
-        ntfy_ok = self._should_send_ntfy(event_code)
-        if not tg_ok and not ntfy_ok:
-            return False
-
         template = _TEMPLATES.get(event_code)
         if not template:
             logger.warning(f"Нет шаблона для события: {event_code}")
@@ -355,46 +352,36 @@ class TelegramNotifier:
             logger.error(f"Ошибка форматирования шаблона [{event_code}]: {e}")
             return False
 
-        # Отправляем в оба канала, если они включены
-        sent_anywhere = False
-        
-        # Отправка в Telegram
-        if tg_ok:
-            self._ensure_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._send_message(text), self._loop
-            )
-            future.add_done_callback(lambda f: self._on_send_done(f, event_code))
-            sent_anywhere = True
-            
-        # Отправка в NTFY
-        if ntfy_ok:
-            ntfy_success = ntfy_notifier.send(text)
-            if ntfy_success:
-                sent_anywhere = True
-
-        return sent_anywhere
+        title = f"Trading Manager [{event_code}]"
+        return notification_gateway.dispatch(
+            event_code,
+            {
+                "telegram": lambda: self._dispatch_telegram(text, event_code),
+                "ntfy": lambda: ntfy_notifier.send(text, title=title),
+                "webhook": lambda: webhook_notifier.send(
+                    text,
+                    title=title,
+                    event_code=event_code,
+                    metadata=kwargs,
+                ),
+            },
+            level_ok=self._level_ok,
+        )
 
     def send_raw(self, text: str) -> bool:
         """Отправляет произвольный текст без шаблона."""
-        sent_anywhere = False
-        
-        # Отправка в Telegram
-        if self._enabled:
-            self._ensure_loop()
-            future = asyncio.run_coroutine_threadsafe(
-                self._send_message(text), self._loop
-            )
-            future.add_done_callback(lambda f: self._on_send_done(f, "raw"))
-            sent_anywhere = True
-            
-        # Отправка в NTFY
-        if self._ntfy_enabled():
-            ntfy_success = ntfy_notifier.send(text)
-            if ntfy_success:
-                sent_anywhere = True
-
-        return sent_anywhere
+        return notification_gateway.dispatch_raw(
+            {
+                "telegram": lambda: self._dispatch_telegram(text, "raw"),
+                "ntfy": lambda: ntfy_notifier.send(text, title="Trading Manager [raw]"),
+                "webhook": lambda: webhook_notifier.send(
+                    text,
+                    title="Trading Manager [raw]",
+                    event_code="raw",
+                    metadata={},
+                ),
+            }
+        )
 
     def _ntfy_enabled(self) -> bool:
         """Проверяет, включена ли отправка в NTFY."""
@@ -445,6 +432,16 @@ class TelegramNotifier:
             parse_mode="HTML",
         )
 
+    def _dispatch_telegram(self, text: str, event_code: str) -> bool:
+        if not self._enabled:
+            return False
+        self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(
+            self._send_message(text), self._loop
+        )
+        future.add_done_callback(lambda f: self._on_send_done(f, event_code))
+        return True
+
     def _on_send_done(self, future, event_code: str):
         """Callback после отправки — логирует ошибку если не удалось."""
         try:
@@ -456,36 +453,6 @@ class TelegramNotifier:
             pass
         except Exception as e:
             logger.error(f"Telegram: неизвестная ошибка [{event_code}]: {e}")
-
-    def _should_send_telegram(self, event_code: str) -> bool:
-        """Проверяет нужно ли отправлять событие в Telegram."""
-        if not self._enabled:
-            return False
-        if not get_bool_setting("telegram_enabled"):
-            return False
-        val = get_setting(f"notify_telegram_{event_code}")
-        if val is not None:
-            if isinstance(val, bool):
-                if not val:
-                    return False
-            elif str(val).lower() not in ("true", "1", "yes", "on"):
-                return False
-        return self._level_ok(event_code)
-
-    def _should_send_ntfy(self, event_code: str) -> bool:
-        """Проверяет нужно ли отправлять событие в NTFY."""
-        if not self._ntfy_enabled():
-            return False
-        if not get_bool_setting("ntfy_enabled"):
-            return False
-        val = get_setting(f"notify_ntfy_{event_code}")
-        if val is not None:
-            if isinstance(val, bool):
-                if not val:
-                    return False
-            elif str(val).lower() not in ("true", "1", "yes", "on"):
-                return False
-        return self._level_ok(event_code)
 
     def _level_ok(self, event_code: str) -> bool:
         """Проверяет соответствие события уровню уведомлений."""

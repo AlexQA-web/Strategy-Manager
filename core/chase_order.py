@@ -13,7 +13,7 @@
 #   - При отмене текущего ордера: ждём финального статуса (matched/cancelled/...) перед
 #     отпиской watcher'а, чтобы не потерять частичные fills в момент отмены.
 #   - После cancel_order() делаем poll статуса до 2 сек — защита от race condition.
-#   - Если place_order вернул None — ждём 1 сек и повторяем (не теряем остаток).
+#   - Если place_order вернул None — повторяем с capped exponential backoff.
 
 import threading
 import time
@@ -24,6 +24,8 @@ from loguru import logger
 
 # Финальные статусы ордера (исполнен, снят, отклонён)
 _TERMINAL_STATUSES = {"matched", "cancelled", "canceled", "denied", "removed", "expired", "killed"}
+_PLACE_RETRY_INITIAL_DELAY_SEC = 0.25
+_PLACE_RETRY_MAX_DELAY_SEC = 2.0
 
 
 class ChaseOrder:
@@ -230,6 +232,7 @@ class ChaseOrder:
             time.sleep(0.5)
 
             current_watcher = None
+            place_retry_delay = _PLACE_RETRY_INITIAL_DELAY_SEC
 
             while not self._cancel_requested.is_set():
                 remaining = self.remaining_qty
@@ -291,11 +294,20 @@ class ChaseOrder:
                 if tid:
                     self._current_tid = tid
                     self._current_price = target_price
+                    place_retry_delay = _PLACE_RETRY_INITIAL_DELAY_SEC
                     # Передаём цену этой конкретной заявки в watcher
                     current_watcher = self._track_order_fills(tid, target_price)
                 else:
-                    logger.warning(f"[Chase] Failed to place order for {self._ticker}, retry in 1s")
-                    if self._cancel_requested.wait(1.0):
+                    retry_delay = place_retry_delay
+                    logger.warning(
+                        f"[Chase] Failed to place order for {self._ticker}, "
+                        f"retry in {retry_delay:.2f}s"
+                    )
+                    place_retry_delay = min(
+                        place_retry_delay * 2.0,
+                        _PLACE_RETRY_MAX_DELAY_SEC,
+                    )
+                    if self._cancel_requested.wait(retry_delay):
                         break
                     continue
 

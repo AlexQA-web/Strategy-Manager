@@ -41,6 +41,7 @@ from core.base_connector import Side, OrderMode
 _TERMINAL_STATUSES = frozenset({
     'matched', 'cancelled', 'canceled', 'denied', 'removed', 'expired', 'killed',
 })
+_CHASE_CANCEL_SETTLE_TIMEOUT_SEC = 3.0
 
 
 # ── Data-классы результатов ───────────────────────────────────────────────────
@@ -246,8 +247,22 @@ class OrderPlacer:
             chase.wait(timeout=timeout)
             if not chase.is_done:
                 chase.cancel()
+                chase.wait(timeout=_CHASE_CANCEL_SETTLE_TIMEOUT_SEC)
 
-            if chase.filled_qty == 0:
+            filled_qty = max(int(chase.filled_qty), 0)
+            remaining_qty = max(int(chase.remaining_qty), 0)
+
+            if filled_qty > 0 and on_filled:
+                on_filled(filled_qty, chase.avg_price)
+
+            if remaining_qty <= 0:
+                logger.info(
+                    f'[{self.agent_name}] Chase {side.upper()} {ticker}x{qty} '
+                    f'filled={filled_qty} avg={chase.avg_price:.4f} | {comment}'
+                )
+                return
+
+            if filled_qty <= 0:
                 logger.error(
                     f'[{self.agent_name}] ОШИБКА заявки: агент={self.agent_name} '
                     f'тикер={ticker} сторона={side.upper()} qty={qty} '
@@ -256,22 +271,27 @@ class OrderPlacer:
                 )
                 if on_failed:
                     on_failed()
-
-                # Fallback на рыночный ордер
-                if fallback_to_market:
-                    result = self.place_market(
-                        account_id, board, ticker, side, qty,
-                        comment=f'FALLBACK после chase | {comment}',
-                    )
-                    if result.success and on_filled:
-                        on_filled(0, 0.0)  # filled_qty неизвестен здесь
             else:
-                logger.info(
+                logger.warning(
                     f'[{self.agent_name}] Chase {side.upper()} {ticker}x{qty} '
-                    f'filled={chase.filled_qty} avg={chase.avg_price:.4f} | {comment}'
+                    f'частично исполнен: filled={filled_qty} remaining={remaining_qty} '
+                    f'avg={chase.avg_price:.4f} | {comment}'
                 )
-                if on_filled:
-                    on_filled(chase.filled_qty, chase.avg_price)
+
+            if fallback_to_market:
+                result = self.place_market(
+                    account_id,
+                    board,
+                    ticker,
+                    side,
+                    remaining_qty,
+                    comment=f'FALLBACK остатка {remaining_qty} после chase | {comment}',
+                )
+                if result.success:
+                    logger.info(
+                        f'[{self.agent_name}] Chase fallback MARKET {side.upper()} '
+                        f'{ticker}x{remaining_qty} после filled={filled_qty}/{qty}'
+                    )
 
         t = threading.Thread(
             target=_run_chase, daemon=True,

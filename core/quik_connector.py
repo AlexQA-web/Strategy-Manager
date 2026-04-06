@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable, Optional
 from loguru import logger
 
-from core.base_connector import BaseConnector
+from core.base_connector import BaseConnector, OrderOutcome, OrderResult
 from core.storage import get_setting
 from core.moex_api import MOEXClient
 
@@ -288,23 +288,46 @@ class QuikConnector(BaseConnector):
         board: str = "TQBR",
         agent_name: str = "",
     ) -> Optional[str]:
+        result = self.place_order_result(
+            account_id=account_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            board=board,
+            agent_name=agent_name,
+        )
+        return result.transaction_id or None
+
+    def place_order_result(
+        self,
+        account_id: str,
+        ticker: str,
+        side: str,
+        quantity: int,
+        order_type: str = "market",
+        price: float = 0.0,
+        board: str = "TQBR",
+        agent_name: str = "",
+    ) -> OrderResult:
         # Валидация входных параметров
         if not ticker or not ticker.strip():
             logger.error("[QUIK] place_order — пустой ticker")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="empty_ticker")
         if side not in ("buy", "sell"):
             logger.error(f"[QUIK] place_order — неверный side: {side} (должен быть 'buy' или 'sell')")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="invalid_side")
         if quantity <= 0:
             logger.error(f"[QUIK] place_order — quantity должно быть > 0, получено: {quantity}")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="invalid_quantity")
         if price < 0:
             logger.error(f"[QUIK] place_order — price не может быть отрицательным: {price}")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="negative_price")
 
         if not self._connected or not self._client:
             logger.warning("[QUIK] place_order — нет подключения")
-            return None
+            return OrderResult(OrderOutcome.STALE_STATE, message="connector_disconnected")
         try:
             transaction = {
                 "ACTION":    "NEW_ORDER",
@@ -322,15 +345,21 @@ class QuikConnector(BaseConnector):
                 result = self._client.send_transaction(transaction)
             trans_id = str(result.get("data", ""))
             logger.info(f"[QUIK] Ордер {side} {ticker}x{quantity} board={board}: transID={trans_id}")
-            return trans_id or None
+            if trans_id:
+                return OrderResult(OrderOutcome.SUCCESS, transaction_id=trans_id)
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, message="missing_transaction_id")
         except Exception as e:
             logger.error(f"[QUIK] place_order error: {e}")
             self._fire_event('error', str(e))
-            return None
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, message=str(e))
 
     def cancel_order(self, order_id: str, account_id: str) -> bool:
+        result = self.cancel_order_result(order_id, account_id)
+        return result.is_success
+
+    def cancel_order_result(self, order_id: str, account_id: str) -> OrderResult:
         if not self._connected or not self._client:
-            return False
+            return OrderResult(OrderOutcome.STALE_STATE, transaction_id=str(order_id), message="connector_disconnected")
         try:
             transaction = {
                 "ACTION":   "KILL_ORDER",
@@ -339,10 +368,10 @@ class QuikConnector(BaseConnector):
             }
             with self._lock:
                 self._client.send_transaction(transaction)
-            return True
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(order_id))
         except Exception as e:
             logger.error(f"[QUIK] cancel_order error: {e}")
-            return False
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, transaction_id=str(order_id), message=str(e))
 
     @staticmethod
     def _to_int(value, default: int = 0) -> int:
@@ -352,6 +381,13 @@ class QuikConnector(BaseConnector):
             return int(float(value))
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _first_present(*values):
+        for value in values:
+            if value is not None:
+                return value
+        return None
 
     def _fetch_orders(self) -> list[dict]:
         if not self._connected or not self._client:
@@ -388,17 +424,21 @@ class QuikConnector(BaseConnector):
                 if not tid:
                     continue
                 quantity = self._to_int(
-                    row.get("qty")
-                    or row.get("quantity")
-                    or row.get("QUANTITY")
-                    or row.get("order_qty"),
+                    self._first_present(
+                        row.get("qty"),
+                        row.get("quantity"),
+                        row.get("QUANTITY"),
+                        row.get("order_qty"),
+                    ),
                     0,
                 )
                 balance = self._to_int(
-                    row.get("balance")
-                    or row.get("BALANCE")
-                    or row.get("qty_left")
-                    or quantity,
+                    self._first_present(
+                        row.get("balance"),
+                        row.get("BALANCE"),
+                        row.get("qty_left"),
+                        quantity,
+                    ),
                     quantity,
                 )
                 status = self._map_order_status(
@@ -505,17 +545,21 @@ class QuikConnector(BaseConnector):
             return None
 
         quantity = self._to_int(
-            order.get("qty")
-            or order.get("quantity")
-            or order.get("QUANTITY")
-            or order.get("order_qty"),
+            self._first_present(
+                order.get("qty"),
+                order.get("quantity"),
+                order.get("QUANTITY"),
+                order.get("order_qty"),
+            ),
             0,
         )
         balance = self._to_int(
-            order.get("balance")
-            or order.get("BALANCE")
-            or order.get("qty_left")
-            or quantity,
+            self._first_present(
+                order.get("balance"),
+                order.get("BALANCE"),
+                order.get("qty_left"),
+                quantity,
+            ),
             quantity,
         )
         status = self._map_order_status(
@@ -625,16 +669,26 @@ class QuikConnector(BaseConnector):
         quantity: int = 0,
         agent_name: str = "",
     ) -> Optional[str]:
+        result = self.close_position_result(account_id, ticker, quantity, agent_name)
+        return result.transaction_id or None
+
+    def close_position_result(
+        self,
+        account_id: str,
+        ticker: str,
+        quantity: int = 0,
+        agent_name: str = "",
+    ) -> OrderResult:
         positions = self.get_positions(account_id)
         pos = next((p for p in positions if p.get("ticker") == ticker), None)
         if not pos:
-            return None
+            return OrderResult(OrderOutcome.NOT_FOUND, message="position_not_found")
         pos_qty = int(pos.get("quantity", 0))
         if pos_qty == 0:
-            return None
+            return OrderResult(OrderOutcome.NOT_FOUND, message="zero_position")
         close_qty = abs(quantity) if 0 < quantity <= abs(pos_qty) else abs(pos_qty)
         side = "sell" if pos_qty > 0 else "buy"
-        tid = self.place_order(
+        return self.place_order_result(
             account_id=account_id,
             ticker=ticker,
             side=side,
@@ -643,7 +697,6 @@ class QuikConnector(BaseConnector):
             board=pos.get("board", "TQBR"),
             agent_name=agent_name,
         )
-        return tid
 
     # ── Позиции / счета ─────────────────────────────────────────────────
 

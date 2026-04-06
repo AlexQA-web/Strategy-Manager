@@ -65,6 +65,7 @@ class TradeRecorder:
         comment: str,
         order_type: str = "market",
         order_ref: str = "",
+        correlation_id: str = "",
     ):
         """Записывает исполненную сделку в order_history и trades_history.
 
@@ -107,7 +108,7 @@ class TradeRecorder:
             )
 
             # Canonical fill — единая точка записи
-            fill_ledger.record_fill(
+            result = fill_ledger.record_fill(
                 fill_id=exec_id,
                 strategy_id=self._strategy_id,
                 ticker=self._ticker,
@@ -123,7 +124,13 @@ class TradeRecorder:
                 point_cost=self._get_point_cost(),
                 pnl_multiplier=pnl_mult,
                 source="connector",
+                correlation_id=correlation_id or exec_id,
             )
+            if result.error:
+                raise RuntimeError(
+                    f"fill projection failed: {result.error} "
+                    f"(order={result.order_status}, trade={result.trade_status})"
+                )
 
         except Exception as e:
             logger.error(

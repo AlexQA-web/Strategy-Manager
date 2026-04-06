@@ -65,6 +65,28 @@ class TestReconnectLoop:
         assert thread1 is thread2, "Должен быть тот же поток"
         conn._stop_reconnect.set()
 
+    def test_concurrent_start_reconnect_is_atomic(self):
+        """Параллельный start_reconnect_loop создаёт только один поток."""
+        conn = _StubConnector()
+        conn._is_conn = True
+        created_threads = []
+        original_thread = threading.Thread
+
+        def _recording_thread(*args, **kwargs):
+            thread = original_thread(*args, **kwargs)
+            created_threads.append(thread)
+            return thread
+
+        with patch("core.base_connector.threading.Thread", side_effect=_recording_thread):
+            workers = [original_thread(target=conn.start_reconnect_loop) for _ in range(5)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+
+        assert len(created_threads) == 1
+        conn._stop_reconnect.set()
+
     def test_loop_does_not_die_after_exhausted_attempts(self):
         """После исчерпания попыток loop уходит в cooldown, а не break."""
         conn = _StubConnector()

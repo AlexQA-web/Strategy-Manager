@@ -15,6 +15,8 @@ from core.storage import (
     _write_unsafe_inner,
     _cache,
     _rwlock,
+    read_json,
+    write_json,
 )
 
 
@@ -235,7 +237,7 @@ class TestTradesTrimming:
     """Regression-тесты для trim policy trades_history (TASK-009)."""
 
     def test_append_trade_trims_when_over_limit(self, tmp_path, monkeypatch):
-        """append_trade обрезает до _MAX_TRADES_HISTORY."""
+        """append_trade сохраняет hot-file в лимите и архивирует хвост."""
         import core.storage as storage
 
         trades_file = tmp_path / "trades_history.json"
@@ -252,6 +254,13 @@ class TestTradesTrimming:
         # Остались последние 5 (id 1..5)
         assert result[0]["id"] == 1
         assert result[-1]["id"] == 5
+
+        archive_dir = tmp_path / storage.TRADES_ARCHIVE_DIR_NAME
+        archived_files = list(archive_dir.glob("*.json"))
+        assert len(archived_files) == 1
+        with open(archived_files[0], "r", encoding="utf-8") as f:
+            archive_payload = json.load(f)
+        assert archive_payload["trades"][0]["id"] == 0
 
     def test_append_trade_preserves_under_limit(self, tmp_path, monkeypatch):
         """append_trade не обрезает если меньше лимита."""
@@ -283,3 +292,60 @@ class TestTradesTrimming:
         result = storage._read(trades_file, use_cache=False)
         assert len(result) == 3
         assert [r["seq"] for r in result] == [7, 8, 9]
+
+    def test_append_trade_is_idempotent_by_execution_id(self, tmp_path, monkeypatch):
+        """Повторная проекция того же fill не создаёт дубль в trades_history."""
+        import core.storage as storage
+
+        trades_file = tmp_path / "trades_history.json"
+        monkeypatch.setattr(storage, "TRADES_FILE", trades_file)
+        trades_file.write_text("[]", encoding="utf-8")
+
+        trade = {"execution_id": "fill-1", "ticker": "SBER"}
+        assert storage.append_trade(trade) == "inserted"
+        assert storage.append_trade(dict(trade)) == "duplicate"
+
+        result = storage._read(trades_file, use_cache=False)
+        assert len(result) == 1
+
+
+class TestPendingOrdersStorage:
+    def test_save_and_delete_pending_order(self, tmp_path, monkeypatch):
+        import core.storage as storage
+
+        pending_file = tmp_path / "pending_orders.json"
+        monkeypatch.setattr(storage, "PENDING_ORDERS_FILE", pending_file)
+
+        assert storage.save_pending_order("agent-1", "tid-1", {"state": "working"}) == "inserted"
+        assert storage.save_pending_order("agent-1", "tid-1", {"state": "matched"}) == "updated"
+        assert storage.get_all_pending_orders().get("agent-1") == {
+            "tid-1": {"state": "matched"}
+        }
+
+        assert storage.delete_pending_order("agent-1", "tid-1") is True
+        assert "agent-1" not in storage.get_all_pending_orders()
+
+
+class TestRuntimeSchemaVersioning:
+    def test_write_json_wraps_runtime_payload_with_schema_version(self, tmp_path):
+        settings_file = tmp_path / "settings.json"
+
+        write_json(settings_file, {"autoconnect": True})
+
+        with open(settings_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+
+        assert raw["schema_version"] == 1
+        assert raw["payload"] == {"autoconnect": True}
+
+    def test_read_json_migrates_legacy_runtime_file_and_rewrites_envelope(self, tmp_path):
+        strategies_file = tmp_path / "strategies.json"
+        strategies_file.write_text('{"sid": {"ticker": "SBER"}}', encoding="utf-8")
+
+        data = read_json(strategies_file)
+
+        assert data == {"sid": {"ticker": "SBER"}}
+        with open(strategies_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        assert raw["schema_version"] == 1
+        assert raw["payload"] == data

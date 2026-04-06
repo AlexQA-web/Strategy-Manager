@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 import threading
 import time
 import math
@@ -10,6 +12,65 @@ Action = Literal["buy", "sell", "close"]
 OrderType = Literal["market", "limit"]
 OrderMode = Literal["market", "limit", "limit_price", "limit_book"]
 from loguru import logger
+
+
+class OrderOutcome(str, Enum):
+    SUCCESS = "success"
+    NOT_FOUND = "not_found"
+    REJECTED = "rejected"
+    TRANSPORT_ERROR = "transport_error"
+    STALE_STATE = "stale_state"
+
+
+@dataclass
+class OrderResult:
+    outcome: OrderOutcome
+    transaction_id: str = ""
+    message: str = ""
+
+    @property
+    def is_success(self) -> bool:
+        return self.outcome == OrderOutcome.SUCCESS
+
+
+@dataclass
+class MarketDataEnvelope:
+    source_ts: float
+    receive_ts: float
+    age_ms: int
+    source_id: str
+    status: str = "unknown"
+
+    @classmethod
+    def build(
+        cls,
+        source_ts: float | None = None,
+        receive_ts: float | None = None,
+        source_id: str = "",
+        stale_after_ms: int = 0,
+        status: str = "",
+    ) -> "MarketDataEnvelope":
+        receive_ts = float(receive_ts if receive_ts is not None else time.time())
+        source_ts = float(source_ts if source_ts is not None else receive_ts)
+        age_ms = max(int((receive_ts - source_ts) * 1000), 0)
+        if not status:
+            status = "stale" if stale_after_ms > 0 and age_ms > stale_after_ms else "fresh"
+        return cls(
+            source_ts=source_ts,
+            receive_ts=receive_ts,
+            age_ms=age_ms,
+            source_id=str(source_id or ""),
+            status=str(status or "unknown"),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "source_ts": self.source_ts,
+            "receive_ts": self.receive_ts,
+            "age_ms": self.age_ms,
+            "source_id": self.source_id,
+            "status": self.status,
+        }
 
 
 class BaseConnector(ABC):
@@ -28,6 +89,7 @@ class BaseConnector(ABC):
         self._reconnect_attempts: int  = 5
         self._reconnect_delay:    int  = 5   # базовая задержка (секунд)
         self._stop_reconnect = threading.Event()
+        self._reconnect_start_lock = threading.Lock()
         self._health_check_event = threading.Event()
         self._health_check_interval: int = 300  # периодическая глубокая проверка (секунд)
 
@@ -129,6 +191,58 @@ class BaseConnector(ABC):
         agent_name: str = "",
     ):
         raise NotImplementedError("chase_order not supported by this connector")
+
+    def place_order_result(
+        self,
+        account_id: str,
+        ticker: str,
+        side: Side,
+        quantity: int,
+        order_type: OrderType,
+        price: float = 0.0,
+        board: str = "TQBR",
+        agent_name: str = "",
+    ) -> OrderResult:
+        transaction_id = self.place_order(
+            account_id=account_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            board=board,
+            agent_name=agent_name,
+        )
+        if transaction_id:
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(transaction_id))
+        return OrderResult(OrderOutcome.REJECTED, message="legacy_place_order_returned_none")
+
+    def cancel_order_result(self, order_id: str, account_id: str) -> OrderResult:
+        canceled = self.cancel_order(order_id, account_id)
+        if canceled:
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(order_id))
+        return OrderResult(
+            OrderOutcome.REJECTED,
+            transaction_id=str(order_id),
+            message="legacy_cancel_order_returned_false",
+        )
+
+    def close_position_result(
+        self,
+        account_id: str,
+        ticker: str,
+        quantity: int = 0,
+        agent_name: str = "",
+    ) -> OrderResult:
+        transaction_id = self.close_position(
+            account_id=account_id,
+            ticker=ticker,
+            quantity=quantity,
+            agent_name=agent_name,
+        )
+        if transaction_id:
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(transaction_id))
+        return OrderResult(OrderOutcome.REJECTED, message="legacy_close_position_returned_none")
 
     # ── Общие утилиты ───────────────────────────────────────────────────
 
@@ -264,16 +378,17 @@ class BaseConnector(ABC):
         Перед запуском сбрасывает флаг _stop_reconnect для корректной работы
         после планового отключения по расписанию.
         """
-        # Сбрасываем флаг перед запуском — это критично для работы после disconnect()
-        self._stop_reconnect.clear()
-        
-        if hasattr(self, "_reconnect_thread") and self._reconnect_thread.is_alive():
-            logger.debug(f"[{self.__class__.__name__}] reconnect-loop уже запущен")
-            return
-        self._reconnect_thread = threading.Thread(
-            target=self._reconnect_loop, daemon=True, name="reconnect-loop"
-        )
-        self._reconnect_thread.start()
+        with self._reconnect_start_lock:
+            # Сбрасываем флаг перед запуском — это критично для работы после disconnect()
+            self._stop_reconnect.clear()
+
+            if hasattr(self, "_reconnect_thread") and self._reconnect_thread.is_alive():
+                logger.debug(f"[{self.__class__.__name__}] reconnect-loop уже запущен")
+                return
+            self._reconnect_thread = threading.Thread(
+                target=self._reconnect_loop, daemon=True, name="reconnect-loop"
+            )
+            self._reconnect_thread.start()
 
     def _on_reconnect_success(self):
         """Hook: вызывается после успешного переподключения.

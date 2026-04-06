@@ -251,3 +251,51 @@
 - В degraded state разрешены только reconcile и close-risk actions
 - Обычная торговля возобновляется только после подтверждённого resync
 - Это явное состояние, а не неявная деградация с продолжением торговли
+
+---
+
+## 17. Почему денежные persistence-границы нормализуются через Decimal helpers
+
+**Контекст:** цены, комиссии, PnL и equity snapshots раньше сохранялись через обычные float-конверсии без единого правила округления.
+
+**Решение:** `core/money.py` задаёт единый Decimal-backed boundary для storage (`to_decimal`, `to_storage_float`, `to_storage_str`).
+
+**Причины:**
+- одинаковое округление на всех путях записи в order_history, trades_history, valuation и reservation snapshots
+- обратная совместимость с существующим JSON сохраняется без одномоментной полной миграции на minor-units
+- companion-поля `*_decimal` позволяют постепенно усиливать точность без поломки старых consumers
+
+**Не писать** новые денежные поля в JSON через сырой `float(...)` без helper-ов из `core/money.py`.
+
+---
+
+## 18. Почему reservation lifecycle теперь связан с order_id, а не с silent eviction
+
+**Контекст:** раньше `ReservationLedger` мог автоматически освобождать stale reserve по timeout и тем самым возвращать buying power до терминального исхода ордера.
+
+**Решение:** lifecycle закреплён как `reserve -> bind_order(order_id/chase_ref) -> terminal release`; timeout только помечает reserve как `stale`.
+
+**Причины:**
+- ambiguous submit больше не маскируется возвратом капитала
+- stale reserve остаётся видимым для reconcile и operator investigation
+- buying power согласуется с pending order lifecycle, а не живёт отдельно
+
+**Не возвращать** silent stale eviction как основной recovery path. Любой stale reserve требует broker/reconcile подтверждения.
+
+---
+
+## 19. Почему observability вынесена в runtime_metrics и health endpoint
+
+**Контекст:** критичные runtime-события (`stale_data_reject`, `history_divergence`, `duplicate_fill_repair`, `manual_intervention_required`) раньше было трудно быстро собрать в единый operator snapshot.
+
+**Решение:**
+- `core/runtime_metrics.py` хранит counters, latencies и audit events
+- `core/observability.py` агрегирует health snapshot
+- `core/health_server.py` публикует `/health`, `/metrics`, `/health/strategies`
+
+**Причины:**
+- оператору нужен текущий readiness state без ручной археологии логов
+- latency degradation должна быть видна до инцидента
+- audit trail для startup, reconcile, flatten и repair должен быть машинно-читаемым
+
+**Не добавлять** новые критичные money/runtime события только в локальный лог. Для таких путей нужен audit event, health metric или оба канала.

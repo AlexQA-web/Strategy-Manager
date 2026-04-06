@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QLabel, QLineEdit, QPushButton, QComboBox, QCheckBox,
     QFormLayout, QGroupBox, QMessageBox, QSpinBox, QTimeEdit,
-    QScrollArea, QFrame, QFileDialog,
+    QScrollArea, QFrame, QFileDialog, QDoubleSpinBox,
 )
 from PyQt6.QtCore import Qt, QTime, QTimer
 from loguru import logger
@@ -768,6 +768,95 @@ class _SettingsMixin:
         rc_form.addRow("Пауза между попытками:", self.spin_reconnect_delay)
 
         layout.addWidget(rc_group)
+
+        exec_group = QGroupBox("Риск и исполнение")
+        exec_form = QFormLayout(exec_group)
+        exec_form.setSpacing(10)
+
+        self.spin_max_gross_exposure = QDoubleSpinBox()
+        self.spin_max_gross_exposure.setRange(0.0, 1_000_000_000.0)
+        self.spin_max_gross_exposure.setDecimals(2)
+        self.spin_max_gross_exposure.setSingleStep(10_000.0)
+        self.spin_max_gross_exposure.setValue(float(get_setting("max_gross_exposure", 0) or 0))
+        self.spin_max_gross_exposure.setSuffix(" ₽")
+        self.spin_max_gross_exposure.setFixedWidth(180)
+        exec_form.addRow("Макс. gross exposure:", self.spin_max_gross_exposure)
+
+        self.spin_max_account_positions = QSpinBox()
+        self.spin_max_account_positions.setRange(0, 1000)
+        self.spin_max_account_positions.setValue(
+            int(float(get_setting("max_account_positions", 0) or 0))
+        )
+        self.spin_max_account_positions.setFixedWidth(130)
+        exec_form.addRow("Макс. позиций на счёте:", self.spin_max_account_positions)
+
+        self.spin_cancel_order_timeout = QDoubleSpinBox()
+        self.spin_cancel_order_timeout.setRange(0.1, 120.0)
+        self.spin_cancel_order_timeout.setDecimals(2)
+        self.spin_cancel_order_timeout.setSingleStep(0.25)
+        self.spin_cancel_order_timeout.setValue(
+            float(get_setting("cancel_order_timeout_sec", 3.0) or 3.0)
+        )
+        self.spin_cancel_order_timeout.setSuffix(" сек")
+        self.spin_cancel_order_timeout.setFixedWidth(130)
+        exec_form.addRow("Timeout отмены ордера:", self.spin_cancel_order_timeout)
+
+        self.spin_submission_block_ttl = QDoubleSpinBox()
+        self.spin_submission_block_ttl.setRange(1.0, 86_400.0)
+        self.spin_submission_block_ttl.setDecimals(2)
+        self.spin_submission_block_ttl.setSingleStep(10.0)
+        self.spin_submission_block_ttl.setValue(
+            float(get_setting("submission_block_ttl_sec", 300.0) or 300.0)
+        )
+        self.spin_submission_block_ttl.setSuffix(" сек")
+        self.spin_submission_block_ttl.setFixedWidth(130)
+        exec_form.addRow("TTL submit-block:", self.spin_submission_block_ttl)
+
+        self.spin_signal_latency_budget = QDoubleSpinBox()
+        self.spin_signal_latency_budget.setRange(0.1, 300.0)
+        self.spin_signal_latency_budget.setDecimals(2)
+        self.spin_signal_latency_budget.setSingleStep(0.5)
+        self.spin_signal_latency_budget.setValue(
+            float(get_setting("signal_latency_budget_sec", 10.0) or 10.0)
+        )
+        self.spin_signal_latency_budget.setSuffix(" сек")
+        self.spin_signal_latency_budget.setFixedWidth(130)
+        exec_form.addRow("Budget задержки сигнала:", self.spin_signal_latency_budget)
+
+        self.spin_stale_quote_budget_ms = QSpinBox()
+        self.spin_stale_quote_budget_ms.setRange(0, 300_000)
+        self.spin_stale_quote_budget_ms.setValue(
+            int(float(get_setting("stale_quote_budget_ms", 5000) or 5000))
+        )
+        self.spin_stale_quote_budget_ms.setSuffix(" мс")
+        self.spin_stale_quote_budget_ms.setFixedWidth(130)
+        exec_form.addRow("Budget stale quote:", self.spin_stale_quote_budget_ms)
+
+        self.spin_market_data_drift_budget_ms = QSpinBox()
+        self.spin_market_data_drift_budget_ms.setRange(0, 300_000)
+        self.spin_market_data_drift_budget_ms.setValue(
+            int(float(get_setting("market_data_clock_drift_budget_ms", 1500) or 1500))
+        )
+        self.spin_market_data_drift_budget_ms.setSuffix(" мс")
+        self.spin_market_data_drift_budget_ms.setFixedWidth(130)
+        exec_form.addRow("Budget clock drift:", self.spin_market_data_drift_budget_ms)
+
+        relaxed_phases = get_setting(
+            "stale_quote_relaxed_phases",
+            ["opening_auction", "closing_auction", "discrete_auction", "pre_clearing"],
+        )
+        if isinstance(relaxed_phases, (list, tuple, set)):
+            relaxed_text = ", ".join(str(item) for item in relaxed_phases if str(item).strip())
+        else:
+            relaxed_text = str(relaxed_phases or "")
+        self.edit_stale_quote_relaxed_phases = QLineEdit()
+        self.edit_stale_quote_relaxed_phases.setText(relaxed_text)
+        self.edit_stale_quote_relaxed_phases.setPlaceholderText(
+            "opening_auction, closing_auction, discrete_auction"
+        )
+        exec_form.addRow("Relaxed phases:", self.edit_stale_quote_relaxed_phases)
+
+        layout.addWidget(exec_group)
         layout.addStretch()
         return tab
 
@@ -841,6 +930,22 @@ class _SettingsMixin:
         save_setting("autostart_strategies",  "true" if self.chk_start_strategies.isChecked()  else "false")
         save_setting("reconnect_attempts",    str(self.spin_reconnect.value()))
         save_setting("reconnect_delay",       str(self.spin_reconnect_delay.value()))
+        save_setting("max_gross_exposure",    self.spin_max_gross_exposure.value())
+        save_setting("max_account_positions", self.spin_max_account_positions.value())
+        save_setting("cancel_order_timeout_sec", self.spin_cancel_order_timeout.value())
+        save_setting("submission_block_ttl_sec", self.spin_submission_block_ttl.value())
+        save_setting("signal_latency_budget_sec", self.spin_signal_latency_budget.value())
+        save_setting("stale_quote_budget_ms", self.spin_stale_quote_budget_ms.value())
+        save_setting(
+            "market_data_clock_drift_budget_ms",
+            self.spin_market_data_drift_budget_ms.value(),
+        )
+        relaxed_phases = [
+            part.strip()
+            for part in self.edit_stale_quote_relaxed_phases.text().split(",")
+            if part.strip()
+        ]
+        save_setting("stale_quote_relaxed_phases", relaxed_phases)
 
         # Применяем без перезапуска
         notifier.load_from_settings()
@@ -1054,6 +1159,34 @@ class _SettingsMixin:
         )
         self.spin_reconnect.setValue(int(get_setting("reconnect_attempts") or 5))
         self.spin_reconnect_delay.setValue(int(get_setting("reconnect_delay") or 5))
+        self.spin_max_gross_exposure.setValue(float(get_setting("max_gross_exposure", 0) or 0))
+        self.spin_max_account_positions.setValue(
+            int(float(get_setting("max_account_positions", 0) or 0))
+        )
+        self.spin_cancel_order_timeout.setValue(
+            float(get_setting("cancel_order_timeout_sec", 3.0) or 3.0)
+        )
+        self.spin_submission_block_ttl.setValue(
+            float(get_setting("submission_block_ttl_sec", 300.0) or 300.0)
+        )
+        self.spin_signal_latency_budget.setValue(
+            float(get_setting("signal_latency_budget_sec", 10.0) or 10.0)
+        )
+        self.spin_stale_quote_budget_ms.setValue(
+            int(float(get_setting("stale_quote_budget_ms", 5000) or 5000))
+        )
+        self.spin_market_data_drift_budget_ms.setValue(
+            int(float(get_setting("market_data_clock_drift_budget_ms", 1500) or 1500))
+        )
+        relaxed_phases = get_setting(
+            "stale_quote_relaxed_phases",
+            ["opening_auction", "closing_auction", "discrete_auction", "pre_clearing"],
+        )
+        if isinstance(relaxed_phases, (list, tuple, set)):
+            relaxed_text = ", ".join(str(item) for item in relaxed_phases if str(item).strip())
+        else:
+            relaxed_text = str(relaxed_phases or "")
+        self.edit_stale_quote_relaxed_phases.setText(relaxed_text)
 
         # --- Комиссии ---
         if hasattr(self, "_commission_widget"):

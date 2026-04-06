@@ -1,0 +1,19 @@
+{
+  "test_strategy": {
+    "tid-1": {
+      "tid": "tid-1",
+      "strategy_id": "test_strategy",
+      "ticker": "SBER",
+      "side": "sell",
+      "requested_qty": 1,
+      "order_type": "market",
+      "state": "working",
+      "filled_qty": 0,
+      "avg_price": 0.0,
+      "terminal_filled": 0,
+      "created_at_epoch": 1775412514.1849902,
+      "terminal_at_epoch": null,
+      "age_sec": 0.0
+    }
+  }
+}

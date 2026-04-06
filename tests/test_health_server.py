@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from core.health_server import HealthServer, HealthCheckHandler
+from core.health_server import HealthServer, HealthCheckHandler, configure_default_callbacks
 
 
 class TestHealthServerSecure:
@@ -72,3 +72,29 @@ class TestHealthCheckHandlerAuth:
         handler.auth_token = 'mytoken'
         handler.headers = {}
         assert HealthCheckHandler._check_auth(handler) is False
+
+
+class TestHealthServerObservability:
+
+    def test_configure_default_callbacks_wires_observability(self, monkeypatch):
+        hs = HealthServer(port=9999, enabled=False)
+
+        monkeypatch.setattr(
+            "core.observability.collect_health_snapshot",
+            lambda: {"status": "ok"},
+        )
+        monkeypatch.setattr(
+            "core.observability.collect_runtime_metrics",
+            lambda: {"latency": {}},
+        )
+        monkeypatch.setattr(
+            "core.observability.collect_strategies_health",
+            lambda: {"sid": {"actual_state": "trading"}},
+        )
+
+        configured = configure_default_callbacks(hs)
+
+        assert configured is hs
+        assert HealthCheckHandler.health_callback() == {"status": "ok"}
+        assert HealthCheckHandler.metrics_callback() == {"latency": {}}
+        assert HealthCheckHandler.strategies_callback() == {"sid": {"actual_state": "trading"}}

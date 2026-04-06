@@ -15,6 +15,7 @@ from PyQt6.QtGui import QColor, QKeySequence, QShortcut, QIcon
 from ui.icons import apply_icon
 from ui.sec_info_cache import SecInfoCache
 from ui.log_mixin import LogMixin
+from ui.ui_safety import format_runtime_status
 from loguru import logger
 
 from config.settings import APP_NAME, APP_VERSION
@@ -583,7 +584,12 @@ class MainWindow(LogMixin, QMainWindow):
                 str(t_pnl),
             ]
         else:
-            status = data.get("status", "stopped")
+            from core.autostart import get_strategy_runtime_status
+
+            desired_state = data.get("desired_state") or data.get("status", "stopped")
+            runtime = get_strategy_runtime_status(sid)
+            actual_state = runtime.get("actual_state", "stopped")
+            sync_status = runtime.get("sync_status", "unknown")
             name = data.get("name", sid)
             params = data.get("params", {})
             ticker = data.get("ticker") or params.get("ticker", "—")
@@ -620,7 +626,9 @@ class MainWindow(LogMixin, QMainWindow):
                 pos_qty = str(int(pos["quantity"])) if pos else "0"
                 avg_price = f"{pos['avg_price']:.3f}" if pos else "—"
                 cur_price = f"{pos['current_price']:.3f}" if pos else "—"
-                pnl = pos["pnl"] if pos else None
+                pnl = None
+
+            runtime_status_text, _ = format_runtime_status(desired_state, actual_state, sync_status)
 
             # Берём из кэша вместо прямых вызовов (Пункт 6)
             total_pnl = self._pnl_cache.get(sid)
@@ -677,7 +685,7 @@ class MainWindow(LogMixin, QMainWindow):
             total_pnl_str = f"{'+' if total_pnl >= 0 else ''}{total_pnl:.2f}" if total_pnl is not None else "—"
 
             parts = [
-                "parent", sid, status, name, ticker, account_label,
+                "parent", sid, desired_state, actual_state, sync_status, runtime_status_text, name, ticker, account_label,
                 str(has_instruments), str(expanded),
                 pos_qty, avg_price, cur_price, pnl_str,
                 comm_str, total_pnl_str, f"{total_commission:.2f}",
@@ -1179,7 +1187,7 @@ class MainWindow(LogMixin, QMainWindow):
 
     def _render_parent_row(self, row: int, data: dict, row_key: str):
         """Рендерит одну родительскую строку стратегии."""
-        from core.autostart import get_live_engines
+        from core.autostart import get_live_engines, get_strategy_runtime_status
         from core.connector_manager import connector_manager
 
         sid = row_key[2:]  # убираем "p:"
@@ -1187,7 +1195,10 @@ class MainWindow(LogMixin, QMainWindow):
 
         self.table.setRowHeight(row, 32)
 
-        status = data.get("status", "stopped")
+        desired_state = data.get("desired_state") or data.get("status", "stopped")
+        runtime = get_strategy_runtime_status(sid)
+        actual_state = runtime.get("actual_state", "stopped")
+        sync_status = runtime.get("sync_status", "unknown")
         name = data.get("name", sid)
         params = data.get("params", {})
         ticker = data.get("ticker") or params.get("ticker", "—")
@@ -1218,19 +1229,13 @@ class MainWindow(LogMixin, QMainWindow):
             pos_qty = str(int(pos["quantity"])) if pos else "0"
             avg_price = f"{pos['avg_price']:.3f}" if pos else "—"
             cur_price = f"{pos['current_price']:.3f}" if pos else "—"
-            pnl = pos["pnl"] if pos else None
+            pnl = None
 
         total_pnl = get_total_pnl(sid)
         open_commission = get_open_commission(sid)
         total_commission = get_total_commission(sid)
 
-        status_map = {
-            "active": ("Активен", "#a6e3a1"),
-            "stopped": ("Остановлен", "#f38ba8"),
-            "waiting": ("Ожидание", "#f9e2af"),
-            "error": ("Ошибка", "#fab387"),
-        }
-        status_text, status_color = status_map.get(status, ("Неизвестно", "#6c7086"))
+        status_text, status_color = format_runtime_status(desired_state, actual_state, sync_status)
 
         center = Qt.AlignmentFlag.AlignCenter
         left = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
@@ -1244,7 +1249,7 @@ class MainWindow(LogMixin, QMainWindow):
             return item
 
         # Агент
-        is_active = status == "active"
+        is_active = desired_state == "active"
         agent_widget = AgentCellWidget(
             name=name, sid=sid,
             on_start=self._start_agent,
@@ -1659,6 +1664,7 @@ class MainWindow(LogMixin, QMainWindow):
                 return
 
             data["status"] = "active"
+            data["desired_state"] = "active"
             save_strategy(sid, data)
             if start_live_engine(sid, wait_for_connection=True):
                 self._log(f"Агент [{data['name']}] запущен", "info")
@@ -1668,6 +1674,7 @@ class MainWindow(LogMixin, QMainWindow):
                     "error"
                 )
                 data["status"] = "stopped"
+                data["desired_state"] = "stopped"
                 save_strategy(sid, data)
             ui_signals.strategies_changed.emit()
 
@@ -1679,6 +1686,7 @@ class MainWindow(LogMixin, QMainWindow):
         data = get_strategy(sid)
         if data:
             data["status"] = "stopped"
+            data["desired_state"] = "stopped"
             save_strategy(sid, data)
             self._log(f"Агент [{data['name']}] остановлен", "info")
             ui_signals.strategies_changed.emit()
@@ -1698,6 +1706,7 @@ class MainWindow(LogMixin, QMainWindow):
                 "file_path":     path,
                 "description":   loaded.info.get("description", ""),
                 "status":        "stopped",
+                "desired_state": "stopped",
                 "finam_account": "",
                 "is_enabled":    True,
                 "params":        {
@@ -1715,6 +1724,7 @@ class MainWindow(LogMixin, QMainWindow):
 
         for sid, data in get_all_strategies().items():
             data["status"] = "active"
+            data["desired_state"] = "active"
             save_strategy(sid, data)
             start_live_engine(sid, wait_for_connection=False)
         self._log("Все агенты запущены", "info")
@@ -1726,6 +1736,7 @@ class MainWindow(LogMixin, QMainWindow):
         for sid, data in get_all_strategies().items():
             stop_live_engine(sid)
             data["status"] = "stopped"
+            data["desired_state"] = "stopped"
             save_strategy(sid, data)
         self._log("Все агенты остановлены", "info")
         ui_signals.strategies_changed.emit()
@@ -1737,6 +1748,7 @@ class MainWindow(LogMixin, QMainWindow):
             data = get_strategy(sid)
             if data:
                 data["status"] = "active"
+                data["desired_state"] = "active"
                 save_strategy(sid, data)
                 if start_live_engine(sid, wait_for_connection=False):
                     self._log(f"Агент [{data['name']}] запущен", "info")
@@ -1755,6 +1767,7 @@ class MainWindow(LogMixin, QMainWindow):
             if data:
                 stop_live_engine(sid)
                 data["status"] = "stopped"
+                data["desired_state"] = "stopped"
                 save_strategy(sid, data)
                 self._log(f"Агент [{data['name']}] остановлен", "info")
         ui_signals.strategies_changed.emit()

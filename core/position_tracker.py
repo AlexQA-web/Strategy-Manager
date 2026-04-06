@@ -135,16 +135,22 @@ class PositionTracker:
                     self._entry_price = 0.0
             return True
 
-    def update_position(self, position: int, qty: int, entry_price: float):
-        """Атомарно обновить все параметры позиции (sync path — для синхронизации с брокером).
+    def sync_position(self, position: int, qty: int, entry_price: float):
+        """Authoritative sync-path update from broker/reconcile.
 
         Не ограничен матрицей переходов, т.к. отражает внешнее состояние.
-        Для trade-path используйте open_position/confirm_open/close_position.
+        Одновременно сбрасывает transient order_in_flight, чтобы reconcile не
+        оставлял стратегию заблокированной после подтверждённого broker sync.
         """
         with self._position_lock:
             self._position = position
             self._position_qty = qty
             self._entry_price = entry_price
+            self._order_in_flight = False
+
+    def update_position(self, position: int, qty: int, entry_price: float):
+        """Совместимый алиас sync-path обновления позиции."""
+        self.sync_position(position, qty, entry_price)
 
     def confirm_open(self, side: str, filled: int, price: float) -> bool:
         """Подтвердить открытие позиции после исполнения ордера (trade path).

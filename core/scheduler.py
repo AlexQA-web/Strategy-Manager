@@ -8,6 +8,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from core.storage import get_all_schedules
 
 DAYS_RU = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
+MOEX_COMMISSION_REFRESH_HOUR = 5
+MOEX_COMMISSION_REFRESH_MINUTE = 0
 
 
 def parse_schedule_window(sched: dict) -> Optional[tuple[dtime, dtime, list[int]]]:
@@ -101,8 +103,18 @@ class StrategyScheduler:
 
     def setup_connector_schedule(self):
         from core.connector_manager import connector_manager
+        from core.commission_manager import commission_manager
 
         self._scheduler.remove_all_jobs()
+        self._scheduler.add_job(
+            commission_manager.refresh_moex_rates,
+            trigger="cron",
+            hour=MOEX_COMMISSION_REFRESH_HOUR,
+            minute=MOEX_COMMISSION_REFRESH_MINUTE,
+            id="moex_commission_refresh",
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
         schedules = get_all_schedules()
 
         for cid, sched in schedules.items():

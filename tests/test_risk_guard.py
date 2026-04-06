@@ -2,6 +2,7 @@
 
 """Unit-тесты для core/risk_guard.py"""
 
+import threading
 import time
 from unittest.mock import patch
 
@@ -159,14 +160,19 @@ class TestRiskLimits:
         assert allowed is True
 
     def test_daily_loss_limit_error_handling(self):
-        """daily_loss_limit не падает при ошибке get_total_pnl."""
+        """daily_loss_limit при ошибке расчёта уходит в fail-safe блокировку."""
         guard = RiskGuard(
             strategy_id="test",
             daily_loss_limit=1000.0,
             get_total_pnl=lambda sid: (_ for _ in ()).throw(Exception("DB error")),
         )
-        allowed, reason = guard.check_risk_limits("buy", 1)
-        assert allowed is True
+        with patch("core.risk_guard.runtime_metrics.emit_audit_event") as audit_mock:
+            allowed, reason = guard.check_risk_limits("buy", 1)
+
+        assert allowed is False
+        assert "daily_loss_guard_error" in reason
+        audit_mock.assert_called_once()
+        assert audit_mock.call_args.args[0] == "risk_guard_daily_loss_error"
 
 
 class TestBaselineEquityPolicy:
@@ -274,3 +280,76 @@ class TestBaselineEquityPolicy:
         allowed, reason = guard.check_risk_limits("buy", 1)
         assert allowed is False
         assert "source=pnl" in reason
+
+    def test_daily_loss_metric_and_rollover_execute_under_single_lock(self):
+        """Чтение метрики и day rollover выполняются внутри одного критического сектора."""
+
+        class InspectingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.acquired = False
+
+            def __enter__(self):
+                self._lock.acquire()
+                self.acquired = True
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.acquired = False
+                self._lock.release()
+
+        inspecting_lock = InspectingLock()
+
+        def _get_total_pnl(_strategy_id):
+            assert inspecting_lock.acquired is True
+            return -250.0
+
+        guard = RiskGuard(
+            strategy_id="test",
+            daily_loss_limit=500.0,
+            get_total_pnl=_get_total_pnl,
+        )
+        guard._lock = inspecting_lock
+
+        allowed, _ = guard.check_risk_limits("buy", 1)
+
+        assert allowed is True
+        assert guard._baseline_metric == -250.0
+
+    def test_per_instrument_limit_overrides_global_limit(self):
+        guard = RiskGuard(
+            strategy_id="test",
+            max_position_size=10,
+            per_instrument_limits={"SBER": {"max_position_size": 2}},
+        )
+
+        allowed, reason = guard.check_risk_limits("buy", 3, ticker="SBER")
+
+        assert allowed is False
+        assert "max_position_size=2" in reason
+
+    def test_trade_frequency_blocks_after_limit(self):
+        guard = RiskGuard(
+            strategy_id="test",
+            max_trades_per_window=2,
+            trade_window_sec=60.0,
+        )
+
+        guard.notify_order_submitted("buy", ticker="SBER")
+        guard.notify_order_submitted("close", ticker="SBER")
+        allowed, reason = guard.check_risk_limits("buy", 1, ticker="SBER")
+
+        assert allowed is False
+        assert "trade frequency limit" in reason
+
+    def test_cooldown_after_close_blocks_new_entry(self):
+        guard = RiskGuard(
+            strategy_id="test",
+            cooldown_after_close_sec=30.0,
+        )
+
+        guard.notify_order_submitted("close", ticker="SBER")
+        allowed, reason = guard.check_risk_limits("buy", 1, ticker="SBER")
+
+        assert allowed is False
+        assert "cooldown_after_close" in reason

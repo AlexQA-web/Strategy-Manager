@@ -15,6 +15,7 @@ NOTE: Race condition fix — используется единый _rwlock из 
 read-modify-write цикла, что предотвращает потерю данных при параллельных save_order.
 """
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from loguru import logger
@@ -22,6 +23,7 @@ from loguru import logger
 from core.moex_api import MOEXClient
 from core.storage import read_json, DATA_DIR, _rwlock, _read as _storage_read, _write_unsafe_inner as _storage_write_unlocked
 from core.valuation_service import valuation_service
+from core.money import to_storage_float, to_storage_str
 
 ORDERS_FILE = DATA_DIR / "order_history.json"
 
@@ -43,6 +45,7 @@ def make_order(
     commission_total: float | None = None,  # абсолютная комиссия за всю сторону
     exec_key: str = "",
     source: str = "",
+    correlation_id: str = "",
     pnl_multiplier: float = 0.0,  # денежный множитель для PnL (0 = вычислять автоматически)
 ) -> Dict[str, Any]:
     qty_abs = abs(int(quantity or 0))
@@ -59,20 +62,24 @@ def make_order(
         "board":              board,
         "side":               side,
         "quantity":           quantity,
-        "price":              price,
+        "price":              to_storage_float(price),
         "timestamp":          datetime.now().isoformat(),
         "status":             "filled",
         "comment":            comment,
-        "commission":         commission_per_lot,  # руб/лот, одна сторона (legacy)
-        "commission_total":   commission_total,    # руб за всю сторону
-        "point_cost":         point_cost,          # стоимость пункта в рублях
+        "commission":         to_storage_float(commission_per_lot),  # руб/лот, одна сторона (legacy)
+        "commission_total":   to_storage_float(commission_total),    # руб за всю сторону
+        "point_cost":         to_storage_float(point_cost),          # стоимость пункта в рублях
         "pnl":                None,   # Заполняется при закрытии
         "pair_id":            None,   # ID ордера-открытия (для закрывающих ордеров)
         "exec_key":           str(exec_key or ""),
         "source":             str(source or ""),
+        "correlation_id":     str(correlation_id or ""),
+        "price_decimal":      to_storage_str(price),
+        "commission_decimal": to_storage_str(commission_per_lot),
+        "commission_total_decimal": to_storage_str(commission_total),
     }
     if pnl_multiplier > 0:
-        order["pnl_multiplier"] = pnl_multiplier
+        order["pnl_multiplier"] = to_storage_float(pnl_multiplier)
     return order
 
 
@@ -102,6 +109,16 @@ def _save(data: Dict[str, Any]) -> None:
 FIFO_KEY_FIELDS = ("strategy_id", "ticker", "board")
 
 
+@dataclass
+class _AccountingState:
+    open_queues: dict[tuple[str, str, str], list[dict[str, Any]]] = field(default_factory=dict)
+    realized_pnl: float = 0.0
+    has_closed_trades: bool = False
+
+
+_accounting_cache: dict[str, _AccountingState] = {}
+
+
 def _key(order: Dict[str, Any]) -> tuple[str, str, str]:
     return (
         str(order.get("strategy_id", "")),
@@ -110,13 +127,107 @@ def _key(order: Dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def save_order(order: Dict[str, Any]) -> None:
+def _slice_commission(total_commission: float, slice_qty: int, source_qty: int) -> float:
+    return valuation_service.slice_commission(total_commission, slice_qty, source_qty)
+
+
+def _queue_order_copy(order: Dict[str, Any], quantity: int | None = None, commission_total: float | None = None) -> Dict[str, Any]:
+    qty_value = int(order.get("quantity", 0) if quantity is None else quantity)
+    commission_total_value = (
+        get_order_commission_total(order)
+        if commission_total is None else float(commission_total)
+    )
+    return {
+        **order,
+        "quantity": qty_value,
+        "commission_total": commission_total_value,
+        "commission": commission_total_value / qty_value if qty_value > 0 else 0.0,
+    }
+
+
+def _apply_order_to_accounting_state(state: _AccountingState, order: Dict[str, Any]) -> None:
+    key = _key(order)
+    queue = state.open_queues.setdefault(key, [])
+
+    side = str(order.get("side", ""))
+    qty = int(order.get("quantity", 0) or 0)
+    remaining_qty = qty
+    remaining_commission_total = get_order_commission_total(order)
+
+    while remaining_qty > 0 and queue:
+        open_order = queue[0]
+        open_qty = int(open_order.get("quantity", 0) or 0)
+
+        if side == str(open_order.get("side", "")):
+            break
+
+        close_qty = min(open_qty, remaining_qty)
+        is_long = str(open_order.get("side", "")) == "buy"
+        open_price = float(open_order.get("price", 0.0) or 0.0)
+        close_price = float(order.get("price", 0.0) or 0.0)
+
+        pnl_multiplier = get_order_pnl_multiplier(open_order)
+        open_commission_total = get_order_commission_total(open_order)
+        entry_commission = _slice_commission(open_commission_total, close_qty, open_qty)
+        exit_commission = _slice_commission(remaining_commission_total, close_qty, remaining_qty)
+        total_commission = entry_commission + exit_commission
+
+        gross_pnl = valuation_service.compute_closed_pnl(
+            open_price=open_price,
+            close_price=close_price,
+            qty=close_qty,
+            is_long=is_long,
+            pnl_multiplier=pnl_multiplier,
+            entry_commission=0.0,
+            exit_commission=0.0,
+        )
+        net_pnl = round(gross_pnl - total_commission, 4)
+        state.realized_pnl += net_pnl
+        state.has_closed_trades = True
+
+        remaining_qty -= close_qty
+        remaining_commission_total -= exit_commission
+        if close_qty >= open_qty:
+            queue.pop(0)
+        else:
+            queue[0] = _queue_order_copy(
+                open_order,
+                quantity=open_qty - close_qty,
+                commission_total=open_commission_total - entry_commission,
+            )
+
+    if remaining_qty > 0:
+        queue.append(
+            _queue_order_copy(
+                order,
+                quantity=remaining_qty,
+                commission_total=remaining_commission_total,
+            )
+        )
+
+
+def _build_accounting_state(orders: List[Dict[str, Any]]) -> _AccountingState:
+    state = _AccountingState()
+    for order in sorted(orders, key=lambda item: item["timestamp"]):
+        _apply_order_to_accounting_state(state, order)
+    return state
+
+
+def _get_or_build_accounting_state_unsafe(strategy_id: str, orders: List[Dict[str, Any]]) -> _AccountingState:
+    state = _accounting_cache.get(strategy_id)
+    if state is None:
+        state = _build_accounting_state(orders)
+        _accounting_cache[strategy_id] = state
+    return state
+
+
+def save_order(order: Dict[str, Any]) -> str:
     """Сохраняет ордер в историю. Защищено от race condition через _rwlock.write_lock()."""
     strategy_id = order["strategy_id"]
     exec_key = str(order.get("exec_key", "") or "")
     if not exec_key:
         logger.warning(f"[{strategy_id}] save_order: нет exec_key, запись пропущена")
-        return
+        return "error"
 
     with _rwlock.write_lock():
         data = _load(use_cache=False)
@@ -125,7 +236,7 @@ def save_order(order: Dict[str, Any]) -> None:
         for existing in data[strategy_id]:
             if str(existing.get("exec_key", "") or "") == exec_key:
                 logger.debug(f"[{strategy_id}] duplicate execution ignored: exec_key={exec_key}")
-                return
+                return "duplicate"
         # Логирование chase-ордеров для отладки
         if exec_key.startswith("chase:"):
             logger.info(
@@ -133,12 +244,35 @@ def save_order(order: Dict[str, Any]) -> None:
                 f"side={order['side']}, qty={order['quantity']}, price={order['price']}"
             )
         data[strategy_id].append(order)
+        state = _accounting_cache.get(strategy_id)
+        if state is None:
+            _accounting_cache[strategy_id] = _build_accounting_state(data[strategy_id])
+        else:
+            _apply_order_to_accounting_state(state, order)
         _save(data)
     logger.debug(
         f"[{strategy_id}] Ордер сохранён: "
         f"{order['side'].upper()} {order['ticker']} "
         f"x{order['quantity']} @ {order['price']}"
     )
+    return "inserted"
+
+
+def get_all_exec_keys(strategy_id: str | None = None) -> set[str]:
+    data = _load()
+    orders = []
+    if strategy_id is None:
+        for items in data.values():
+            if isinstance(items, list):
+                orders.extend(items)
+    else:
+        orders = data.get(strategy_id, [])
+    result = set()
+    for order in orders:
+        exec_key = str(order.get("exec_key", "") or "")
+        if exec_key:
+            result.add(exec_key)
+    return result
 
 
 def get_orders(strategy_id: str) -> List[Dict[str, Any]]:
@@ -164,6 +298,7 @@ def clear_orders(strategy_id: str) -> None:
     with _rwlock.write_lock():
         data = _load(use_cache=False)
         data.pop(strategy_id, None)
+        _accounting_cache.pop(strategy_id, None)
         _save(data)
 
 # ─────────────────────────────────────────────
@@ -289,9 +424,6 @@ def get_order_pairs(strategy_id: str) -> List[Dict[str, Any]]:
 
     NOTE: Защищено от race condition через _orders_lock.
     """
-    def _slice_commission(total_commission: float, slice_qty: int, source_qty: int) -> float:
-        return valuation_service.slice_commission(total_commission, slice_qty, source_qty)
-
     # Защищаем всю обработку lock-ом для избежания race condition
     with _rwlock.read_lock():
         data = _storage_read(ORDERS_FILE, use_cache=True)
@@ -427,11 +559,13 @@ def get_order_pairs(strategy_id: str) -> List[Dict[str, Any]]:
 
 def get_total_pnl(strategy_id: str) -> Optional[float]:
     """Нарастающий итог П/У по всем закрытым сделкам стратегии."""
-    pairs = get_order_pairs(strategy_id)
-    closed = [p["pnl"] for p in pairs if p["pnl"] is not None]
-    if not closed:
-        return None
-    return round(sum(closed), 2)
+    with _rwlock.write_lock():
+        data = _load(use_cache=False)
+        orders = data.get(strategy_id, [])
+        state = _get_or_build_accounting_state_unsafe(strategy_id, orders)
+        if not state.has_closed_trades:
+            return None
+        return round(state.realized_pnl, 2)
 
 
 def get_pnl_by_ticker(strategy_id: str) -> dict[str, Optional[float]]:

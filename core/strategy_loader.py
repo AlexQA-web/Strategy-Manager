@@ -33,6 +33,78 @@ class StrategyLoadError(Exception):
     pass
 
 
+def _coerce_param_value(key: str, value, meta: dict):
+    ptype = meta.get("type", "str")
+
+    if ptype == "int":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Параметр '{key}': ожидается число, получено {type(value).__name__}")
+        return int(value)
+    if ptype == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Параметр '{key}': ожидается число, получено {type(value).__name__}")
+        return float(value)
+    if ptype == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError(f"Параметр '{key}': ожидается bool, получено {type(value).__name__}")
+    if ptype == "time":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Параметр '{key}': ожидается time(int), получено {type(value).__name__}")
+        return int(value)
+    if ptype in ("choice", "select"):
+        options = meta.get("options", [])
+        if options and value not in options:
+            raise ValueError(f"Параметр '{key}': '{value}' не в допустимых значениях {options}")
+        return value
+    if ptype == "instruments":
+        if not isinstance(value, list):
+            raise ValueError(f"Параметр '{key}': ожидается list, получено {type(value).__name__}")
+        return value
+    return value
+
+
+def resolve_strategy_params(raw_params: dict, schema: dict) -> tuple[dict, Optional[str]]:
+    resolved = {}
+
+    for key, meta in schema.items():
+        if key in raw_params:
+            value = raw_params[key]
+        elif "default" in meta:
+            value = meta["default"]
+        elif meta.get("required", False):
+            return {}, f"Параметр '{key}' обязателен"
+        else:
+            continue
+
+        try:
+            coerced = _coerce_param_value(key, value, meta)
+        except ValueError as exc:
+            return {}, str(exc)
+
+        if meta.get("type") in ("int", "float", "time"):
+            if "min" in meta and coerced < meta["min"]:
+                return {}, f"Параметр '{key}': {coerced} < min({meta['min']})"
+            if "max" in meta and coerced > meta["max"]:
+                return {}, f"Параметр '{key}': {coerced} > max({meta['max']})"
+
+        resolved[key] = coerced
+
+    for key, value in raw_params.items():
+        if key not in resolved:
+            resolved[key] = value
+
+    return resolved, None
+
+
 def resolve_custom_execution_adapter(module, file_path: str) -> tuple[Optional[str], frozenset[str]]:
     """Разрешает custom execution adapter только через явный registry.
 
@@ -222,36 +294,8 @@ def validate_params(params: dict, schema: dict) -> Optional[str]:
     """
     Проверяет params по schema. Возвращает строку ошибки или None.
     """
-    for key, meta in schema.items():
-        if key not in params:
-            continue
-        value = params[key]
-        ptype = meta.get("type", "str")
-
-        # Проверка типа
-        if ptype == "int":
-            if not isinstance(value, (int, float)):
-                return f"Параметр '{key}': ожидается число, получено {type(value).__name__}"
-            value = int(value)
-        elif ptype == "float":
-            if not isinstance(value, (int, float)):
-                return f"Параметр '{key}': ожидается число, получено {type(value).__name__}"
-            value = float(value)
-
-        # Проверка диапазона
-        if ptype in ("int", "float"):
-            if "min" in meta and value < meta["min"]:
-                return f"Параметр '{key}': {value} < min({meta['min']})"
-            if "max" in meta and value > meta["max"]:
-                return f"Параметр '{key}': {value} > max({meta['max']})"
-
-        # Проверка choice
-        if ptype in ("choice", "select"):
-            options = meta.get("options", [])
-            if options and value not in options:
-                return f"Параметр '{key}': '{value}' не в допустимых значениях {options}"
-
-    return None
+    _, error = resolve_strategy_params(params, schema)
+    return error
 
 
 class StrategyLoader:

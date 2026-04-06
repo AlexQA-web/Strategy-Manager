@@ -69,8 +69,11 @@ def main():
     window.show()
 
     from core.autostart import autoconnect_connectors, autostart_strategies, start_engine_watchdog
+    from core.health_server import configure_default_callbacks, health_server
     autoconnect_connectors()
     autostart_strategies()
+    configure_default_callbacks(health_server)
+    health_server.start()
     # Watchdog: автоматически запускает/останавливает движки при изменении состояния коннекторов.
     # Проверяет каждые 15 секунд — при подключении коннектора стартует движки активных стратегий,
     # при отключении — останавливает. Работает вместе с расписанием.
@@ -98,6 +101,11 @@ def main():
         try:
             from core.telegram_bot import get_notifier
             get_notifier().stop()
+        except Exception:
+            pass
+        try:
+            from core.health_server import health_server
+            health_server.stop()
         except Exception:
             pass
 

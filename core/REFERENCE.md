@@ -246,7 +246,7 @@ c = valuation_service.slice_commission(total_commission=50.0, slice_qty=4, sourc
 from core.fill_ledger import fill_ledger
 
 # Записать fill (дедупликация по fill_id):
-ok = fill_ledger.record_fill(
+result = fill_ledger.record_fill(
     fill_id="exec_001",        # уникальный execution_id от коннектора
     strategy_id="my_strategy",
     ticker="SBER", board="TQBR", side="buy",
@@ -255,7 +255,9 @@ ok = fill_ledger.record_fill(
     commission_total=6.45,
     pnl_multiplier=10.0,
 )
-# ok=True → записан, ok=False → дубликат или пустой fill_id
+# result.is_success → проекция успешно записана
+# result.is_duplicate → durable duplicate без повторной записи
+# result.is_repair → одна из проекций была восстановлена repair-path'ом
 
 # Проверка дубликата:
 fill_ledger.is_duplicate("exec_001")  # True
@@ -271,14 +273,47 @@ from core.reservation_ledger import reservation_ledger
 # Зарезервировать перед submit ордера:
 reservation_ledger.reserve("strat_A:order_1", "account_123", 50000.0)
 
+# Привязать reserve к broker order id или synthetic chase id:
+reservation_ledger.bind_order("strat_A:order_1", "tid_123")
+
 # Доступные средства с учётом резервов:
 avail = reservation_ledger.available("account_123", gross_free=100000.0)  # 50000.0
 
 # Освободить при fill/cancel/reject:
 reservation_ledger.release("strat_A:order_1")
 
-# Stale eviction: резервы старше 5 мин автоматически удаляются
+# Ambiguous submit / lost ack: reserve помечается stale и остаётся видимым
+reservation_ledger.mark_stale("strat_A:order_1", "ambiguous_submit")
 ```
+
+Правила:
+- reserve делается до submit
+- bind_order обязателен при получении broker order id или synthetic chase id
+- stale reserve сразу исключается из total_reserved()/available(), но кратко остаётся в snapshot для расследования
+- после stale grace-window резерв автоматически очищается из ledger с audit event
+
+## observability.py и runtime_metrics.py — runtime health snapshot
+
+```python
+from core.observability import collect_health_snapshot, collect_runtime_metrics, collect_strategies_health
+
+health = collect_health_snapshot()
+metrics = collect_runtime_metrics()
+strategies = collect_strategies_health()
+```
+
+Снимок включает:
+- desired/runtime state по стратегиям
+- pending/stale counters
+- latency metrics
+- последние audit events
+
+## ownership policy и runtime truth
+
+- `desired_state` хранит пользовательское намерение в storage и не равен реальной торговой готовности.
+- `actual_state` живёт в runtime registry и показывает, стартовал ли engine и в каком он состоянии.
+- На одном `account_id+ticker` разрешён только один owner, если явно не включён `allow_shared_position`.
+- `manual_intervention_required` считается terminal operator state до явного расследования.
 
 ## position_tracker.py — матрица переходов
 
@@ -316,6 +351,9 @@ rg = RiskGuard(
 
 # Pre-trade check (вызывается в OrderExecutor перед submit):
 allowed, reason = rg.check_risk_limits("buy", qty=5)
+
+# Если daily loss metric не удалось вычислить, guard работает в fail-safe:
+# allowed == False, reason содержит daily_loss_guard_error, событие уходит в audit.
 
 # Circuit breaker (hard-stop, только close разрешён):
 rg.is_circuit_open()       # True → запретить buy/sell

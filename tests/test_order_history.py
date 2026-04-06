@@ -1,5 +1,6 @@
 # tests/test_order_history.py
 import pytest
+import core.order_history as order_history_module
 from core.order_history import make_order, save_order, get_order_pairs, get_total_pnl, clear_orders
 
 
@@ -110,3 +111,55 @@ def test_total_pnl():
 
     total = get_total_pnl(STRATEGY_ID)
     assert total == pytest.approx(30.0)
+
+
+def test_total_pnl_uses_incremental_accounting_after_save_order(monkeypatch):
+    buy = make_order(STRATEGY_ID, "SBER", "buy", 1, 100.0, exec_key="inc-b")
+    sell = make_order(STRATEGY_ID, "SBER", "sell", 1, 110.0, exec_key="inc-s")
+    save_order(buy)
+    save_order(sell)
+
+    monkeypatch.setattr(
+        order_history_module,
+        "get_order_pairs",
+        lambda strategy_id: (_ for _ in ()).throw(AssertionError("full rebuild should not run")),
+    )
+
+    total = get_total_pnl(STRATEGY_ID)
+    assert total == pytest.approx(10.0)
+
+
+def test_save_order_returns_duplicate_for_same_exec_key():
+    order = make_order(
+        strategy_id=STRATEGY_ID,
+        ticker="SBER",
+        side="buy",
+        quantity=1,
+        price=100.0,
+        exec_key="dup-key",
+    )
+
+    assert save_order(order) == "inserted"
+    assert save_order(dict(order)) == "duplicate"
+
+
+def test_save_order_persists_versioned_runtime_json(tmp_path, monkeypatch):
+    orders_file = tmp_path / "order_history.json"
+    monkeypatch.setattr(order_history_module, "ORDERS_FILE", orders_file)
+
+    order = make_order(
+        strategy_id=STRATEGY_ID,
+        ticker="SBER",
+        side="buy",
+        quantity=1,
+        price=100.0,
+        exec_key="versioned-order",
+    )
+
+    assert save_order(order) == "inserted"
+
+    with open(orders_file, "r", encoding="utf-8") as f:
+        raw = __import__("json").load(f)
+
+    assert raw["schema_version"] == 1
+    assert STRATEGY_ID in raw["payload"]

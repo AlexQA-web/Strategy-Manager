@@ -216,20 +216,20 @@ class TestPendingOrderRegistry:
     """Тесты PendingOrderRegistry."""
 
     def test_register_and_get_pending(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         reg.register(lc)
         assert len(reg.get_pending()) == 1
 
     def test_unregister(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         reg.register(lc)
         reg.unregister("t1")
         assert len(reg.get_pending()) == 0
 
     def test_check_late_fills_detects_increase(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         lc.update_from_connector("canceled", filled=5)
 
@@ -250,7 +250,7 @@ class TestPendingOrderRegistry:
         assert results[0]["strategy_id"] == "agent1"
 
     def test_check_late_fills_no_change(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         lc.update_from_connector("canceled", filled=5)
 
@@ -268,7 +268,7 @@ class TestPendingOrderRegistry:
         assert len(results) == 0
 
     def test_check_late_fills_connector_error_ignored(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         lc.update_from_connector("timeout", filled=3)
         lc.mark_timeout()
@@ -281,7 +281,7 @@ class TestPendingOrderRegistry:
         assert len(results) == 0
 
     def test_cleanup_expired(self):
-        reg = PendingOrderRegistry(max_age_sec=0.0)
+        reg = PendingOrderRegistry(max_age_sec=0.0, load_from_storage=False)
         lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
         lc.update_from_connector("canceled", filled=5)
         reg.register(lc)
@@ -291,8 +291,63 @@ class TestPendingOrderRegistry:
         assert len(reg.get_pending()) == 0
 
     def test_multiple_orders_tracked(self):
-        reg = PendingOrderRegistry()
+        reg = PendingOrderRegistry(load_from_storage=False)
         for i in range(5):
             lc = OrderLifecycle(f"t{i}", "agent1", "SiM5", "buy", 10)
             reg.register(lc)
         assert len(reg.get_pending()) == 5
+
+    def test_registry_persists_and_restores_from_storage(self, tmp_path, monkeypatch):
+        import core.storage as storage
+
+        monkeypatch.setattr(storage, "PENDING_ORDERS_FILE", tmp_path / "pending_orders.json")
+
+        reg = PendingOrderRegistry(load_from_storage=False)
+        lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
+        lc.update_from_connector("working", filled=3, avg_price=85000.0)
+        reg.register(lc)
+
+        restored = PendingOrderRegistry()
+        restored_pending = [item for item in restored.get_pending() if item.tid == "t1"]
+
+        assert len(restored_pending) == 1
+        assert restored_pending[0].tid == "t1"
+        assert restored_pending[0].filled_qty == 3
+
+    def test_recover_strategy_orders_marks_missing_broker_state_unresolved(self):
+        reg = PendingOrderRegistry(load_from_storage=False)
+        lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
+        reg.register(lc)
+
+        mock_connector = MagicMock()
+        mock_connector.get_order_status.return_value = None
+
+        result = reg.recover_strategy_orders(mock_connector, "agent1")
+
+        assert result["recovered"] == []
+        assert len(result["unresolved"]) == 1
+        assert result["unresolved"][0]["reason"] == "missing_on_broker"
+
+    def test_late_fill_detected_after_registry_restore(self, tmp_path, monkeypatch):
+        import core.storage as storage
+
+        monkeypatch.setattr(storage, "PENDING_ORDERS_FILE", tmp_path / "pending_orders.json")
+
+        reg = PendingOrderRegistry(load_from_storage=False)
+        lc = OrderLifecycle("t1", "agent1", "SiM5", "buy", 10)
+        lc.update_from_connector("canceled", filled=5, avg_price=85000.0)
+        reg.register(lc)
+
+        restored = PendingOrderRegistry()
+        mock_connector = MagicMock()
+        mock_connector.get_order_status.return_value = {
+            "status": "matched",
+            "quantity": 10,
+            "balance": 2,
+            "avg_price": 85050.0,
+        }
+
+        results = restored.check_late_fills(mock_connector)
+
+        assert len(results) == 1
+        assert results[0]["delta"] == 3

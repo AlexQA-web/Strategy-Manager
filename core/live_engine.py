@@ -40,12 +40,31 @@ from core.trade_recorder import TradeRecorder
 from core.reconciler import Reconciler
 from core.finam_connector import FinamConnector
 from core.quik_connector import QuikConnector
+from core.startup_service import fetch_startup_snapshot
+from core.strategy_runtime import StrategyRuntimeState, is_valid_runtime_transition
+from core.base_connector import MarketDataEnvelope
 
 # Маппинг timeframe → строка для get_history
 TIMEFRAME_TO_PERIOD = {
     "1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h",
     "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h",
 }
+
+PERIOD_TO_BAR_MINUTES = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "1d": 1440,
+}
+
+_TRADING_SESSION_MINUTES = 8 * 60
+_WARMUP_HISTORY_SAFETY_FACTOR = 1.25
+_MIN_WARMUP_HISTORY_DAYS = 5
+_MAX_WARMUP_HISTORY_DAYS = 3650
+_MAX_WARMUP_FETCH_ATTEMPTS = 3
+_INCREMENTAL_HISTORY_DAYS = 5
 
 # Маппинг timeframe → интервал поллинга (секунды)
 TIMEFRAME_TO_POLL_SEC = {
@@ -86,7 +105,7 @@ class LiveEngine:
     def __init__(self, strategy_id: str, loaded_strategy, params: dict,
                  connector, account_id: str, ticker: str, board: str,
                  timeframe: str, agent_name: str = "", order_mode: str = "market",
-                 lot_sizing: dict = None):
+                 lot_sizing: dict = None, allow_shared_position: bool = False):
         self._strategy_id = strategy_id
         self._loaded = loaded_strategy
         self._module = loaded_strategy.module
@@ -115,6 +134,7 @@ class LiveEngine:
         self._agent_name = agent_name or strategy_id
         self._order_mode = order_mode
         self._lot_sizing = lot_sizing or {}
+        self._allow_shared_position = allow_shared_position
 
         # Комиссия: поддержка режима "auto" или ручных значений
         commission_param = params.get("commission", "auto")
@@ -143,6 +163,7 @@ class LiveEngine:
         self._last_bar_dt: Optional[datetime] = None
         self._thread: Optional[threading.Thread] = None
         self._subscribed_quotes = False
+        self._subscribed_reconnect = False
 
         # Счётчик тайм-аутов get_history
         self._consecutive_timeouts: int = 0
@@ -151,6 +172,8 @@ class LiveEngine:
         # Статус синхронизации с брокером: "unknown" | "synced" | "stale"
         # При stale запрещены открывающие сделки, разрешены только close/reconcile
         self._sync_status: str = "unknown"
+        self._runtime_state: str = StrategyRuntimeState.STOPPED.value
+        self._startup_snapshot_data: dict = {}
 
         # Bounded executor для get_history (max 1, чтобы не плодить потоки при timeout)
         self._history_pool = ThreadPoolExecutor(
@@ -163,6 +186,7 @@ class LiveEngine:
 
         # Параметры для point_cost и lot_size
         self._last_price: float = 0.0
+        self._last_price_envelope: Optional[MarketDataEnvelope] = None
         self._point_cost: float = 1.0
         self._lot_size: int = 1
 
@@ -174,12 +198,16 @@ class LiveEngine:
         # 2. RiskGuard
         self._risk_guard = RiskGuard(
             strategy_id=self._strategy_id,
-            circuit_breaker_threshold=3,
-            circuit_breaker_timeout=60.0,
+            circuit_breaker_threshold=int(params.get("circuit_breaker_threshold", 3) or 3),
+            circuit_breaker_timeout=float(params.get("circuit_breaker_timeout", 60.0) or 60.0),
             max_position_size=int(params.get("max_position_size", 0) or 0),
             daily_loss_limit=float(params.get("daily_loss_limit", 0.0) or 0.0),
             get_total_pnl=get_total_pnl,
             get_current_equity=self._get_current_equity_metric,
+            per_instrument_limits=params.get("per_instrument_limits", {}),
+            max_trades_per_window=int(params.get("max_trades_per_window", 0) or 0),
+            trade_window_sec=float(params.get("trade_window_sec", 60.0) or 60.0),
+            cooldown_after_close_sec=float(params.get("cooldown_after_close_sec", 0.0) or 0.0),
         )
 
         # 3. TradeRecorder
@@ -211,12 +239,14 @@ class LiveEngine:
             order_mode=self._order_mode,
             lot_sizing=self._lot_sizing,
             get_last_price=lambda: self._last_price,
+            get_last_price_envelope=lambda: self._last_price_envelope,
             get_point_cost=lambda: self._point_cost,
             get_lot_size=lambda: self._lot_size,
             is_futures=lambda: self._is_futures(),
             calculate_commission=self._calculate_commission,
             on_reconcile=self._detect_position,
             on_circuit_break=self._on_circuit_break,
+            on_manual_intervention=self._require_manual_intervention,
         )
 
         # 5. Reconciler
@@ -231,6 +261,8 @@ class LiveEngine:
             reconcile_interval_sec=60.0,
             alert_cooldown_sec=300.0,
             on_broker_unavailable=self._on_broker_unavailable,
+            on_history_divergence=self._require_manual_intervention,
+            allow_shared_position=self._allow_shared_position,
         )
 
     # === Legacy-прокси для обратной совместимости ===
@@ -304,6 +336,59 @@ class LiveEngine:
     def sync_status(self) -> str:
         """Текущий статус синхронизации с брокером: unknown | synced | stale."""
         return self._sync_status
+
+    @property
+    def runtime_state(self) -> str:
+        """Текущее runtime-состояние стратегии."""
+        return self._runtime_state
+
+    def _set_runtime_state(self, new_state: str):
+        current_state = self._runtime_state
+        if not is_valid_runtime_transition(current_state, new_state):
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] runtime_state invalid transition: "
+                f"{current_state} -> {new_state}"
+            )
+        if current_state != new_state:
+            logger.info(
+                f"[LiveEngine:{self._strategy_id}] runtime_state: "
+                f"{current_state} -> {new_state}"
+            )
+        self._runtime_state = new_state
+
+    def startup_preflight(self) -> bool:
+        """Загружает startup snapshot и выполняет initial reconcile до запуска poll-loop."""
+        self._set_runtime_state(StrategyRuntimeState.INITIALIZING.value)
+        try:
+            self._startup_snapshot_data = fetch_startup_snapshot(
+                self._connector,
+                self._account_id,
+                self._strategy_id,
+            )
+            unresolved = self._startup_snapshot_data.get("pending_recovery", {}).get("unresolved", [])
+            if unresolved:
+                self._sync_status = "stale"
+                self._require_manual_intervention(
+                    f"unresolved_pending_orders:{len(unresolved)}"
+                )
+                return False
+            self._detect_position()
+            self._reconciler._last_reconcile_ts = 0.0
+            self._reconciler.reconcile()
+
+            if self._sync_status == "unknown":
+                self._sync_status = "stale"
+
+            if self._sync_status == "synced":
+                self._set_runtime_state(StrategyRuntimeState.SYNCED.value)
+            else:
+                self._set_runtime_state(StrategyRuntimeState.DEGRADED.value)
+            return True
+        except Exception as e:
+            logger.error(f"[LiveEngine:{self._strategy_id}] startup_preflight failed: {e}")
+            self._sync_status = "stale"
+            self._set_runtime_state(StrategyRuntimeState.FAILED_START.value)
+            return False
 
     # === Вспомогательные методы ===
 
@@ -426,7 +511,7 @@ class LiveEngine:
             return True, ""
         if self._risk_guard.is_circuit_open():
             return False, "circuit breaker открыт"
-        return self._risk_guard.check_risk_limits(action, qty)
+        return self._risk_guard.check_risk_limits(action, qty, ticker=self._ticker)
 
     def _custom_account_risk_check(
         self,
@@ -635,10 +720,16 @@ class LiveEngine:
 
     # === Start / Stop ===
 
-    def start(self):
-        """Запускает daemon-поток поллинга."""
+    def start(self) -> bool:
+        """Запускает daemon-поток поллинга.
+
+        Returns:
+            True если engine успешно запущен, False при ошибке.
+        """
         if self._running:
-            return
+            return True
+        if self._runtime_state == StrategyRuntimeState.FAILED_START.value:
+            return False
         logger.info(f"[LiveEngine:{self._strategy_id}] Запуск: {self._ticker} "
                      f"tf={self._timeframe} board={self._board} poll={self._poll_interval}s")
 
@@ -662,7 +753,8 @@ class LiveEngine:
                 )
             except Exception:
                 pass
-            return
+            self._set_runtime_state(StrategyRuntimeState.FAILED_START.value)
+            return False
 
         if not point_cost_ok and not is_fut:
             logger.warning(
@@ -671,56 +763,43 @@ class LiveEngine:
             )
             self._point_cost = 1.0
 
-        self._connector.on_reconnect(self._on_connector_reconnect)
+        if hasattr(self._connector, "subscribe_reconnect"):
+            self._connector.subscribe_reconnect(self._on_connector_reconnect)
+            self._subscribed_reconnect = True
+        else:
+            self._connector.on_reconnect(self._on_connector_reconnect)
 
         self._running = True
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True,
                                         name=f"LiveEngine-{self._strategy_id}")
         self._thread.start()
+        if self._sync_status == "synced":
+            self._set_runtime_state(StrategyRuntimeState.TRADING.value)
+        else:
+            self._set_runtime_state(StrategyRuntimeState.DEGRADED.value)
         logger.info(f"[LiveEngine:{self._strategy_id}] Запущен, позиция={self._position_tracker.get_position()}")
+        return True
 
-    def stop(self, close_position: bool = None):
+    def stop(self):
         """Останавливает поток поллинга и выполняет graceful shutdown.
 
-        Если close_position_on_stop=True и есть открытая позиция:
-        1. Отправляет аварийный close-ордер
-        2. Ждёт подтверждения flat (до 30 секунд)
-        3. Логирует, подтверждено ли закрытие или позиция может остаться на бирже
+        SAFETY: stop() НИКОГДА не закрывает позицию автоматически.
+        Открытая позиция сохраняется на бирже. Закрытие — только явное
+        действие оператора через UI (manual flatten).
         """
         if not self._running:
             return
 
-        should_close = close_position
-        if should_close is None:
-            from core.storage import get_strategy
-            data = get_strategy(self._strategy_id) or {}
-            should_close = data.get("close_position_on_stop", False)
+        self._set_runtime_state(StrategyRuntimeState.STOPPING.value)
 
-        flat_confirmed = True  # True если нет позиции или закрытие подтверждено
-        if should_close:
-            qty = self._position_tracker.get_position_qty()
-            pos = self._position_tracker.get_position()
-            if qty != 0 and pos != 0:
-                logger.info(
-                    f"[LiveEngine:{self._strategy_id}] "
-                    f"Закрытие позиции перед остановкой (close_position_on_stop=True)"
-                )
-                self._emergency_close_position()
-
-                # Ждём подтверждения flat
-                flat_confirmed = self._wait_for_flat(timeout=30)
-                if flat_confirmed:
-                    logger.info(
-                        f"[LiveEngine:{self._strategy_id}] "
-                        f"Flat подтверждён перед остановкой"
-                    )
-                else:
-                    logger.warning(
-                        f"[LiveEngine:{self._strategy_id}] "
-                        f"⚠️ ВНИМАНИЕ: flat НЕ подтверждён за 30с — "
-                        f"позиция может остаться открытой на бирже!"
-                    )
+        qty = self._position_tracker.get_position_qty()
+        if qty != 0:
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] "
+                f"Остановка при открытой позиции (qty={qty}). "
+                f"Позиция сохраняется на бирже — требуется ручное закрытие."
+            )
 
         self._running = False
         self._stop_event.set()
@@ -733,49 +812,18 @@ class LiveEngine:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=10)
 
+        if self._subscribed_reconnect and hasattr(self._connector, "unsubscribe_reconnect"):
+            try:
+                self._connector.unsubscribe_reconnect(self._on_connector_reconnect)
+            except Exception as e:
+                logger.warning(f"[LiveEngine:{self._strategy_id}] Ошибка отписки от reconnect: {e}")
+            self._subscribed_reconnect = False
+
         self._unsubscribe_quotes()
         equity_flush_all()
+        self._set_runtime_state(StrategyRuntimeState.STOPPED.value)
 
-        status = "остановлен" if flat_confirmed else "остановлен (RISK: позиция не подтверждена flat)"
-        logger.info(f"[LiveEngine:{self._strategy_id}] {status}")
-
-    def _wait_for_flat(self, timeout: float = 30) -> bool:
-        """Ожидает пока позиция станет нулевой (flat).
-
-        Returns:
-            True — позиция подтверждённо закрыта.
-            False — таймаут, позиция всё ещё открыта.
-        """
-        import time
-        deadline = time.time() + timeout
-        interval = 1.0
-
-        while time.time() < deadline:
-            qty = self._position_tracker.get_position_qty()
-            if qty == 0:
-                return True
-            # Попробуем reconcile через коннектор
-            try:
-                positions = self._connector.get_positions(self._account_id)
-                found = False
-                for p in (positions or []):
-                    if p.get("ticker") == self._ticker:
-                        broker_qty = int(float(p.get("quantity", 0)))
-                        if broker_qty == 0:
-                            self._position_tracker.update_position(0, 0)
-                            return True
-                        found = True
-                        break
-                if not found:
-                    # Тикер не найден в позициях — значит flat
-                    self._position_tracker.update_position(0, 0)
-                    return True
-            except Exception as e:
-                logger.debug(
-                    f"[LiveEngine:{self._strategy_id}] _wait_for_flat reconcile error: {e}"
-                )
-            time.sleep(interval)
-        return False
+        logger.info(f"[LiveEngine:{self._strategy_id}] остановлен")
 
     def _subscribe_quotes(self):
         """Подписывается на котировки тикера."""
@@ -801,11 +849,41 @@ class LiveEngine:
         self._detect_position()
         logger.info(f"[{self._strategy_id}] Позиция после синхронизации: {self._position_tracker.get_position()}")
 
+    def _get_last_bar_dt(self) -> Optional[datetime]:
+        with self._bars_lock:
+            return self._last_bar_dt
+
+    def _update_bar_state(self, bars: list[dict], new_bar_dt: datetime) -> tuple[bool, bool]:
+        """Атомарно сравнивает и обновляет bars state.
+
+        Returns:
+            (updated, was_initial)
+        """
+        with self._bars_lock:
+            was_initial = self._last_bar_dt is None
+            if self._last_bar_dt is not None and new_bar_dt <= self._last_bar_dt:
+                return False, False
+            self._bars = list(bars)
+            self._last_bar_dt = new_bar_dt
+            return True, was_initial
+
     # === Позиция и reconciliation ===
 
     def _detect_position(self):
         """Определяет текущую позицию по тикеру из коннектора."""
         try:
+            if not self._allow_shared_position:
+                try:
+                    from core.autostart import has_strategy_collision
+
+                    if has_strategy_collision(self._account_id, self._ticker, self._strategy_id):
+                        self._sync_status = "stale"
+                        self._require_manual_intervention("multi_strategy_collision")
+                        return
+                except Exception as collision_exc:
+                    logger.debug(
+                        f"[LiveEngine:{self._strategy_id}] collision guard check failed: {collision_exc}"
+                    )
             positions = self._connector.get_positions(self._account_id)
             new_position = 0
             new_qty = 0
@@ -833,6 +911,7 @@ class LiveEngine:
                     break
 
             self._position_tracker.update_position(new_position, new_qty, new_entry_price)
+            self._order_executor.release_blocked_submissions_after_reconcile()
             self._last_price = new_last_price
             if self._sync_status != "synced":
                 logger.info(
@@ -840,9 +919,22 @@ class LiveEngine:
                     f"{self._sync_status} → synced"
                 )
             self._sync_status = "synced"
+            if self._running:
+                self._set_runtime_state(StrategyRuntimeState.TRADING.value)
+            elif self._runtime_state in {
+                StrategyRuntimeState.INITIALIZING.value,
+                StrategyRuntimeState.DEGRADED.value,
+                StrategyRuntimeState.STALE.value,
+                StrategyRuntimeState.MANUAL_INTERVENTION_REQUIRED.value,
+            }:
+                self._set_runtime_state(StrategyRuntimeState.SYNCED.value)
         except Exception as e:
             prev = self._sync_status
             self._sync_status = "stale"
+            if self._running:
+                self._set_runtime_state(StrategyRuntimeState.DEGRADED.value)
+            else:
+                self._set_runtime_state(StrategyRuntimeState.STALE.value)
             logger.warning(f"[LiveEngine:{self._strategy_id}] "
                            f"Не удалось определить позицию: {e} — "
                            f"сохраняю последнюю подтверждённую: "
@@ -858,6 +950,20 @@ class LiveEngine:
                 f"{self._sync_status} → stale (broker unavailable в reconcile)"
             )
             self._sync_status = "stale"
+        if self._running:
+            self._set_runtime_state(StrategyRuntimeState.DEGRADED.value)
+        else:
+            self._set_runtime_state(StrategyRuntimeState.STALE.value)
+
+    def _require_manual_intervention(self, reason: str):
+        """Переводит стратегию в состояние ручного вмешательства."""
+        if self._sync_status != "stale":
+            logger.warning(
+                f"[LiveEngine:{self._strategy_id}] sync_status: "
+                f"{self._sync_status} → stale ({reason})"
+            )
+        self._sync_status = "stale"
+        self._set_runtime_state(StrategyRuntimeState.MANUAL_INTERVENTION_REQUIRED.value)
 
     def _get_entry_price_from_history(self) -> float:
         """Берёт цену входа из последней незакрытой пары ордеров."""
@@ -870,34 +976,38 @@ class LiveEngine:
             pass
         return 0.0
 
-    def _emergency_close_position(self):
-        """Экстренное закрытие позиции при circuit breaker.
+    def manual_close_position(self):
+        """Ручное закрытие позиции — вызывается ТОЛЬКО оператором через UI.
 
-        Использует guarded ownership: проверяет order_in_flight, чтобы
-        не отправлять параллельный close, если мониторинг уже ведёт закрытие.
+        SAFETY: Этот метод НЕ вызывается автоматически из stop(),
+        timeout, circuit breaker или crash paths.
+        Это единственная точка входа для экстренного закрытия.
+
+        Returns:
+            str: "success" | "no_position" | "order_in_flight" | "close_failed"
         """
         qty = self._position_tracker.get_position_qty()
         pos = self._position_tracker.get_position()
 
         if qty == 0 or pos == 0:
-            return
+            return "no_position"
 
         # Проверяем, не ведётся ли уже закрытие
         if self._position_tracker.is_order_in_flight():
             logger.warning(
                 f"[LiveEngine:{self._strategy_id}] "
-                f"Аварийное закрытие пропущено — ордер уже в работе"
+                f"Ручное закрытие пропущено — ордер уже в работе"
             )
-            return
+            return "order_in_flight"
 
         close_side = "sell" if pos == 1 else "buy"
         abs_qty = abs(qty)
         logger.warning(
             f"[LiveEngine:{self._strategy_id}] "
-            f"АВАРИЙНОЕ ЗАКРЫТИЕ: {close_side.upper()} {self._ticker} x{abs_qty}"
+            f"РУЧНОЕ ЗАКРЫТИЕ: {close_side.upper()} {self._ticker} x{abs_qty}"
         )
         try:
-            tid = self._connector.place_order(
+            result = self._connector.place_order_result(
                 account_id=self._account_id,
                 ticker=self._ticker,
                 side=close_side,
@@ -906,35 +1016,26 @@ class LiveEngine:
                 board=self._board,
                 agent_name=self._agent_name,
             )
+            tid = result.transaction_id
             if tid:
                 logger.warning(
                     f"[LiveEngine:{self._strategy_id}] "
-                    f"Аварийный ордер принят: tid={tid}"
+                    f"Ордер ручного закрытия принят: tid={tid}"
                 )
+                return "success"
             else:
                 logger.error(
                     f"[LiveEngine:{self._strategy_id}] "
-                    f"Аварийный ордер ОТКЛОНЁН брокером — позиция остаётся открытой!"
+                    f"Ордер ручного закрытия ОТКЛОНЁН/не подтверждён — "
+                    f"позиция остаётся открытой! outcome={result.outcome.value} msg={result.message}"
                 )
+                return "close_failed"
         except Exception as e:
             logger.error(
                 f"[LiveEngine:{self._strategy_id}] "
-                f"Ошибка аварийного закрытия: {e} — позиция остаётся открытой!"
+                f"Ошибка ручного закрытия: {e} — позиция остаётся открытой!"
             )
-
-        try:
-            from core.telegram_bot import notifier, EventCode
-            notifier.send(
-                EventCode.STRATEGY_CRASHED,
-                agent=self._strategy_id,
-                description=(
-                    f"Circuit breaker сработал после {self._risk_guard.circuit_breaker_threshold} ошибок. "
-                    f"Попытка закрыть позицию {close_side.upper()} {self._ticker} x{abs_qty}."
-                ),
-                traceback="",
-            )
-        except Exception:
-            pass
+            return "close_failed"
 
     # === Poll loop ===
 
@@ -949,45 +1050,29 @@ class LiveEngine:
                 )
         return DEFAULT_STRATEGY_LOOKBACK
 
-    def _poll_loop(self):
-        """Основной цикл: загрузка истории → поллинг новых баров."""
-        self._load_and_update()
-        if not self._position_tracker.get_entry_price():
-            self._detect_position()
+    def _estimate_bars_per_day(self) -> int:
+        bar_minutes = PERIOD_TO_BAR_MINUTES.get(self._period_str, 5)
+        if bar_minutes >= 1440:
+            return 1
+        return max(1, math.floor(_TRADING_SESSION_MINUTES / bar_minutes))
 
-        while not self._stop_event.is_set():
-            now = time.monotonic()
-            interval = self._poll_interval
-            if now - self._last_signal_ts <= self._fast_poll_window:
-                interval = min(interval, self._fast_poll_interval)
+    def _calculate_initial_history_days(self, lookback: int) -> int:
+        required_bars = max(int(lookback or 0), 1)
+        bars_per_day = self._estimate_bars_per_day()
+        required_days = math.ceil((required_bars * _WARMUP_HISTORY_SAFETY_FACTOR) / bars_per_day)
+        return max(required_days, _MIN_WARMUP_HISTORY_DAYS)
 
-            self._stop_event.wait(interval)
-            if self._stop_event.is_set():
-                break
-            if not self._connector.is_connected():
-                continue
-            try:
-                self._load_and_update()
-                self._reconciler.reconcile()
-            except Exception as e:
-                logger.error(f"[LiveEngine:{self._strategy_id}] Ошибка в poll_loop: {e}\n"
-                             f"{traceback.format_exc()}")
+    def _calculate_incremental_history_days(self) -> int:
+        return _INCREMENTAL_HISTORY_DAYS
 
-    def _load_and_update(self):
-        """Загружает историю, ищет новые бары, вызывает on_bar при необходимости."""
-        lookback = self._get_lookback()
-        days = max(lookback // 50, 5)
+    def _expand_history_days(self, current_days: int, required_bars: int, actual_bars: int) -> int:
+        if actual_bars <= 0:
+            return min(max(current_days * 2, _MIN_WARMUP_HISTORY_DAYS), _MAX_WARMUP_HISTORY_DAYS)
+        deficit_ratio = required_bars / max(actual_bars, 1)
+        growth_factor = min(max(deficit_ratio, 1.5), 3.0)
+        return min(max(current_days + 1, math.ceil(current_days * growth_factor)), _MAX_WARMUP_HISTORY_DAYS)
 
-        if self._stop_event.is_set():
-            return
-
-        if self._last_bar_dt is None:
-            try:
-                if hasattr(self._connector, "clear_history_cache"):
-                    self._connector.clear_history_cache(self._ticker, self._board)
-            except Exception:
-                pass
-
+    def _fetch_history_dataframe(self, days: int) -> tuple[bool, Optional[Exception], Optional[pd.DataFrame]]:
         result_lock = threading.Lock()
         result = {'df': None, 'error': None, 'done': False}
 
@@ -1020,9 +1105,137 @@ class LiveEngine:
             pass
 
         with result_lock:
-            done = result['done']
-            fetch_error = result['error']
-            df = result['df']
+            return result['done'], result['error'], result['df']
+
+    def _load_history_dataframe(self, lookback: int) -> tuple[bool, Optional[Exception], Optional[pd.DataFrame]]:
+        initial_load = self._get_last_bar_dt() is None
+        if not initial_load:
+            return self._fetch_history_dataframe(self._calculate_incremental_history_days())
+
+        required_bars = max(int(lookback or 0), 1)
+        days = self._calculate_initial_history_days(lookback)
+        previous_count = -1
+        last_result: tuple[bool, Optional[Exception], Optional[pd.DataFrame]] = (True, None, None)
+
+        for _ in range(_MAX_WARMUP_FETCH_ATTEMPTS):
+            done, fetch_error, df = self._fetch_history_dataframe(days)
+            last_result = (done, fetch_error, df)
+            if not done or fetch_error or df is None or df.empty:
+                return last_result
+
+            actual_bars = len(df.index)
+            if actual_bars >= required_bars:
+                return last_result
+            if actual_bars <= previous_count or days >= _MAX_WARMUP_HISTORY_DAYS:
+                logger.warning(
+                    f"[LiveEngine:{self._strategy_id}] warmup incomplete: "
+                    f"bars={actual_bars}/{required_bars}, days={days}"
+                )
+                return last_result
+
+            next_days = self._expand_history_days(days, required_bars, actual_bars)
+            logger.info(
+                f"[LiveEngine:{self._strategy_id}] warmup refetch: "
+                f"bars={actual_bars}/{required_bars}, days={days} -> {next_days}"
+            )
+            previous_count = actual_bars
+            days = next_days
+
+        return last_result
+
+    def _build_market_data_envelope(self, source_dt=None) -> MarketDataEnvelope:
+        source_ts = None
+        if isinstance(source_dt, datetime):
+            source_ts = source_dt.timestamp()
+        stale_after_ms = max(int(self._poll_interval * 3000), 15000)
+        return MarketDataEnvelope.build(
+            source_ts=source_ts,
+            receive_ts=time.time(),
+            source_id=self._connector_id,
+            stale_after_ms=stale_after_ms,
+        )
+
+    def _attach_market_data_envelopes(self, bars: list[dict]) -> list[dict]:
+        stamped_bars = []
+        for bar in bars:
+            stamped = dict(bar)
+            stamped["market_data"] = self._build_market_data_envelope(
+                stamped.get("dt")
+            ).to_dict()
+            stamped_bars.append(stamped)
+        return stamped_bars
+
+    def _validate_bars(self, bars: list[dict]) -> tuple[bool, str]:
+        if not bars:
+            return False, "empty_bars"
+
+        prev_dt = None
+        seen_dt = set()
+        for index, bar in enumerate(bars):
+            bar_dt = bar.get("dt")
+            if bar_dt is None:
+                return False, f"missing_dt[{index}]"
+            if bar_dt in seen_dt:
+                return False, f"duplicate_bar_dt[{index}]"
+            if prev_dt is not None and bar_dt <= prev_dt:
+                return False, f"non_monotonic_bar_dt[{index}]"
+            seen_dt.add(bar_dt)
+            prev_dt = bar_dt
+
+            try:
+                open_price = float(bar.get("open", 0) or 0)
+                high_price = float(bar.get("high", 0) or 0)
+                low_price = float(bar.get("low", 0) or 0)
+                close_price = float(bar.get("close", 0) or 0)
+            except (TypeError, ValueError):
+                return False, f"invalid_ohlc_type[{index}]"
+
+            if min(open_price, high_price, low_price, close_price) <= 0:
+                return False, f"non_positive_ohlc[{index}]"
+            if high_price < max(open_price, low_price, close_price):
+                return False, f"broken_high[{index}]"
+            if low_price > min(open_price, high_price, close_price):
+                return False, f"broken_low[{index}]"
+
+        return True, ""
+
+    def _poll_loop(self):
+        """Основной цикл: загрузка истории → поллинг новых баров."""
+        self._load_and_update()
+
+        while not self._stop_event.is_set():
+            now = time.monotonic()
+            interval = self._poll_interval
+            if now - self._last_signal_ts <= self._fast_poll_window:
+                interval = min(interval, self._fast_poll_interval)
+
+            self._stop_event.wait(interval)
+            if self._stop_event.is_set():
+                break
+            if not self._connector.is_connected():
+                continue
+            try:
+                self._load_and_update()
+                self._reconciler.reconcile()
+            except Exception as e:
+                logger.error(f"[LiveEngine:{self._strategy_id}] Ошибка в poll_loop: {e}\n"
+                             f"{traceback.format_exc()}")
+
+    def _load_and_update(self):
+        """Загружает историю, ищет новые бары, вызывает on_bar при необходимости."""
+        lookback = self._get_lookback()
+
+        if self._stop_event.is_set():
+            return
+
+        if self._get_last_bar_dt() is None:
+            try:
+                if hasattr(self._connector, "clear_history_cache"):
+                    self._connector.clear_history_cache(self._ticker, self._board)
+            except Exception:
+                pass
+
+        done, fetch_error, df = self._load_history_dataframe(lookback)
 
         if not done:
             self._consecutive_timeouts += 1
@@ -1033,10 +1246,23 @@ class LiveEngine:
             if self._consecutive_timeouts >= self._MAX_CONSECUTIVE_TIMEOUTS:
                 logger.error(
                     f"[LiveEngine:{self._strategy_id}] {self._MAX_CONSECUTIVE_TIMEOUTS} "
-                    f"тайм-аутов подряд — остановка стратегии"
+                    f"тайм-аутов подряд — переход в degraded state (manual intervention required)"
                 )
-                self._emergency_close_position()
-                self.stop()
+                self._sync_status = "stale"
+                self._set_runtime_state(StrategyRuntimeState.DEGRADED.value)
+                try:
+                    from core.telegram_bot import notifier, EventCode
+                    notifier.send(
+                        EventCode.STRATEGY_CRASHED,
+                        agent=self._strategy_id,
+                        description=(
+                            f"[{self._strategy_id}] {self._MAX_CONSECUTIVE_TIMEOUTS} тайм-аутов "
+                            f"get_history подряд — стратегия в degraded state, "
+                            f"требуется ручное вмешательство"
+                        ),
+                    )
+                except Exception:
+                    pass
             return
         else:
             self._consecutive_timeouts = 0
@@ -1058,11 +1284,24 @@ class LiveEngine:
         if not bars:
             return
 
+        bars = self._attach_market_data_envelopes(bars)
+        is_valid_bars, bars_error = self._validate_bars(bars)
+        if not is_valid_bars:
+            logger.error(
+                f"[LiveEngine:{self._strategy_id}] invalid market data bars: {bars_error}"
+            )
+            self._require_manual_intervention(f"invalid_bars:{bars_error}")
+            return
+
         newest_dt = bars[-1]["dt"]
-        if self._last_bar_dt and newest_dt <= self._last_bar_dt:
+        last_bar_dt = self._get_last_bar_dt()
+        if last_bar_dt and newest_dt <= last_bar_dt:
             return
 
         self._last_price = bars[-1]["close"]
+        self._last_price_envelope = MarketDataEnvelope(
+            **dict(bars[-1].get("market_data") or self._build_market_data_envelope(newest_dt).to_dict())
+        )
 
         if self._point_cost == 1.0:
             self._load_point_cost()
@@ -1071,20 +1310,14 @@ class LiveEngine:
 
         new_bar_dt = bars[-1]["dt"]
 
-        if self._last_bar_dt is None:
-            with self._bars_lock:
-                self._bars = bars
-                self._last_bar_dt = new_bar_dt
+        updated, was_initial = self._update_bar_state(bars, new_bar_dt)
+        if not updated:
+            return
+
+        if was_initial:
             logger.info(f"[LiveEngine:{self._strategy_id}] Загружено {len(bars)} баров, "
                         f"последний: {new_bar_dt}")
             return
-
-        if new_bar_dt <= self._last_bar_dt:
-            return
-
-        with self._bars_lock:
-            self._bars = bars
-            self._last_bar_dt = new_bar_dt
 
         logger.debug(f"[LiveEngine:{self._strategy_id}] Новый бар: {new_bar_dt} "
                       f"O={bars[-1]['open']} H={bars[-1]['high']} "
@@ -1099,6 +1332,25 @@ class LiveEngine:
         if len(bars) < 2:
             return
         closed_bars = bars[:-1]
+
+        is_valid_bars, bars_error = self._validate_bars(bars)
+        if not is_valid_bars:
+            logger.error(
+                f"[LiveEngine:{self._strategy_id}] _process_bar rejected invalid bars: {bars_error}"
+            )
+            self._require_manual_intervention(f"invalid_bars:{bars_error}")
+            return
+
+        if self._last_price <= 0 and closed_bars:
+            self._last_price = float(closed_bars[-1].get("close", 0) or 0)
+        if self._last_price_envelope is None and closed_bars:
+            closed_envelope = closed_bars[-1].get("market_data")
+            if isinstance(closed_envelope, dict):
+                self._last_price_envelope = MarketDataEnvelope(**closed_envelope)
+            else:
+                self._last_price_envelope = self._build_market_data_envelope(
+                    closed_bars[-1].get("dt")
+                )
 
         try:
             df = pd.DataFrame(closed_bars)
@@ -1121,6 +1373,11 @@ class LiveEngine:
 
         current_position = self._position_tracker.get_position()
         signal = self._loaded.call_on_bar(processed_bars, current_position, self._params)
+
+        if isinstance(signal, dict):
+            signal.setdefault("signal_ts", time.time())
+            if self._last_price_envelope is not None:
+                signal.setdefault("market_data_envelope", self._last_price_envelope.to_dict())
 
         action = signal.get("action") if signal else None
         if action:
@@ -1216,13 +1473,34 @@ class LiveEngine:
     # === Legacy прокси-методы для обратной совместимости ===
 
     def _on_circuit_break(self):
-        """Вызывается из OrderExecutor при срабатывании circuit breaker."""
+        """Вызывается из OrderExecutor при срабатывании circuit breaker.
+
+        SAFETY: circuit breaker запрещает новые рисковые действия,
+        но НИКОГДА не закрывает позицию автоматически.
+        Оператор получает уведомление и должен действовать вручную.
+        """
         logger.error(
             f"[LiveEngine:{self._strategy_id}] CIRCUIT BREAKER: "
-            f"{self._risk_guard.consecutive_failures} ошибок подряд — аварийное закрытие позиции"
+            f"{self._risk_guard.consecutive_failures} ошибок подряд — "
+            f"новые ордера заблокированы, позиция сохранена. "
+            f"Требуется ручное вмешательство."
         )
-        self._emergency_close_position()
-        self.stop()
+        self._sync_status = "stale"
+        self._set_runtime_state(StrategyRuntimeState.MANUAL_INTERVENTION_REQUIRED.value)
+        try:
+            from core.telegram_bot import notifier, EventCode
+            notifier.send(
+                EventCode.STRATEGY_CRASHED,
+                agent=self._strategy_id,
+                description=(
+                    f"[{self._strategy_id}] Circuit breaker сработал: "
+                    f"{self._risk_guard.consecutive_failures} ошибок подряд. "
+                    f"Новые ордера заблокированы, позиция сохранена. "
+                    f"Требуется ручное вмешательство."
+                ),
+            )
+        except Exception:
+            pass
 
     def _record_failure(self):
         """Прокси к risk_guard.record_failure()."""
@@ -1238,9 +1516,12 @@ class LiveEngine:
         return self._risk_guard.check_risk_limits(action, qty)
 
     def _record_trade(self, side: str, qty: int, price: float, comment: str,
-                      order_type: str = "market", order_ref: str = ""):
+                      order_type: str = "market", order_ref: str = "",
+                      correlation_id: str = ""):
         """Прокси к trade_recorder.record_trade()."""
-        self._trade_recorder.record_trade(side, qty, price, comment, order_type, order_ref)
+        self._trade_recorder.record_trade(
+            side, qty, price, comment, order_type, order_ref, correlation_id
+        )
 
     def _execute_signal(self, signal: dict):
         """Прокси к order_executor.execute_signal()."""

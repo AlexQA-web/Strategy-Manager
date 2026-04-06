@@ -49,3 +49,36 @@ def test_stock_commission_uses_lot_size():
         order_role="taker", lot_size=10,
     )
     assert comm_lot10 == pytest.approx(comm_lot1 * 10, rel=0.01)
+
+
+def test_refresh_moex_rates_keeps_previous_config_on_invalid_payload():
+    mgr = CommissionManager.__new__(CommissionManager)
+    mgr.config = {}
+    mgr._create_default_config()
+    mgr.save_config = lambda: None
+
+    class _BadFetcher:
+        def fetch_rates(self):
+            return {"unknown_type": 0.123}
+
+    previous = dict(mgr.config["moex"]["taker_pct"])
+
+    assert mgr.refresh_moex_rates(fetcher=_BadFetcher()) is False
+    assert mgr.config["moex"]["taker_pct"] == previous
+
+
+def test_refresh_moex_rates_applies_valid_payload():
+    mgr = CommissionManager.__new__(CommissionManager)
+    mgr.config = {}
+    mgr._create_default_config()
+    saved = []
+    mgr.save_config = lambda: saved.append(True)
+
+    class _Fetcher:
+        def fetch_rates(self):
+            return {"stock": 0.005, "bond": 0.002}
+
+    assert mgr.refresh_moex_rates(fetcher=_Fetcher()) is True
+    assert mgr.config["moex"]["taker_pct"]["stock"] == 0.005
+    assert mgr.config["moex"]["taker_pct"]["bond"] == 0.002
+    assert saved == [True]

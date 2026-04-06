@@ -67,6 +67,23 @@ class TestCopyOnRead:
         result["U1"].append({"ticker": "FAKE"})
         assert len(connector._positions) == 1
 
+    def test_get_order_status_returns_copy(self, connector):
+        with connector._order_status_lock:
+            connector._order_status["tid-1"] = {"status": "working", "balance": 1}
+        result = connector.get_order_status("tid-1")
+        result["status"] = "mutated"
+        with connector._order_status_lock:
+            assert connector._order_status["tid-1"]["status"] == "working"
+
+    def test_get_sec_info_returns_copy(self, connector):
+        with connector._sec_info_lock:
+            connector._sec_info["SBER"] = {"ticker": "SBER", "lotsize": 10}
+        connector._connected = True
+        result = connector.get_sec_info("SBER")
+        result["lotsize"] = 999
+        with connector._sec_info_lock:
+            assert connector._sec_info["SBER"]["lotsize"] == 10
+
 
 class TestStateLock:
     """_state_lock защищает _connected, _securities, _positions, _accounts."""
@@ -106,6 +123,67 @@ class TestStateLock:
         accounts = connector.get_accounts()
         assert len(accounts) == 1
         assert accounts[0]["id"] == "U1"
+
+    def test_concurrent_is_connected_reads_do_not_crash(self, connector):
+        stop_event = threading.Event()
+        errors = []
+
+        def writer():
+            for idx in range(200):
+                with connector._state_lock:
+                    connector._connected = bool(idx % 2)
+                time.sleep(0.001)
+            stop_event.set()
+
+        def reader():
+            while not stop_event.is_set():
+                try:
+                    connector.is_connected()
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        writer_thread.join(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert errors == []
+
+    def test_concurrent_get_all_positions_snapshot(self, connector):
+        stop_event = threading.Event()
+        errors = []
+
+        def writer():
+            for idx in range(100):
+                with connector._state_lock:
+                    connector._accounts = [{"id": f"U{idx}"}]
+                    connector._positions = [{"ticker": "SBER", "quantity": idx}]
+                time.sleep(0.001)
+            stop_event.set()
+
+        def reader():
+            while not stop_event.is_set():
+                try:
+                    snapshot = connector.get_all_positions()
+                    for positions in snapshot.values():
+                        assert isinstance(positions, list)
+                except Exception as exc:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        writer_thread = threading.Thread(target=writer)
+        writer_thread.start()
+        writer_thread.join(timeout=5)
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert errors == []
 
 
 class TestThrottleLock:

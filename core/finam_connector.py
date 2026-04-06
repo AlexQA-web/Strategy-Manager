@@ -11,7 +11,7 @@ import json
 
 from loguru import logger
 
-from core.base_connector import BaseConnector
+from core.base_connector import BaseConnector, OrderOutcome, OrderResult
 from core.storage import get_setting
 from core.moex_api import MOEXClient
 
@@ -505,7 +505,7 @@ class FinamConnector(BaseConnector):
             quantity = int(trade.findtext("quantity", "0") or "0")
             price = float(trade.findtext("price", "0") or "0")
             board = trade.findtext("board", "")
-            brokerref = trade.findtext("brokerref", "")
+            brokerref = (trade.findtext("brokerref", "") or "").strip()
             time_str = trade.findtext("time", "")
 
             if not seccode or not buysell or quantity <= 0:
@@ -515,6 +515,10 @@ class FinamConnector(BaseConnector):
             strategy_id = brokerref  # agent_name передаётся как brokerref
 
             if not strategy_id:
+                logger.warning(
+                    f"[Finam] trade tradeno={tradeno} без brokerref пропущен: "
+                    f"{side.upper()} {seccode} x{quantity}"
+                )
                 continue
 
             # Парсим реальное время сделки из DLL
@@ -678,14 +682,17 @@ class FinamConnector(BaseConnector):
                 result = None
 
         if result is None:
-            if not self._connected:
+            with self._state_lock:
+                is_connected = self._connected
+                has_securities = bool(self._securities)
+            if not is_connected:
                 return None
 
             if self._has_recent_sec_info_failure(ticker, board):
                 logger.debug(f'[Finam] get_sec_info suppressed for {ticker} board={board} after recent failure')
                 return None
 
-            if self._securities and not self._has_security_in_cache(ticker, board):
+            if has_securities and not self._has_security_in_cache(ticker, board):
                 logger.debug(f'[Finam] get_sec_info skipped: {ticker} не найден в кеше securities для board={board}')
                 self._remember_sec_info_failure(ticker, board)
                 return None
@@ -1125,7 +1132,8 @@ class FinamConnector(BaseConnector):
 
     def get_order_status(self, transaction_id: str) -> Optional[dict]:
         with self._order_status_lock:
-            return self._order_status.get(transaction_id)
+            info = self._order_status.get(transaction_id)
+            return dict(info) if isinstance(info, dict) else info
 
     def watch_order(self, transaction_id: str, callback: Callable):
         """Регистрирует callback(tid, info) на изменение статуса ордера."""
@@ -1343,23 +1351,48 @@ class FinamConnector(BaseConnector):
         board: str = "TQBR",
         agent_name: str = "",
     ) -> Optional[str]:
+        result = self.place_order_result(
+            account_id=account_id,
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            board=board,
+            agent_name=agent_name,
+        )
+        return result.transaction_id or None
+
+    def place_order_result(
+        self,
+        account_id: str,
+        ticker: str,
+        side: str,
+        quantity: int,
+        order_type: str = "market",
+        price: float = 0.0,
+        board: str = "TQBR",
+        agent_name: str = "",
+    ) -> OrderResult:
         # Валидация входных параметров
         if not ticker or not ticker.strip():
             logger.error("[Finam] place_order — пустой ticker")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="empty_ticker")
         if side not in ("buy", "sell"):
             logger.error(f"[Finam] place_order — неверный side: {side} (должен быть 'buy' или 'sell')")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="invalid_side")
         if quantity <= 0:
             logger.error(f"[Finam] place_order — quantity должно быть > 0, получено: {quantity}")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="invalid_quantity")
         if price < 0:
             logger.error(f"[Finam] place_order — price не может быть отрицательным: {price}")
-            return None
+            return OrderResult(OrderOutcome.REJECTED, message="negative_price")
 
-        if not self._connected:
+        with self._state_lock:
+            is_connected = self._connected
+        if not is_connected:
             logger.warning("[Finam] place_order — нет подключения")
-            return None
+            return OrderResult(OrderOutcome.STALE_STATE, message="connector_disconnected")
         try:
             client_id = self._resolve_client_id(account_id, board)
             buysell = "B" if side == "buy" else "S"
@@ -1381,7 +1414,7 @@ class FinamConnector(BaseConnector):
             if err:
                 logger.error(f"[Finam] Ордер отклонён: {err}")
                 self._fire_event('error', err)
-                return None
+                return OrderResult(OrderOutcome.REJECTED, message=err)
 
             # Парсим transactionid из ответа
             try:
@@ -1391,15 +1424,23 @@ class FinamConnector(BaseConnector):
                 tid = ""
 
             logger.info(f"[Finam] Ордер {side} {ticker}x{quantity} board={board}: tid={tid}")
-            return tid or None
+            if tid:
+                return OrderResult(OrderOutcome.SUCCESS, transaction_id=tid)
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, message="missing_transaction_id")
         except Exception as e:
             logger.error(f"[Finam] place_order error: {e}")
             self._fire_event('error', str(e))
-            return None
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, message=str(e))
 
     def cancel_order(self, order_id: str, account_id: str) -> bool:
-        if not self._connected:
-            return False
+        result = self.cancel_order_result(order_id, account_id)
+        return result.is_success
+
+    def cancel_order_result(self, order_id: str, account_id: str) -> OrderResult:
+        with self._state_lock:
+            is_connected = self._connected
+        if not is_connected:
+            return OrderResult(OrderOutcome.STALE_STATE, transaction_id=str(order_id), message="connector_disconnected")
         try:
             cmd = (
                 f'<command id="cancelorder">'
@@ -1410,11 +1451,11 @@ class FinamConnector(BaseConnector):
             err = self._parse_error(response)
             if err:
                 logger.error(f"[Finam] cancel_order: {err}")
-                return False
-            return True
+                return OrderResult(OrderOutcome.REJECTED, transaction_id=str(order_id), message=err)
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(order_id))
         except Exception as e:
             logger.error(f"[Finam] cancel_order error: {e}")
-            return False
+            return OrderResult(OrderOutcome.TRANSPORT_ERROR, transaction_id=str(order_id), message=str(e))
 
     def close_position(
         self,
@@ -1423,16 +1464,26 @@ class FinamConnector(BaseConnector):
         quantity: int = 0,
         agent_name: str = "",
     ) -> Optional[str]:
+        result = self.close_position_result(account_id, ticker, quantity, agent_name)
+        return result.transaction_id or None
+
+    def close_position_result(
+        self,
+        account_id: str,
+        ticker: str,
+        quantity: int = 0,
+        agent_name: str = "",
+    ) -> OrderResult:
         positions = self.get_positions(account_id)
         pos = next((p for p in positions if p.get("ticker") == ticker), None)
         if not pos:
-            return None
+            return OrderResult(OrderOutcome.NOT_FOUND, message="position_not_found")
         total_qty = int(abs(float(pos.get("quantity", 0))))
         if total_qty == 0:
-            return None
+            return OrderResult(OrderOutcome.NOT_FOUND, message="zero_position")
         close_qty = quantity if 0 < quantity <= total_qty else total_qty
         side = "sell" if float(pos.get("quantity", 0)) > 0 else "buy"
-        tid = self.place_order(
+        return self.place_order_result(
             account_id=account_id,
             ticker=ticker,
             side=side,
@@ -1441,7 +1492,6 @@ class FinamConnector(BaseConnector):
             board=pos.get("board", "TQBR"),
             agent_name=agent_name,
         )
-        return tid
 
     # ── Позиции / счета ───────────────────────────────────────────────────
 
@@ -1453,9 +1503,10 @@ class FinamConnector(BaseConnector):
     def get_all_positions(self) -> dict:
         """Возвращает позиции в формате {account_id: [positions]} для PositionManager."""
         with self._state_lock:
-            if self._accounts and self._positions:
-                positions_copy = [dict(p) for p in self._positions]
-                return {acc["id"]: positions_copy for acc in self._accounts}
+            accounts_snapshot = [dict(a) for a in self._accounts]
+            positions_copy = [dict(p) for p in self._positions]
+        if accounts_snapshot and positions_copy:
+            return {acc["id"]: [dict(p) for p in positions_copy] for acc in accounts_snapshot}
         return {}
 
     def get_accounts(self) -> list[dict]:
@@ -1471,7 +1522,9 @@ class FinamConnector(BaseConnector):
             return [dict(s) for s in self._securities]
 
     def get_last_price(self, ticker: str, board: str = "TQBR") -> Optional[float]:
-        if not self._connected:
+        with self._state_lock:
+            is_connected = self._connected
+        if not is_connected:
             return None
         try:
             market = self._BOARD_TO_MARKET.get(board, "1")
@@ -1619,7 +1672,9 @@ class FinamConnector(BaseConnector):
     def get_history(self, ticker: str, board: str,
                     period: str, days: int):
         """Запрашивает свечи через DLL и возвращает DataFrame (per-request буфер)."""
-        if not self._connected:
+        with self._state_lock:
+            is_connected = self._connected
+        if not is_connected:
             return None
         try:
             import pandas as pd
@@ -1795,7 +1850,9 @@ class FinamConnector(BaseConnector):
 
     def shutdown(self):
         """Полная деинициализация DLL. Вызывать при завершении приложения."""
-        if self._connected:
+        with self._state_lock:
+            is_connected = self._connected
+        if is_connected:
             self.disconnect()
         if self._dll and self._initialized:
             try:

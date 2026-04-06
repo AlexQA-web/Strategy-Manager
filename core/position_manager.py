@@ -145,13 +145,13 @@ class PositionManager:
             return False
 
         close_qty = quantity if 0 < quantity <= total_qty else total_qty
-        result = connector.close_position(
+        result = connector.close_position_result(
             account_id=account_id,
             ticker=ticker,
             quantity=close_qty,
             agent_name=agent_name,
         )
-        if result:
+        if result.is_success:
             label = 'частично' if close_qty < total_qty else 'полностью'
             logger.info(
                 f'Позиция {ticker} закрывается {label}: qty={close_qty}, '
@@ -160,9 +160,10 @@ class PositionManager:
         else:
             logger.warning(
                 f'close_position: не удалось отправить закрытие {ticker} '
-                f'qty={close_qty}, счёт={account_id}, цена~{market_price}'
+                f'qty={close_qty}, счёт={account_id}, цена~{market_price}, '
+                f'outcome={result.outcome.value}, msg={result.message}'
             )
-        return result
+        return result.is_success
 
     def close_all_positions(self, account_id: str, agent_name: str = "manual") -> int:
         """Закрывает все открытые позиции по счёту. Возвращает кол-во закрытых."""
@@ -176,6 +177,32 @@ class PositionManager:
                     closed += 1
         logger.info(f"close_all_positions: закрыто {closed} позиций на {account_id}")
         return closed
+
+    def close_strategy_position(
+        self,
+        strategy_id: str,
+        ticker: str | None = None,
+        quantity: int = 0,
+    ) -> dict:
+        """Закрывает позицию стратегии по её position book, а не по счёту целиком."""
+        from core.strategy_flatten import StrategyFlattenExecutor
+
+        executor = StrategyFlattenExecutor()
+        result = executor.execute(
+            strategy_id=strategy_id,
+            ticker=ticker,
+            quantity=quantity,
+            wait_for_confirmation=False,
+        )
+        logger.info(
+            f"close_strategy_position[{strategy_id}]: status={result.get('status')} "
+            f"ticker={ticker or '-'} qty={quantity or 'all'}"
+        )
+        return result
+
+    def close_strategy_positions(self, strategy_id: str) -> dict:
+        """Полное strategy-scoped закрытие всех позиций стратегии."""
+        return self.close_strategy_position(strategy_id=strategy_id)
 
     # ── Ручной ордер ──────────────────────────────────────────────────────
 

@@ -1,10 +1,11 @@
 """Тесты расписания: is_in_time_window и parse_schedule_window (TASK-016)."""
 
 from datetime import time as dtime
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.scheduler import is_in_time_window, parse_schedule_window
+from core.scheduler import StrategyScheduler, is_in_time_window, parse_schedule_window
 
 
 class TestParseScheduleWindow:
@@ -120,3 +121,19 @@ class TestIsInTimeWindow:
             dtime(22, 0), dtime(2, 0), [0, 1, 2, 3, 4],
             now_weekday=6, now_time=dtime(23, 0),
         ) is False
+
+
+class TestStrategyScheduler:
+
+    def test_setup_connector_schedule_always_adds_moex_refresh_job(self):
+        scheduler = StrategyScheduler()
+        scheduler._scheduler = MagicMock()
+        scheduler._scheduler.get_jobs.return_value = []
+        connector = MagicMock()
+
+        with patch("core.scheduler.get_all_schedules", return_value={"finam": {"is_active": True}}), \
+             patch("core.connector_manager.connector_manager.get", return_value=connector):
+            scheduler.setup_connector_schedule()
+
+        added_jobs = scheduler._scheduler.add_job.call_args_list
+        assert added_jobs[0].kwargs["id"] == "moex_commission_refresh"

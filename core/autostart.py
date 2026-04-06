@@ -5,6 +5,8 @@ import time
 from typing import Any, Dict, Optional
 from loguru import logger
 
+from core.strategy_runtime import StrategyRuntimeState
+
 
 def autoconnect_connectors() -> None:
     """Автоподключение коннекторов по расписанию."""
@@ -40,6 +42,103 @@ _engine_state_lock = threading.Lock()
 # Защита от двойного запуска: стратегии "в процессе запуска"
 _launching_engines: Dict[str, bool] = {}
 
+# Runtime state registry: strategy_id -> state snapshot
+_runtime_states: Dict[str, Dict[str, Any]] = {}
+
+# Ownership registry: (account_id, ticker) -> strategy_id
+_strategy_ownership: Dict[tuple[str, str], str] = {}
+
+
+def _ownership_key(account_id: str, ticker: str) -> tuple[str, str]:
+    return (str(account_id or "").strip(), str(ticker or "").strip().upper())
+
+
+def has_strategy_collision(account_id: str, ticker: str, strategy_id: str = "") -> bool:
+    key = _ownership_key(account_id, ticker)
+    with _engine_state_lock:
+        owner = _strategy_ownership.get(key)
+        return bool(owner and owner != strategy_id)
+
+
+def _claim_strategy_ownership(
+    strategy_id: str,
+    account_id: str,
+    ticker: str,
+    allow_shared_position: bool = False,
+) -> bool:
+    if allow_shared_position:
+        return True
+    key = _ownership_key(account_id, ticker)
+    with _engine_state_lock:
+        owner = _strategy_ownership.get(key)
+        if owner and owner != strategy_id:
+            return False
+        _strategy_ownership[key] = strategy_id
+    return True
+
+
+def _release_strategy_ownership(strategy_id: str, account_id: str = "", ticker: str = ""):
+    with _engine_state_lock:
+        if account_id or ticker:
+            key = _ownership_key(account_id, ticker)
+            if _strategy_ownership.get(key) == strategy_id:
+                _strategy_ownership.pop(key, None)
+            return
+        keys_to_remove = [key for key, owner in _strategy_ownership.items() if owner == strategy_id]
+        for key in keys_to_remove:
+            _strategy_ownership.pop(key, None)
+
+
+def _get_desired_state(data: dict) -> str:
+    return data.get("desired_state") or data.get("status", "stopped")
+
+
+def _runtime_snapshot_from_engine(engine) -> Dict[str, Any]:
+    return {
+        "actual_state": getattr(engine, "runtime_state", StrategyRuntimeState.STOPPED.value),
+        "sync_status": getattr(engine, "sync_status", "unknown"),
+        "is_running": bool(getattr(engine, "is_running", False)),
+    }
+
+
+def _set_runtime_state(
+    strategy_id: str,
+    actual_state: str,
+    sync_status: str = "unknown",
+    is_running: bool = False,
+):
+    with _engine_state_lock:
+        _runtime_states[strategy_id] = {
+            "actual_state": actual_state,
+            "sync_status": sync_status,
+            "is_running": is_running,
+        }
+
+
+def get_strategy_runtime_status(strategy_id: str) -> Dict[str, Any]:
+    with _engine_state_lock:
+        engine = _live_engines.get(strategy_id)
+        if engine is not None:
+            snapshot = _runtime_snapshot_from_engine(engine)
+            _runtime_states[strategy_id] = snapshot
+            return dict(snapshot)
+        snapshot = _runtime_states.get(strategy_id)
+        if snapshot is not None:
+            return dict(snapshot)
+    return {
+        "actual_state": StrategyRuntimeState.STOPPED.value,
+        "sync_status": "unknown",
+        "is_running": False,
+    }
+
+
+def get_all_runtime_states() -> Dict[str, Dict[str, Any]]:
+    with _engine_state_lock:
+        snapshot = dict(_runtime_states)
+        for strategy_id, engine in _live_engines.items():
+            snapshot[strategy_id] = _runtime_snapshot_from_engine(engine)
+        return snapshot
+
 
 def get_live_engines() -> Dict[str, Any]:
     """Возвращает копию словаря запущенных LiveEngine (потокобезопасно)."""
@@ -54,7 +153,7 @@ def stop_live_engine(strategy_id: str) -> bool:
         True если engine был найден и остановлен, False если не найден.
     """
     from core.storage import get_strategy
-    from core.strategy_loader import strategy_loader
+    from core.strategy_loader import strategy_loader, resolve_strategy_params
     from core.connector_manager import connector_manager
 
     with _engine_state_lock:
@@ -62,6 +161,11 @@ def stop_live_engine(strategy_id: str) -> bool:
         if engine is None:
             logger.warning(f"[autostart] LiveEngine для стратегии '{strategy_id}' не найден")
             return False
+        _runtime_states[strategy_id] = {
+            "actual_state": StrategyRuntimeState.STOPPING.value,
+            "sync_status": getattr(engine, "sync_status", "unknown"),
+            "is_running": True,
+        }
         del _live_engines[strategy_id]
 
     try:
@@ -72,9 +176,19 @@ def stop_live_engine(strategy_id: str) -> bool:
         connector_id = data.get('connector_id') or data.get('connector') or 'finam'
         connector = connector_manager.get(connector_id)
         if loaded is not None:
-            params = {k: v['default'] for k, v in loaded.params_schema.items()}
-            params.update(data.get('params', {}))
+            params, _ = resolve_strategy_params(data.get('params', {}), loaded.params_schema)
             loaded.call_on_stop(params, connector)
+        _set_runtime_state(
+            strategy_id,
+            StrategyRuntimeState.STOPPED.value,
+            getattr(engine, 'sync_status', 'unknown'),
+            False,
+        )
+        _release_strategy_ownership(
+            strategy_id,
+            data.get('account_id') or data.get('finam_account', ''),
+            data.get('ticker', ''),
+        )
 
     logger.info(f"[autostart] LiveEngine стратегии '{strategy_id}' остановлен и удалён")
     return True
@@ -83,7 +197,7 @@ def stop_live_engine(strategy_id: str) -> bool:
 def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> bool:
     """Запускает стратегию и её LiveEngine по конфигу из хранилища."""
     from core.storage import get_strategy
-    from core.strategy_loader import strategy_loader
+    from core.strategy_loader import strategy_loader, resolve_strategy_params
     from core.connector_manager import connector_manager
     from core.live_engine import LiveEngine
     from core.scheduler import is_in_schedule
@@ -108,8 +222,13 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
     if loaded is None:
         loaded = strategy_loader.load(strategy_id, file_path)
 
-    params = {k: v['default'] for k, v in loaded.params_schema.items()}
-    params.update(data.get('params', {}))
+    params, validation_error = resolve_strategy_params(data.get('params', {}), loaded.params_schema)
+    if validation_error:
+        logger.warning(f"[autostart] [{strategy_id}] некорректные params: {validation_error}")
+        return False
+    account_id = data.get('account_id') or data.get('finam_account', '')
+    ticker = data.get('ticker', params.get('ticker', ''))
+    allow_shared_position = bool(data.get('allow_shared_position', False))
 
     # Миграция order_mode: если на верхнем уровне — перенести в params
     order_mode = data.get('order_mode')
@@ -137,10 +256,7 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
                 time.sleep(1)
             return False
 
-        if not loaded.call_on_start(params, connector):
-            return False
-
-        logger.info(f"Автозапуск: [{strategy_id}] запущена")
+        _set_runtime_state(strategy_id, StrategyRuntimeState.INITIALIZING.value)
 
         if hasattr(loaded.module, 'on_bar') and connector:
             if not connector.is_connected():
@@ -166,6 +282,19 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
                 logger.warning(
                     f"[autostart] [{strategy_id}] коннектор '{connector_id}' офлайн, запуск отменён"
                 )
+                _set_runtime_state(strategy_id, StrategyRuntimeState.FAILED_START.value)
+                return False
+            if not _claim_strategy_ownership(strategy_id, account_id, ticker, allow_shared_position):
+                logger.error(
+                    f"[autostart] [{strategy_id}] ownership conflict: {ticker} на счёте {account_id} "
+                    f"уже закреплён за другой стратегией"
+                )
+                _set_runtime_state(
+                    strategy_id,
+                    StrategyRuntimeState.MANUAL_INTERVENTION_REQUIRED.value,
+                    "stale",
+                    False,
+                )
                 return False
             try:
                 engine = LiveEngine(
@@ -173,21 +302,67 @@ def start_live_engine(strategy_id: str, wait_for_connection: bool = True) -> boo
                     loaded_strategy=loaded,
                     params=params,
                     connector=connector,
-                    account_id=data.get('account_id') or data.get('finam_account', ''),
-                    ticker=data.get('ticker', params.get('ticker', '')),
+                    account_id=account_id,
+                    ticker=ticker,
                     board=data.get('board', 'FUT'),
                     timeframe=data.get('timeframe', '5'),
                     agent_name=strategy_id,
                     order_mode=params.get('order_mode', 'market'),
                     lot_sizing=data.get('lot_sizing', {}),
+                    allow_shared_position=allow_shared_position,
                 )
-                engine.start()
+                if not engine.startup_preflight():
+                    _set_runtime_state(
+                        strategy_id,
+                        engine.runtime_state,
+                        engine.sync_status,
+                        False,
+                    )
+                    _release_strategy_ownership(strategy_id, account_id, ticker)
+                    return False
+                _set_runtime_state(
+                    strategy_id,
+                    engine.runtime_state,
+                    engine.sync_status,
+                    False,
+                )
+                if not loaded.call_on_start(params, connector):
+                    _set_runtime_state(
+                        strategy_id,
+                        StrategyRuntimeState.STOPPED.value,
+                        engine.sync_status,
+                        False,
+                    )
+                    _release_strategy_ownership(strategy_id, account_id, ticker)
+                    return False
+
+                logger.info(f"Автозапуск: [{strategy_id}] preflight completed")
+                started = engine.start()
+                if not started:
+                    logger.error(f"Автозапуск [{strategy_id}]: engine.start() вернул False — engine НЕ зарегистрирован")
+                    _set_runtime_state(
+                        strategy_id,
+                        StrategyRuntimeState.FAILED_START.value,
+                        engine.sync_status,
+                        False,
+                    )
+                    _release_strategy_ownership(strategy_id, account_id, ticker)
+                    return False
                 with _engine_state_lock:
                     _live_engines[strategy_id] = engine
+                    _runtime_states[strategy_id] = _runtime_snapshot_from_engine(engine)
                 logger.info(f"Автозапуск: [{strategy_id}] LiveEngine запущен")
             except Exception as e:
                 logger.error(f"Автозапуск [{strategy_id}]: ошибка LiveEngine — {e}")
+                _set_runtime_state(strategy_id, StrategyRuntimeState.FAILED_START.value)
+                _release_strategy_ownership(strategy_id, account_id, ticker)
                 return False
+        else:
+            if not loaded.call_on_start(params, connector):
+                _set_runtime_state(strategy_id, StrategyRuntimeState.FAILED_START.value)
+                _release_strategy_ownership(strategy_id, account_id, ticker)
+                return False
+            _set_runtime_state(strategy_id, StrategyRuntimeState.STOPPED.value)
 
         return True
     finally:
@@ -210,7 +385,7 @@ def autostart_strategies() -> None:
         started = 0
 
         for sid, data in strategies.items():
-            if not (data.get("status") == "active" and data.get("is_enabled", True)):
+            if not (_get_desired_state(data) == "active" and data.get("is_enabled", True)):
                 continue
 
             file_path = data.get("file_path") or data.get("file", "")
@@ -297,7 +472,7 @@ def _sync_engines_with_connectors() -> None:
                 continue
 
             for sid, data in strategies.items():
-                if not (data.get("status") == "active" and data.get("is_enabled", True)):
+                if not (_get_desired_state(data) == "active" and data.get("is_enabled", True)):
                     continue
                 sid_connector = data.get("connector_id") or data.get("connector") or "finam"
                 if sid_connector != cid:

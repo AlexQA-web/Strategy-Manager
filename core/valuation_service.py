@@ -19,6 +19,8 @@ from typing import Optional
 
 from loguru import logger
 
+from core.money import to_decimal, to_storage_float
+
 
 class ValuationService:
     """Центральный расчётчик PnL, комиссий и equity."""
@@ -71,8 +73,13 @@ class ValuationService:
         Returns:
             Net unrealized PnL в рублях.
         """
-        gross = (current_price - entry_price) * qty * pnl_multiplier
-        return gross - entry_commission - exit_commission
+        gross = (
+            (to_decimal(current_price) - to_decimal(entry_price))
+            * to_decimal(qty)
+            * to_decimal(pnl_multiplier)
+        )
+        net = gross - to_decimal(entry_commission) - to_decimal(exit_commission)
+        return to_storage_float(net)
 
     # ------------------------------------------------------------------
     # Realized (closed) PnL — для одной FIFO-пары
@@ -104,10 +111,19 @@ class ValuationService:
             Net realized PnL в рублях.
         """
         if is_long:
-            gross = (close_price - open_price) * qty * pnl_multiplier
+            gross = (
+                (to_decimal(close_price) - to_decimal(open_price))
+                * to_decimal(qty)
+                * to_decimal(pnl_multiplier)
+            )
         else:
-            gross = (open_price - close_price) * qty * pnl_multiplier
-        return gross - entry_commission - exit_commission
+            gross = (
+                (to_decimal(open_price) - to_decimal(close_price))
+                * to_decimal(qty)
+                * to_decimal(pnl_multiplier)
+            )
+        net = gross - to_decimal(entry_commission) - to_decimal(exit_commission)
+        return to_storage_float(net)
 
     # ------------------------------------------------------------------
     # Commission
@@ -147,7 +163,7 @@ class ValuationService:
         """
         if commission_manager is None:
             return 0.0
-        return commission_manager.calculate(
+        return to_storage_float(commission_manager.calculate(
             ticker=ticker,
             board=board,
             quantity=abs(qty),
@@ -156,7 +172,7 @@ class ValuationService:
             point_cost=point_cost,
             connector_id=connector_id,
             lot_size=lot_size,
-        )
+        ))
 
     # ------------------------------------------------------------------
     # Equity snapshot
@@ -198,7 +214,7 @@ class ValuationService:
             )
         else:
             unrealized = 0.0
-        return realized_pnl + unrealized
+        return to_storage_float(to_decimal(realized_pnl) + to_decimal(unrealized))
 
     # ------------------------------------------------------------------
     # Commission slicing (для FIFO partial matching)
@@ -213,7 +229,9 @@ class ValuationService:
         """Пропорционально делит комиссию при частичном матчинге FIFO."""
         if total_commission <= 0 or slice_qty <= 0 or source_qty <= 0:
             return 0.0
-        return total_commission * (slice_qty / source_qty)
+        return to_storage_float(
+            to_decimal(total_commission) * (to_decimal(slice_qty) / to_decimal(source_qty))
+        )
 
 
 # Module-level singleton

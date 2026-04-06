@@ -22,26 +22,61 @@ order_history и trades_history — производные представле�
 
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
 from loguru import logger
 
 from core.order_history import make_order, save_order
+from core.runtime_metrics import runtime_metrics
 from core.storage import append_trade
+from core.telegram_bot import notifier, EventCode
+
+
+@dataclass
+class ProjectionResult:
+    fill_id: str
+    order_status: str
+    trade_status: str
+    error: str = ""
+
+    @property
+    def is_duplicate(self) -> bool:
+        return self.order_status == "duplicate" and self.trade_status == "duplicate"
+
+    @property
+    def is_repair(self) -> bool:
+        statuses = {self.order_status, self.trade_status}
+        return statuses == {"inserted", "duplicate"} and not self.error
+
+    @property
+    def is_success(self) -> bool:
+        return not self.error and (self.is_duplicate or self.is_repair or {
+            self.order_status,
+            self.trade_status,
+        } == {"inserted"})
+
+
+@dataclass
+class FillReservation:
+    status: str
+    updated_at: float
 
 
 class FillLedger:
     """Canonical fill ledger — единая точка записи исполнений.
 
-    Дедупликация в памяти по fill_id. Каждый fill проецируется
+    Дедупликация в памяти по fill_id с атомарным резервированием.
+    Каждый fill проецируется
     в order_history (save_order) и trades_history (append_trade).
     """
 
     _MAX_SEEN = 5_000
+    _PROCESSING_TTL_SEC = 300
 
     def __init__(self):
-        self._seen_fills: dict[str, float] = {}
+        self._seen_fills: dict[str, FillReservation] = {}
         self._lock = threading.Lock()
 
     def record_fill(
@@ -62,7 +97,8 @@ class FillLedger:
         pnl_multiplier: float = 0.0,
         source: str = "",
         timestamp: str = "",
-    ) -> bool:
+        correlation_id: str = "",
+    ) -> ProjectionResult:
         """Записывает канонический fill event.
 
         Args:
@@ -84,22 +120,18 @@ class FillLedger:
             timestamp: ISO-время fill. Если пусто — datetime.now().
 
         Returns:
-            True — fill записан. False — дубликат или невалидный fill_id.
+            ProjectionResult с итогом проекции.
         """
         if not fill_id:
             logger.warning(
                 f"[FillLedger] Пропуск fill без fill_id: "
                 f"{side} {ticker} x{qty} [{strategy_id}]"
             )
-            return False
+            return ProjectionResult(fill_id="", order_status="error", trade_status="error", error="missing_fill_id")
 
-        with self._lock:
-            if fill_id in self._seen_fills:
-                logger.debug(f"[FillLedger] Дубликат fill_id={fill_id}, пропуск")
-                return False
-            self._seen_fills[fill_id] = time.time()
-            if len(self._seen_fills) > self._MAX_SEEN:
-                self._cleanup_old_unsafe()
+        if not self._reserve_fill(fill_id):
+            logger.debug(f"[FillLedger] Дубликат fill_id={fill_id}, пропуск")
+            return ProjectionResult(fill_id=fill_id, order_status="duplicate", trade_status="duplicate")
 
         # --- Проекция в order_history ---
         ts = timestamp or datetime.now().isoformat()
@@ -118,6 +150,7 @@ class FillLedger:
             pnl_multiplier=pnl_multiplier,
             exec_key=fill_id,
             source=source,
+            correlation_id=correlation_id or fill_id,
         )
         if timestamp:
             order["timestamp"] = timestamp
@@ -136,33 +169,139 @@ class FillLedger:
             "comment": comment,
             "dt": ts,
             "execution_id": fill_id,
+            "correlation_id": correlation_id or fill_id,
         }
 
-        # Атомарная запись: save_order → append_trade
-        save_order(order)
-        append_trade(trade)
+        order_status = "error"
+        trade_status = "error"
+        try:
+            order_status = save_order(order) or "inserted"
+            trade_status = append_trade(trade) or "inserted"
+        except Exception as exc:
+            self._release_fill(fill_id)
+            result = ProjectionResult(
+                fill_id=fill_id,
+                order_status=order_status,
+                trade_status=trade_status,
+                error=str(exc),
+            )
+            logger.error(
+                f"[FillLedger] Projection error fill_id={fill_id}: "
+                f"order={order_status} trade={trade_status} err={exc}"
+            )
+            return result
 
-        logger.info(
-            f"[FillLedger] Fill записан: {side.upper()} {ticker} x{qty} @ {price:.4f} "
-            f"fill_id={fill_id} [{strategy_id}]"
+        result = ProjectionResult(
+            fill_id=fill_id,
+            order_status=order_status,
+            trade_status=trade_status,
         )
-        return True
+
+        if not result.is_success:
+            self._release_fill(fill_id)
+            result.error = "projection_divergence"
+            logger.error(
+                f"[FillLedger] Projection divergence fill_id={fill_id}: "
+                f"order={order_status} trade={trade_status}"
+            )
+            return result
+
+        self._commit_fill(fill_id)
+
+        if result.is_duplicate:
+            logger.debug(f"[FillLedger] Durable duplicate fill_id={fill_id}, пропуск")
+        elif result.is_repair:
+            runtime_metrics.emit_audit_event(
+                "duplicate_fill_repair",
+                strategy_id=strategy_id,
+                fill_id=fill_id,
+                ticker=ticker,
+                side=side,
+                qty=qty,
+                price=price,
+            )
+            logger.warning(
+                f"[FillLedger] Projection repair fill_id={fill_id}: "
+                f"order={order_status} trade={trade_status}"
+            )
+            try:
+                notifier.send(
+                    EventCode.STRATEGY_ERROR,
+                    agent=strategy_id,
+                    description=(
+                        f"Duplicate fill repair: {side.upper()} {ticker} x{qty} @ {price:.4f} "
+                        f"fill_id={fill_id}"
+                    ),
+                )
+            except Exception:
+                pass
+        else:
+            logger.info(
+                f"[FillLedger] Fill записан: {side.upper()} {ticker} x{qty} @ {price:.4f} "
+                f"fill_id={fill_id} [{strategy_id}]"
+            )
+        return result
 
     def is_duplicate(self, fill_id: str) -> bool:
         """Проверяет, был ли fill с таким ID уже записан."""
         with self._lock:
             return fill_id in self._seen_fills
 
+    def _reserve_fill(self, fill_id: str) -> bool:
+        with self._lock:
+            if fill_id in self._seen_fills:
+                return False
+            self._seen_fills[fill_id] = FillReservation(
+                status="processing",
+                updated_at=time.time(),
+            )
+            return True
+
+    def _commit_fill(self, fill_id: str):
+        with self._lock:
+            self._seen_fills[fill_id] = FillReservation(
+                status="committed",
+                updated_at=time.time(),
+            )
+            if len(self._seen_fills) > self._MAX_SEEN:
+                self._cleanup_old_unsafe()
+
+    def _release_fill(self, fill_id: str):
+        with self._lock:
+            state = self._seen_fills.get(fill_id)
+            if state and state.status == "processing":
+                del self._seen_fills[fill_id]
+
     def _cleanup_old_unsafe(self):
         """Удаляет старые записи. Вызывать только внутри self._lock."""
-        cutoff = time.time() - 86400  # 24 часа
-        to_remove = [k for k, v in self._seen_fills.items() if v < cutoff]
+        now = time.time()
+        committed_cutoff = now - 86400  # 24 часа
+        processing_cutoff = now - self._PROCESSING_TTL_SEC
+        to_remove = [
+            fill_id
+            for fill_id, reservation in self._seen_fills.items()
+            if (
+                reservation.status == "committed" and reservation.updated_at < committed_cutoff
+            ) or (
+                reservation.status == "processing" and reservation.updated_at < processing_cutoff
+            )
+        ]
         for k in to_remove:
             del self._seen_fills[k]
-        # Если всё ещё слишком много — удаляем старейшую половину
+
+        # Если всё ещё слишком много — удаляем старейшие committed записи,
+        # не вытесняя свежие processing-резервации.
         if len(self._seen_fills) > self._MAX_SEEN // 2:
-            sorted_items = sorted(self._seen_fills.items(), key=lambda x: x[1])
-            for k, _ in sorted_items[: len(sorted_items) // 2]:
+            committed_items = sorted(
+                (
+                    (fill_id, reservation)
+                    for fill_id, reservation in self._seen_fills.items()
+                    if reservation.status == "committed"
+                ),
+                key=lambda item: item[1].updated_at,
+            )
+            overflow = len(self._seen_fills) - (self._MAX_SEEN // 2)
+            for k, _ in committed_items[:overflow]:
                 del self._seen_fills[k]
 
 

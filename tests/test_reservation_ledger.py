@@ -58,10 +58,10 @@ class TestReservationLedger:
 
 
 class TestStaleEviction:
-    """Устаревшие резервы автоматически удаляются."""
+    """Устаревшие резервы исключаются из капитала и затем очищаются."""
 
-    def test_stale_reservation_evicted(self):
-        ledger = ReservationLedger(stale_timeout_sec=1.0)
+    def test_stale_reservation_excluded_from_total_reserved(self):
+        ledger = ReservationLedger(stale_timeout_sec=1.0, stale_cleanup_sec=60.0)
         ledger.reserve("s1:Si:1", "acc1", 10000.0)
 
         # Подменяем ts на давнее время
@@ -69,11 +69,42 @@ class TestStaleEviction:
             ledger._reservations["s1:Si:1"]["ts"] = time.monotonic() - 2.0
 
         assert ledger.total_reserved("acc1") == 0.0
+        snapshot = ledger.snapshot()["s1:Si:1"]
+        assert snapshot["stale"] is True
+        assert snapshot["stale_reason"] == "timeout"
 
     def test_non_stale_preserved(self):
         ledger = ReservationLedger(stale_timeout_sec=300.0)
         ledger.reserve("s1:Si:1", "acc1", 10000.0)
         assert ledger.total_reserved("acc1") == 10000.0
+
+    def test_mark_stale_excludes_reservation_before_cleanup(self):
+        ledger = ReservationLedger(stale_timeout_sec=300.0, stale_cleanup_sec=60.0)
+        ledger.reserve("s1:Si:1", "acc1", 10000.0)
+
+        assert ledger.mark_stale("s1:Si:1", "ambiguous_submit") is True
+
+        assert ledger.total_reserved("acc1") == 0.0
+        snapshot = ledger.snapshot()["s1:Si:1"]
+        assert snapshot["stale"] is True
+        assert snapshot["stale_reason"] == "ambiguous_submit"
+
+    def test_stale_cleanup_removes_reservation_and_emits_audit(self):
+        ledger = ReservationLedger(stale_timeout_sec=300.0, stale_cleanup_sec=1.0)
+        ledger.reserve("s1:Si:1", "acc1", 10000.0)
+
+        with ledger._lock:
+            ledger._reservations["s1:Si:1"]["stale"] = True
+            ledger._reservations["s1:Si:1"]["stale_reason"] = "timeout"
+            ledger._reservations["s1:Si:1"]["stale_marked_at"] = time.monotonic() - 2.0
+
+        with patch("core.reservation_ledger.runtime_metrics.emit_audit_event") as audit_mock:
+            assert ledger.total_reserved("acc1") == 0.0
+
+        assert ledger.snapshot() == {}
+        audit_mock.assert_called_once()
+        assert audit_mock.call_args.args[0] == "stale_reservation_cleanup"
+        assert audit_mock.call_args.kwargs["reservation_key"] == "s1:Si:1"
 
 
 class TestReserveOverwrite:

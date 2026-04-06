@@ -14,6 +14,7 @@ from core.order_placer import (
     get_best_offer,
     has_market_data,
 )
+from core.chase_order import ChaseOrder
 
 
 # ── Фикстуры ──────────────────────────────────────────────────────────────────
@@ -207,6 +208,104 @@ class TestPlaceChase:
         # Chase запущен, ждём завершения
         assert result.success is True
         assert failed_called.wait(timeout=10), "on_failed callback was not called"
+
+    def test_fallback_market_uses_remaining_qty_after_partial_fill(self, placer, mock_connector):
+        fallback_done = threading.Event()
+        filled_callbacks = []
+
+        class FakeChaseOrder:
+            def __init__(self, **kwargs):
+                self._cancelled = False
+                self._done = False
+                self._filled_qty = 0
+                self._remaining_qty = 3
+                self._avg_price = 100.25
+
+            def wait(self, timeout=None):
+                if self._cancelled:
+                    self._filled_qty = 2
+                    self._remaining_qty = 1
+                    self._done = True
+                    return True
+                return False
+
+            def cancel(self):
+                self._cancelled = True
+
+            @property
+            def is_done(self):
+                return self._done
+
+            @property
+            def filled_qty(self):
+                return self._filled_qty
+
+            @property
+            def remaining_qty(self):
+                return self._remaining_qty
+
+            @property
+            def avg_price(self):
+                return self._avg_price
+
+        original_place_market = placer.place_market
+
+        def _place_market(*args, **kwargs):
+            result = original_place_market(*args, **kwargs)
+            fallback_done.set()
+            return result
+
+        with patch('core.chase_order.ChaseOrder', FakeChaseOrder):
+            with patch.object(placer, 'place_market', side_effect=_place_market) as market_mock:
+                result = placer.place_chase(
+                    'acct1', 'SPBFUT', 'SiH6', 'buy', 3,
+                    timeout=0.01,
+                    on_filled=lambda filled_qty, avg_price: filled_callbacks.append((filled_qty, avg_price)),
+                )
+
+                assert result.success is True
+                assert fallback_done.wait(timeout=2) is True
+
+        market_mock.assert_called_once()
+        assert market_mock.call_args.args[:5] == ('acct1', 'SPBFUT', 'SiH6', 'buy', 1)
+        assert filled_callbacks == [(2, 100.25)]
+
+
+class TestChaseOrder:
+    def test_place_order_failures_use_exponential_backoff(self, mock_connector):
+        recorded_waits = []
+
+        class _DormantThread:
+            def __init__(self, target=None, daemon=None, name=None):
+                self.target = target
+                self.daemon = daemon
+                self.name = name
+
+            def start(self):
+                return None
+
+        mock_connector.place_order.return_value = None
+
+        with patch('core.chase_order.threading.Thread', _DormantThread):
+            chase = ChaseOrder(
+                connector=mock_connector,
+                account_id='acct1',
+                ticker='SiH6',
+                side='buy',
+                quantity=1,
+                board='SPBFUT',
+                agent_name='TestStrategy',
+            )
+
+        def _wait(delay):
+            recorded_waits.append(delay)
+            return len(recorded_waits) >= 3
+
+        with patch('core.chase_order.time.sleep', lambda _: None), \
+             patch.object(chase._cancel_requested, 'wait', side_effect=_wait):
+            chase._run()
+
+        assert recorded_waits == [0.25, 0.5, 1.0]
 
 
 # ── Тесты OrderPlacer.place_limit_price ───────────────────────────────────────

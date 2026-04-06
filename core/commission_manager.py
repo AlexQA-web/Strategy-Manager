@@ -5,6 +5,7 @@
 Использует классификатор инструментов и конфигурацию ставок.
 """
 
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -118,6 +119,15 @@ class CommissionManager:
             },
             "last_moex_update": datetime.now().strftime("%Y-%m-%d")
         }
+
+    @staticmethod
+    def _to_decimal(value: object, default: str = "0") -> Decimal:
+        try:
+            if value is None or value == "":
+                return Decimal(default)
+            return Decimal(str(value))
+        except Exception:
+            return Decimal(default)
     
     def calculate(
         self,
@@ -156,44 +166,53 @@ class CommissionManager:
 
         # Определяем конфигурацию брокера в зависимости от коннектора
         broker_config = self._get_broker_config(connector_id)
+        quantity_dec = self._to_decimal(quantity)
+        price_dec = self._to_decimal(price)
         
         if is_futures:
             # Для фьючерсов
             if point_cost is None or point_cost == 0:
                 logger.warning(f"[CommissionManager] point_cost не указан для {ticker}, используем 1.0")
                 point_cost = 1.0
-            
-            trade_value = price * point_cost * quantity
-            moex_part = trade_value * moex_pct / 100
-            
-            broker_rub = broker_config.get("futures_rub", {}).get(instrument_type, 1.0)
-            broker_part = broker_rub * quantity
-            
+
+            point_cost_dec = self._to_decimal(point_cost, default="1")
+            trade_value = price_dec * point_cost_dec * quantity_dec
+            moex_part = trade_value * moex_pct / Decimal("100")
+
+            broker_rub = self._to_decimal(
+                broker_config.get("futures_rub", {}).get(instrument_type, 1.0),
+                default="1",
+            )
+            broker_part = broker_rub * quantity_dec
+
             total = moex_part + broker_part
-            
+
             logger.debug(f"[CommissionManager] {ticker}: futures, connector={connector_id}, "
-                        f"trade_value={trade_value:.2f}, moex={moex_part:.2f}, "
-                        f"broker={broker_part:.2f}, total={total:.2f}")
+                        f"trade_value={float(trade_value):.2f}, moex={float(moex_part):.2f}, "
+                        f"broker={float(broker_part):.2f}, total={float(total):.2f}")
         else:
             # Для акций/облигаций/ETF quantity приходит в лотах,
             # поэтому комиссия должна считаться от полной денежной суммы сделки.
             resolved_lot_size = self._resolve_lot_size(ticker, board, lot_size)
-            trade_value = price * quantity * resolved_lot_size
-            moex_part = trade_value * moex_pct / 100
-            
+            trade_value = price_dec * quantity_dec * self._to_decimal(resolved_lot_size, default="1")
+            moex_part = trade_value * moex_pct / Decimal("100")
+
             # Получаем процентную ставку брокера в зависимости от коннектора
-            broker_pct = broker_config.get(f'{instrument_type}_pct', 0.04)
-            broker_part = trade_value * broker_pct / 100
-            
+            broker_pct = self._to_decimal(
+                broker_config.get(f'{instrument_type}_pct', 0.04),
+                default="0.04",
+            )
+            broker_part = trade_value * broker_pct / Decimal("100")
+
             total = moex_part + broker_part
-            
+
             logger.debug(
                 f'[CommissionManager] {ticker}: stock, connector={connector_id}, '
-                f'lot_size={resolved_lot_size}, trade_value={trade_value:.2f}, '
-                f'moex={moex_part:.2f}, broker={broker_part:.2f}, total={total:.2f}'
+                f'lot_size={resolved_lot_size}, trade_value={float(trade_value):.2f}, '
+                f'moex={float(moex_part):.2f}, broker={float(broker_part):.2f}, total={float(total):.2f}'
             )
-        
-        return total
+
+        return float(total)
     
     def get_breakdown(
         self,
@@ -231,56 +250,65 @@ class CommissionManager:
 
         # Определяем конфигурацию брокера в зависимости от коннектора
         broker_config = self._get_broker_config(connector_id)
+        quantity_dec = self._to_decimal(quantity)
+        price_dec = self._to_decimal(price)
         
         if is_futures:
             # Для фьючерсов
             if point_cost is None or point_cost == 0:
                 point_cost = 1.0
-            
-            trade_value = price * point_cost * quantity
-            moex_rub = trade_value * moex_pct / 100
-            
-            broker_rub = broker_config.get("futures_rub", {}).get(instrument_type, 1.0)
-            broker_total = broker_rub * quantity
-            
+
+            point_cost_dec = self._to_decimal(point_cost, default="1")
+            trade_value = price_dec * point_cost_dec * quantity_dec
+            moex_rub = trade_value * moex_pct / Decimal("100")
+
+            broker_rub = self._to_decimal(
+                broker_config.get("futures_rub", {}).get(instrument_type, 1.0),
+                default="1",
+            )
+            broker_total = broker_rub * quantity_dec
+
             total_one_side = moex_rub + broker_total
-            
+
             return {
                 "instrument_type": instrument_type,
                 "is_futures": True,
-                "trade_value": trade_value,
-                "moex_pct": moex_pct,
-                "moex_rub": moex_rub,
-                "broker_rub": broker_rub,
+                "trade_value": float(trade_value),
+                "moex_pct": float(moex_pct),
+                "moex_rub": float(moex_rub),
+                "broker_rub": float(broker_rub),
                 "broker_pct": None,
-                "total_one_side": total_one_side,
-                "total_roundtrip": total_one_side * 2,
+                "total_one_side": float(total_one_side),
+                "total_roundtrip": float(total_one_side * Decimal("2")),
                 "order_role": order_role,
                 "connector_id": connector_id
             }
         else:
             # Для акций/облигаций/ETF quantity приходит в лотах.
             resolved_lot_size = self._resolve_lot_size(ticker, board, lot_size)
-            trade_value = price * quantity * resolved_lot_size
-            moex_rub = trade_value * moex_pct / 100
-            
+            trade_value = price_dec * quantity_dec * self._to_decimal(resolved_lot_size, default="1")
+            moex_rub = trade_value * moex_pct / Decimal("100")
+
             # Получаем процентную ставку брокера в зависимости от коннектора
-            broker_pct = broker_config.get(f'{instrument_type}_pct', 0.04)
-            broker_rub = trade_value * broker_pct / 100
-            
+            broker_pct = self._to_decimal(
+                broker_config.get(f'{instrument_type}_pct', 0.04),
+                default="0.04",
+            )
+            broker_rub = trade_value * broker_pct / Decimal("100")
+
             total_one_side = moex_rub + broker_rub
-            
+
             return {
                 'instrument_type': instrument_type,
                 'is_futures': False,
-                'trade_value': trade_value,
+                'trade_value': float(trade_value),
                 'lot_size': resolved_lot_size,
-                'moex_pct': moex_pct,
-                'moex_rub': moex_rub,
-                'broker_rub': broker_rub,
-                'broker_pct': broker_pct,
-                'total_one_side': total_one_side,
-                'total_roundtrip': total_one_side * 2,
+                'moex_pct': float(moex_pct),
+                'moex_rub': float(moex_rub),
+                'broker_rub': float(broker_rub),
+                'broker_pct': float(broker_pct),
+                'total_one_side': float(total_one_side),
+                'total_roundtrip': float(total_one_side * Decimal("2")),
                 'order_role': order_role,
                 'connector_id': connector_id
             }
@@ -316,12 +344,15 @@ class CommissionManager:
 
         if is_futures:
             # Для фьючерсов возвращаем только MOEX%
-            return moex_pct
+            return float(moex_pct)
         else:
             # Для акций возвращаем сумму MOEX + брокер
             broker_config = self._get_broker_config(connector_id)
-            broker_pct = broker_config.get(f"{instrument_type}_pct", 0.04)
-            return moex_pct + broker_pct
+            broker_pct = self._to_decimal(
+                broker_config.get(f"{instrument_type}_pct", 0.04),
+                default="0.04",
+            )
+            return float(moex_pct + broker_pct)
     
     def _resolve_lot_size(self, ticker: str, board: str, lot_size: Optional[int]) -> int:
         """Возвращает размер лота для акций/облигаций/ETF.
@@ -354,10 +385,12 @@ class CommissionManager:
         logger.debug(f'[CommissionManager] lot_size for {ticker}.{board} not found, используем 1')
         return 1
 
-    def _get_moex_rate(self, instrument_type: str, order_role: str) -> float:
+    def _get_moex_rate(self, instrument_type: str, order_role: str) -> Decimal:
         """Получает ставку MOEX для типа инструмента и роли ордера."""
         role_key = 'maker_pct' if order_role == 'maker' else 'taker_pct'
-        return self.config.get('moex', {}).get(role_key, {}).get(instrument_type, 0.0)
+        return self._to_decimal(
+            self.config.get('moex', {}).get(role_key, {}).get(instrument_type, 0.0)
+        )
 
     def _get_broker_config(self, connector_id: str) -> dict:
         """Возвращает конфиг брокера по ID коннектора.
@@ -407,6 +440,53 @@ class CommissionManager:
         
         self.config["last_moex_update"] = datetime.now().strftime("%Y-%m-%d")
         logger.info(f"[CommissionManager] Обновлены ставки MOEX: {rates}")
+
+    def _validate_moex_rates(self, rates: dict | None) -> Optional[dict[str, float]]:
+        if not isinstance(rates, dict) or not rates:
+            return None
+
+        allowed_types = set(self.config.get("moex", {}).get("taker_pct", {}).keys())
+        normalized: dict[str, float] = {}
+        for instrument_type, rate in rates.items():
+            if instrument_type not in allowed_types:
+                logger.warning(
+                    f"[CommissionManager] Пропуск неизвестной ставки MOEX: {instrument_type}"
+                )
+                return None
+            rate_dec = self._to_decimal(rate, default="-1")
+            if rate_dec < 0 or rate_dec > Decimal("100"):
+                logger.warning(
+                    f"[CommissionManager] Некорректная ставка MOEX для {instrument_type}: {rate}"
+                )
+                return None
+            normalized[instrument_type] = float(rate_dec)
+
+        return normalized or None
+
+    def refresh_moex_rates(self, fetcher=None) -> bool:
+        from core.moex_commission_fetcher import moex_commission_fetcher
+
+        fetcher = fetcher or moex_commission_fetcher
+        previous_taker = dict(self.config.get("moex", {}).get("taker_pct", {}))
+        previous_date = self.config.get("last_moex_update")
+
+        try:
+            fetched = fetcher.fetch_rates()
+            validated = self._validate_moex_rates(fetched)
+            if not validated:
+                logger.warning("[CommissionManager] Обновление ставок MOEX пропущено: пустой/невалидный ответ")
+                return False
+
+            self.update_moex_rates(validated)
+            self.save_config()
+            return True
+        except Exception as exc:
+            self.config.setdefault("moex", {}).setdefault("taker_pct", {}).clear()
+            self.config["moex"]["taker_pct"].update(previous_taker)
+            if previous_date is not None:
+                self.config["last_moex_update"] = previous_date
+            logger.warning(f"[CommissionManager] Не удалось обновить ставки MOEX, оставляем предыдущий конфиг: {exc}")
+            return False
     
     def get_last_update_date(self) -> Optional[str]:
         """Возвращает дату последнего обновления ставок MOEX."""

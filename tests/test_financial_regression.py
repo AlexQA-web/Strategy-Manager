@@ -656,20 +656,22 @@ class TestFillLedgerRegression:
     def test_duplicate_fill_rejected(self, mock_append, mock_save):
         """Повторный fill с тем же fill_id не записывается."""
         ledger = self._make_ledger()
+        mock_save.return_value = "inserted"
+        mock_append.return_value = "inserted"
 
-        ok1 = ledger.record_fill(
+        result1 = ledger.record_fill(
             fill_id="exec_001", strategy_id="s1",
             ticker="SBER", board="TQBR", side="buy",
             qty=10, price=300.0,
         )
-        ok2 = ledger.record_fill(
+        result2 = ledger.record_fill(
             fill_id="exec_001", strategy_id="s1",
             ticker="SBER", board="TQBR", side="buy",
             qty=10, price=300.0,
         )
 
-        assert ok1 is True
-        assert ok2 is False
+        assert result1.is_success is True
+        assert result2.is_duplicate is True
         assert mock_save.call_count == 1
         assert mock_append.call_count == 1
 
@@ -679,13 +681,14 @@ class TestFillLedgerRegression:
         """Fill без fill_id отклоняется."""
         ledger = self._make_ledger()
 
-        ok = ledger.record_fill(
+        result = ledger.record_fill(
             fill_id="", strategy_id="s1",
             ticker="SBER", board="TQBR", side="buy",
             qty=10, price=300.0,
         )
 
-        assert ok is False
+        assert result.is_success is False
+        assert result.error == "missing_fill_id"
         mock_save.assert_not_called()
         mock_append.assert_not_called()
 
@@ -694,20 +697,22 @@ class TestFillLedgerRegression:
     def test_late_fill_different_id_accepted(self, mock_append, mock_save):
         """Поздний fill с другим fill_id записывается (late fill repair scenario)."""
         ledger = self._make_ledger()
+        mock_save.return_value = "inserted"
+        mock_append.return_value = "inserted"
 
-        ok1 = ledger.record_fill(
+        result1 = ledger.record_fill(
             fill_id="exec_001", strategy_id="s1",
             ticker="SBER", board="TQBR", side="buy",
             qty=10, price=300.0,
         )
-        ok2 = ledger.record_fill(
+        result2 = ledger.record_fill(
             fill_id="exec_002_late", strategy_id="s1",
             ticker="SBER", board="TQBR", side="buy",
             qty=5, price=301.0,
         )
 
-        assert ok1 is True
-        assert ok2 is True
+        assert result1.is_success is True
+        assert result2.is_success is True
         assert mock_save.call_count == 2
 
     @patch("core.fill_ledger.save_order")
@@ -715,6 +720,8 @@ class TestFillLedgerRegression:
     def test_is_duplicate_check(self, mock_append, mock_save):
         """is_duplicate корректно определяет уже записанные fills."""
         ledger = self._make_ledger()
+        mock_save.return_value = "inserted"
+        mock_append.return_value = "inserted"
 
         assert ledger.is_duplicate("fill_x") is False
         ledger.record_fill(
@@ -857,17 +864,21 @@ class TestReservationLedgerRegression:
         assert avail == pytest.approx(0.0)
 
     def test_stale_reservation_evicted(self):
-        """Устаревшие резервы удаляются при запросе total_reserved."""
-        rl = ReservationLedger(stale_timeout_sec=0.05)
+        """Устаревшие резервы больше не блокируют капитал, но кратко остаются в snapshot."""
+        rl = ReservationLedger(stale_timeout_sec=0.05, stale_cleanup_sec=60.0)
         rl.reserve("k1", "acc", 50000.0)
 
         # Вручную ставим timestamp в прошлое
         with rl._lock:
             rl._reservations["k1"]["ts"] = time.monotonic() - 1.0
 
-        # При следующем запросе stale eviction очистит
+        # При следующем запросе stale reserve исключается из доступного капитала,
+        # но остаётся видимым в snapshot на окно расследования.
         reserved = rl.total_reserved("acc")
         assert reserved == pytest.approx(0.0)
+        snapshot = rl.snapshot()["k1"]
+        assert snapshot["stale"] is True
+        assert snapshot["stale_reason"] == "timeout"
 
     def test_replace_reservation(self):
         """Повторный reserve с тем же ключом перезаписывает."""
@@ -876,6 +887,17 @@ class TestReservationLedgerRegression:
         rl.reserve("k1", "acc", 25000.0)
 
         assert rl.total_reserved("acc") == pytest.approx(25000.0)
+
+    def test_bind_order_links_reservation_to_order_id(self):
+        """Reservation bind связывает резерв с order_id до terminal release."""
+        rl = ReservationLedger()
+        rl.reserve("k1", "acc", 25000.0)
+
+        assert rl.bind_order("k1", "tid-123") is True
+
+        snapshot = rl.snapshot()["k1"]
+        assert snapshot["order_id"] == "tid-123"
+        assert snapshot["stale"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────

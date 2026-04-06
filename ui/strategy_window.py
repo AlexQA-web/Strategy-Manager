@@ -11,6 +11,11 @@ from PyQt6.QtGui import QColor, QFont
 from ui.icons import apply_icon
 from loguru import logger
 from core.position_manager import position_manager  # для синхронизации
+from ui.ui_safety import (
+    DestructiveActionGuard,
+    build_strategy_stop_confirmation,
+    format_runtime_status,
+)
 
 from core.storage import get_strategy, save_strategy, get_setting, save_setting
 from core.strategy_loader import strategy_loader
@@ -179,6 +184,7 @@ class StrategyWindow(QDialog):
         self.setMinimumSize(680, 540)
         self.resize(780, 600)
         self.setStyleSheet(STYLE_DIALOG)
+        self._destructive_guard = DestructiveActionGuard()
 
         self._build_ui()
 
@@ -205,8 +211,11 @@ class StrategyWindow(QDialog):
         self._sync_tickers()
 
         # Блокируем редактирование если агент запущен
-        if self.data.get("status") == "active":
+        if (self.data.get("desired_state") or self.data.get("status")) == "active":
             self._lock_editing()
+
+        self._start_runtime_timer()
+        self._refresh_runtime_status()
 
     def _lock_editing(self):
         """Блокирует редактирование вкладок Обзор и Параметры если агент запущен."""
@@ -287,16 +296,20 @@ class StrategyWindow(QDialog):
         lbl_name.setMaximumWidth(300)  # ← ограничиваем ширину
         layout.addWidget(lbl_name)
 
-        status = self.data.get("status", "stopped")
+        desired_state = self.data.get("desired_state") or self.data.get("status", "stopped")
         self.lbl_status = QLabel(
-            "🟢 Активен" if status == "active" else "🔴 Остановлен"
+            "Intent: active" if desired_state == "active" else "Intent: stopped"
         )
         self.lbl_status.setStyleSheet(
             "color: #a6e3a1; font-weight: bold;"
-            if status == "active"
+            if desired_state == "active"
             else "color: #f38ba8; font-weight: bold;"
         )
         layout.addWidget(self.lbl_status)
+
+        self.lbl_runtime_status = QLabel("Runtime: stopped | Sync: unknown")
+        self.lbl_runtime_status.setStyleSheet("color: #89b4fa; font-weight: bold;")
+        layout.addWidget(self.lbl_runtime_status)
 
         # Кумулятивный P&L
         from core.order_history import get_total_pnl
@@ -564,6 +577,78 @@ class StrategyWindow(QDialog):
 
         self._param_widgets: dict = {}
         self._commission_widget = None
+
+        risk_group = QGroupBox("RiskGuard и runtime-ограничения")
+        risk_form = QFormLayout(risk_group)
+        risk_form.setSpacing(12)
+        risk_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.spin_max_position_size = QSpinBox()
+        self.spin_max_position_size.setRange(0, 1_000_000)
+        self.spin_max_position_size.setValue(int(params.get("max_position_size", 0) or 0))
+        self.spin_max_position_size.setFixedWidth(140)
+        self.spin_max_position_size.setToolTip("0 = лимит отключён")
+        risk_form.addRow("Макс. размер позиции:", self.spin_max_position_size)
+
+        self.spin_daily_loss_limit = QDoubleSpinBox()
+        self.spin_daily_loss_limit.setRange(0.0, 1_000_000_000.0)
+        self.spin_daily_loss_limit.setDecimals(2)
+        self.spin_daily_loss_limit.setValue(float(params.get("daily_loss_limit", 0.0) or 0.0))
+        self.spin_daily_loss_limit.setFixedWidth(160)
+        self.spin_daily_loss_limit.setSuffix(" ₽")
+        self.spin_daily_loss_limit.setToolTip("0 = лимит отключён")
+        risk_form.addRow("Дневной лимит убытка:", self.spin_daily_loss_limit)
+
+        self.spin_max_trades_per_window = QSpinBox()
+        self.spin_max_trades_per_window.setRange(0, 100_000)
+        self.spin_max_trades_per_window.setValue(
+            int(params.get("max_trades_per_window", 0) or 0)
+        )
+        self.spin_max_trades_per_window.setFixedWidth(140)
+        self.spin_max_trades_per_window.setToolTip("0 = лимит частоты отключён")
+        risk_form.addRow("Макс. сделок в окне:", self.spin_max_trades_per_window)
+
+        self.spin_trade_window_sec = QDoubleSpinBox()
+        self.spin_trade_window_sec.setRange(0.0, 86_400.0)
+        self.spin_trade_window_sec.setDecimals(2)
+        self.spin_trade_window_sec.setValue(float(params.get("trade_window_sec", 60.0) or 60.0))
+        self.spin_trade_window_sec.setFixedWidth(140)
+        self.spin_trade_window_sec.setSuffix(" сек")
+        risk_form.addRow("Размер окна частоты:", self.spin_trade_window_sec)
+
+        self.spin_cooldown_after_close_sec = QDoubleSpinBox()
+        self.spin_cooldown_after_close_sec.setRange(0.0, 86_400.0)
+        self.spin_cooldown_after_close_sec.setDecimals(2)
+        self.spin_cooldown_after_close_sec.setValue(
+            float(params.get("cooldown_after_close_sec", 0.0) or 0.0)
+        )
+        self.spin_cooldown_after_close_sec.setFixedWidth(140)
+        self.spin_cooldown_after_close_sec.setSuffix(" сек")
+        risk_form.addRow("Cooldown после close:", self.spin_cooldown_after_close_sec)
+
+        self.spin_circuit_breaker_threshold = QSpinBox()
+        self.spin_circuit_breaker_threshold.setRange(1, 100)
+        self.spin_circuit_breaker_threshold.setValue(
+            int(params.get("circuit_breaker_threshold", 3) or 3)
+        )
+        self.spin_circuit_breaker_threshold.setFixedWidth(140)
+        risk_form.addRow("Circuit breaker threshold:", self.spin_circuit_breaker_threshold)
+
+        self.spin_circuit_breaker_timeout = QDoubleSpinBox()
+        self.spin_circuit_breaker_timeout.setRange(0.1, 86_400.0)
+        self.spin_circuit_breaker_timeout.setDecimals(2)
+        self.spin_circuit_breaker_timeout.setValue(
+            float(params.get("circuit_breaker_timeout", 60.0) or 60.0)
+        )
+        self.spin_circuit_breaker_timeout.setFixedWidth(140)
+        self.spin_circuit_breaker_timeout.setSuffix(" сек")
+        risk_form.addRow("Circuit breaker timeout:", self.spin_circuit_breaker_timeout)
+
+        self.chk_allow_shared_position = QCheckBox("Разрешить shared position для account+ticker")
+        self.chk_allow_shared_position.setChecked(bool(self.data.get("allow_shared_position", False)))
+        risk_form.addRow("Shared position:", self.chk_allow_shared_position)
+
+        layout.addWidget(risk_group)
 
         group = QGroupBox("Параметры стратегии")
         form = QFormLayout(group)
@@ -867,7 +952,7 @@ class StrategyWindow(QDialog):
         ticker = self.data.get("ticker") or self.data.get("params", {}).get("ticker") or None
         engine = get_live_engines().get(self.sid)
         self._positions_panel = PositionsPanel(
-            account_id=account, ticker=ticker, live_engine=engine, parent=self
+            account_id=account, ticker=ticker, live_engine=engine, strategy_id=self.sid, parent=self
         )
         return self._positions_panel
 
@@ -1077,7 +1162,16 @@ class StrategyWindow(QDialog):
                 else:
                     params[key] = widget.text()
 
+        params["max_position_size"] = self.spin_max_position_size.value()
+        params["daily_loss_limit"] = self.spin_daily_loss_limit.value()
+        params["max_trades_per_window"] = self.spin_max_trades_per_window.value()
+        params["trade_window_sec"] = self.spin_trade_window_sec.value()
+        params["cooldown_after_close_sec"] = self.spin_cooldown_after_close_sec.value()
+        params["circuit_breaker_threshold"] = self.spin_circuit_breaker_threshold.value()
+        params["circuit_breaker_timeout"] = self.spin_circuit_breaker_timeout.value()
+
         self.data["params"] = params
+        self.data["allow_shared_position"] = self.chk_allow_shared_position.isChecked()
 
         # Синхронизируем верхнеуровневые ticker/board с params,
         # чтобы главная таблица, LiveEngine и графики видели актуальные значения
@@ -1097,31 +1191,46 @@ class StrategyWindow(QDialog):
     def _start_strategy(self):
         from core.autostart import start_live_engine
 
+        self.data["desired_state"] = "active"
         self.data["status"] = "active"
         save_strategy(self.sid, self.data)
 
         started = start_live_engine(self.sid, wait_for_connection=False)
         if started:
-            self.lbl_status.setText("🟢 Активен")
-            self.lbl_status.setObjectName("lbl_status_active")
-            self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
             logger.info(f"[{self.sid}] Запущен из окна агента")
         else:
-            logger.warning(f"[{self.sid}] Статус сохранён как active, но LiveEngine не запущен")
+            logger.warning(f"[{self.sid}] desired_state=active, но LiveEngine не запущен")
+
+        self.lbl_status.setText("Intent: active")
+        self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold;")
+        self._refresh_runtime_status()
 
         self.strategy_updated.emit(self.sid)
 
     def _stop_strategy(self):
         from core.autostart import stop_live_engine
 
-        stop_live_engine(self.sid)
-        self.data["status"] = "stopped"
-        save_strategy(self.sid, self.data)
-        self.lbl_status.setText("🔴 Остановлен")
-        self.lbl_status.setObjectName("lbl_status_stopped")
-        self.lbl_status.setStyleSheet("color: #f38ba8; font-weight: bold;")
-        logger.info(f"[{self.sid}] Остановлен из окна агента")
-        self.strategy_updated.emit(self.sid)
+        confirm = QMessageBox.question(
+            self,
+            "Подтверждение остановки",
+            build_strategy_stop_confirmation(self.sid),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        def _action():
+            stop_live_engine(self.sid)
+            self.data["desired_state"] = "stopped"
+            self.data["status"] = "stopped"
+            save_strategy(self.sid, self.data)
+            self.lbl_status.setText("Intent: stopped")
+            self.lbl_status.setStyleSheet("color: #f38ba8; font-weight: bold;")
+            self._refresh_runtime_status()
+            logger.info(f"[{self.sid}] Остановлен из окна агента")
+            self.strategy_updated.emit(self.sid)
+
+        self._destructive_guard.run([self.btn_stop], _action)
 
     # ─────────────────────────────────────────────
     # Таймер обновления позиций
@@ -1132,10 +1241,28 @@ class StrategyWindow(QDialog):
         self._timer.timeout.connect(self._refresh_positions)
         self._timer.start(3000)  # Каждые 3 сек
 
+    def _start_runtime_timer(self):
+        self._runtime_timer = QTimer(self)
+        self._runtime_timer.timeout.connect(self._refresh_runtime_status)
+        self._runtime_timer.start(3000)
+
+    def _refresh_runtime_status(self):
+        from core.autostart import get_strategy_runtime_status
+
+        runtime = get_strategy_runtime_status(self.sid)
+        actual_state = runtime.get("actual_state", "stopped")
+        sync_status = runtime.get("sync_status", "unknown")
+        desired_state = self.data.get("desired_state") or self.data.get("status", "stopped")
+        status_text, color = format_runtime_status(desired_state, actual_state, sync_status)
+        self.lbl_runtime_status.setText(f"Runtime: {status_text}")
+        self.lbl_runtime_status.setStyleSheet(f"color: {color}; font-weight: bold;")
+
     def closeEvent(self, event):
         # Останавливаем все таймеры чтобы избежать вызова callback'ов после уничтожения виджетов
         if hasattr(self, '_lot_timer') and self._lot_timer:
             self._lot_timer.stop()
         if hasattr(self, '_timer') and self._timer:
             self._timer.stop()
+        if hasattr(self, '_runtime_timer') and self._runtime_timer:
+            self._runtime_timer.stop()
         event.accept()

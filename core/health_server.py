@@ -190,6 +190,20 @@ class HealthServer:
         return f'http://{self._host}:{self._port}'
 
 
+def configure_default_callbacks(server: HealthServer | None = None) -> HealthServer:
+    target = server or health_server
+    from core.observability import (
+        collect_health_snapshot,
+        collect_runtime_metrics,
+        collect_strategies_health,
+    )
+
+    target.set_health_callback(collect_health_snapshot)
+    target.set_metrics_callback(collect_runtime_metrics)
+    target.set_strategies_callback(collect_strategies_health)
+    return target
+
+
 # Синглтон для использования в приложении
 from core.storage import get_setting, get_bool_setting
 _port = int(get_setting('health_server_port') or 8080)

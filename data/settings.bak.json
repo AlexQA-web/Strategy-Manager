@@ -86,5 +86,7 @@
   "notify_ntfy_SCHEDULE_DISCONNECT": "false",
   "notify_ntfy_APP_STARTED": "true",
   "notify_ntfy_APP_STOPPED": "true",
-  "paper_mode": false
+  "paper_mode": true,
+  "max_gross_exposure": 0,
+  "max_account_positions": 0
 }

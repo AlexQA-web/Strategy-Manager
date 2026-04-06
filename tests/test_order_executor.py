@@ -8,8 +8,38 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from core.base_connector import OrderOutcome, OrderResult
+from core.order_lifecycle import OrderLifecycle
 from core.order_executor import OrderExecutor
 from core.position_tracker import PositionTracker
+from core.reservation_ledger import ReservationLedger
+
+
+def _bind_result_api(connector):
+    def _place_order_result(**call_kwargs):
+        value = connector.place_order(**call_kwargs)
+        if value:
+            transaction_id = value if isinstance(value, str) else "legacy-submit"
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=transaction_id)
+        return OrderResult(OrderOutcome.REJECTED, message="mock_place_order_none")
+
+    def _close_position_result(**call_kwargs):
+        value = connector.close_position(**call_kwargs)
+        if value:
+            transaction_id = value if isinstance(value, str) else "legacy-close"
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=transaction_id)
+        return OrderResult(OrderOutcome.REJECTED, message="mock_close_position_none")
+
+    def _cancel_order_result(order_id, account_id):
+        value = connector.cancel_order(order_id, account_id)
+        if value:
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(order_id))
+        return OrderResult(OrderOutcome.REJECTED, transaction_id=str(order_id), message="mock_cancel_false")
+
+    connector.place_order_result.side_effect = _place_order_result
+    connector.close_position_result.side_effect = _close_position_result
+    connector.cancel_order_result.side_effect = _cancel_order_result
+    return connector
 
 
 class MockTradeRecorder:
@@ -18,7 +48,7 @@ class MockTradeRecorder:
     def __init__(self):
         self.recorded_trades = []
 
-    def record_trade(self, side, qty, price, comment, order_type="market", order_ref=""):
+    def record_trade(self, side, qty, price, comment, order_type="market", order_ref="", correlation_id=""):
         self.recorded_trades.append({
             "side": side,
             "qty": qty,
@@ -26,6 +56,7 @@ class MockTradeRecorder:
             "comment": comment,
             "order_type": order_type,
             "order_ref": order_ref,
+            "correlation_id": correlation_id,
         })
 
 
@@ -53,8 +84,11 @@ class MockRiskGuard:
     def is_circuit_open(self):
         return self._circuit_open
 
-    def check_risk_limits(self, action: str, qty: int):
+    def check_risk_limits(self, action: str, qty: int, ticker: str = ""):
         return self._risk_allowed, self._risk_reason
+
+    def notify_order_submitted(self, action: str, qty: int = 0, ticker: str = ""):
+        return None
 
 
 class TestOrderExecutorInit:
@@ -89,11 +123,23 @@ class TestExecuteSignal:
     """Тесты метода execute_signal."""
 
     def _create_executor(self, order_mode="market", **kwargs):
-        connector = MagicMock()
+        connector = _bind_result_api(MagicMock())
         connector.get_free_money.return_value = 100000.0
         pt = PositionTracker()
         tr = MockTradeRecorder()
         rg = MockRiskGuard()
+
+        get_last_price = kwargs.pop("get_last_price", lambda: 100.0)
+        get_last_price_envelope = kwargs.pop(
+            "get_last_price_envelope",
+            lambda: {
+                "source_ts": time.time(),
+                "receive_ts": time.time(),
+                "age_ms": 0,
+                "source_id": "test",
+                "status": "fresh",
+            },
+        )
 
         executor = OrderExecutor(
             strategy_id="test_strategy",
@@ -106,8 +152,11 @@ class TestExecuteSignal:
             board="TQBR",
             agent_name="test_agent",
             order_mode=order_mode,
+            get_last_price=get_last_price,
+            get_last_price_envelope=get_last_price_envelope,
             **kwargs,
         )
+        executor._monitor_pool.submit = MagicMock()
         return executor, connector, pt, tr, rg
 
     def test_execute_buy_signal_market_mode(self):
@@ -160,19 +209,257 @@ class TestExecuteSignal:
         connector.place_order.assert_not_called()
 
     def test_execute_close_signal_with_position(self):
-        """Сигнал на закрытие когда позиция есть."""
+        """Сигнал на закрытие использует только close_position без fallback."""
         executor, connector, pt, tr, rg = self._create_executor(order_mode="market")
         pt.open_position("buy", 10, 150.0)
         pt.clear_order_in_flight()  # имитируем завершение open-ордера
-        # close_position возвращает None — fallback на place_order
-        connector.close_position.return_value = None
-        connector.place_order.return_value = "close_order_456"
+        connector.close_position.return_value = "close_order_456"
 
         executor.execute_signal({"action": "close", "qty": 10, "comment": "close"})
 
+        connector.close_position.assert_called_once()
+        connector.place_order.assert_not_called()
+
+    def test_duplicate_submit_blocked_after_ambiguous_failure(self):
+        """Повторный submit того же сигнала блокируется после неясного результата отправки."""
+        callback = MagicMock()
+        executor, connector, pt, tr, rg = self._create_executor(
+            order_mode="market",
+            on_manual_intervention=callback,
+        )
+        connector.place_order.return_value = None
+        connector.place_order_result.side_effect = lambda **kwargs: OrderResult(
+            OrderOutcome.STALE_STATE,
+            message="connector_disconnected",
+        )
+
+        signal = {"action": "buy", "qty": 10, "comment": "dup-protect"}
+        executor.execute_signal(signal)
+        executor.execute_signal(signal)
+
+        assert connector.place_order_result.call_count == 1
+        callback.assert_called()
+
+    def test_submission_block_expires_after_ttl(self):
+        executor, connector, pt, tr, rg = self._create_executor(order_mode="market")
+        executor._block_submission("dup-key", reason="ambiguous_submit")
+
+        with executor._submission_lock:
+            executor._blocked_submission_keys["dup-key"]["expires_at"] = time.monotonic() - 1.0
+
+        assert executor._is_submission_blocked("dup-key") is False
+        assert "dup-key" not in executor._blocked_submission_keys
+
+    def test_reconcile_releases_submission_blocks_without_active_pending_orders(self):
+        executor, connector, pt, tr, rg = self._create_executor(order_mode="market")
+        executor._block_submission("dup-key", reason="ambiguous_submit")
+
+        with patch("core.order_executor.pending_order_registry.get_pending", return_value=[]):
+            released = executor.release_blocked_submissions_after_reconcile()
+
+        assert released == 1
+        assert executor._is_submission_blocked("dup-key") is False
+
+    def test_reconcile_keeps_submission_blocks_while_pending_order_active(self):
+        executor, connector, pt, tr, rg = self._create_executor(order_mode="market")
+        executor._block_submission("dup-key", reason="ambiguous_submit")
+        lifecycle = MagicMock()
+        lifecycle.strategy_id = executor._strategy_id
+        lifecycle.ticker = executor._ticker
+        lifecycle.is_terminal = False
+
+        with patch("core.order_executor.pending_order_registry.get_pending", return_value=[lifecycle]):
+            released = executor.release_blocked_submissions_after_reconcile()
+
+        assert released == 0
+        assert executor._is_submission_blocked("dup-key") is True
+
+    def test_stale_quote_rejects_open_signal(self):
+        executor, connector, pt, tr, rg = self._create_executor(
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time() - 10,
+                "receive_ts": time.time() - 10,
+                "age_ms": 10000,
+                "source_id": "test",
+                "status": "stale",
+            }
+        )
+
+        executor.execute_signal({"action": "buy", "qty": 1})
+
+        connector.place_order.assert_not_called()
+
+    def test_stale_status_with_fresh_receive_ts_does_not_reject_open_signal(self):
+        executor, connector, pt, tr, rg = self._create_executor(
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time() - 10,
+                "receive_ts": time.time(),
+                "age_ms": 10000,
+                "source_id": "test",
+                "status": "stale",
+            }
+        )
+        connector.place_order.return_value = "order_123"
+
+        executor.execute_signal({"action": "buy", "qty": 1})
+
         connector.place_order.assert_called_once()
-        call_kwargs = connector.place_order.call_args.kwargs
-        assert call_kwargs["side"] == "sell"
+
+    def test_stale_quote_allowed_in_relaxed_market_phase(self):
+        executor, connector, pt, tr, rg = self._create_executor(
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time() - 10,
+                "receive_ts": time.time() - 10,
+                "age_ms": 10000,
+                "source_id": "test",
+                "status": "stale",
+            }
+        )
+        connector.place_order.return_value = "order_123"
+
+        executor.execute_signal({"action": "buy", "qty": 1, "market_phase": "closing_auction"})
+
+        connector.place_order.assert_called_once()
+
+    def test_stale_quote_rejects_in_non_relaxed_market_phase(self):
+        executor, connector, pt, tr, rg = self._create_executor(
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time() - 10,
+                "receive_ts": time.time() - 10,
+                "age_ms": 10000,
+                "source_id": "test",
+                "status": "stale",
+            }
+        )
+
+        executor.execute_signal({"action": "buy", "qty": 1, "market_phase": "normal_trading"})
+
+        connector.place_order.assert_not_called()
+
+    def test_invalid_bid_ask_rejects_open_signal(self):
+        executor, connector, pt, tr, rg = self._create_executor()
+
+        executor.execute_signal({"action": "buy", "qty": 1, "bid": 101.0, "ask": 100.0})
+
+        connector.place_order.assert_not_called()
+
+    def test_stale_signal_rejects_without_override(self):
+        executor, connector, pt, tr, rg = self._create_executor()
+
+        executor.execute_signal({"action": "buy", "qty": 1, "signal_ts": time.time() - 30})
+
+        connector.place_order.assert_not_called()
+
+    def test_stale_signal_allowed_with_override(self):
+        executor, connector, pt, tr, rg = self._create_executor()
+        connector.place_order.return_value = "order_123"
+
+        executor.execute_signal({
+            "action": "buy",
+            "qty": 1,
+            "signal_ts": time.time() - 30,
+            "allow_stale_signal": True,
+        })
+
+        connector.place_order.assert_called_once()
+
+    def test_limit_price_normalized_before_submit(self):
+        executor, connector, pt, tr, rg = self._create_executor(order_mode="limit_price")
+        executor._monitor_pool.submit = MagicMock()
+        connector.get_sec_info.return_value = {"minstep": 0.05, "lotsize": 1}
+        connector.place_order.return_value = "order_123"
+
+        executor.execute_signal({"action": "buy", "qty": 1, "price": 100.03})
+
+        connector.place_order.assert_called_once()
+        assert connector.place_order.call_args.kwargs["price"] == pytest.approx(100.05)
+
+    def test_successful_submit_binds_reservation_to_order_id(self):
+        executor, connector, pt, tr, rg = self._create_executor(order_mode="market")
+        executor._monitor_pool.submit = MagicMock()
+        connector.place_order.return_value = "order_123"
+        ledger = ReservationLedger()
+
+        with patch("core.order_executor.reservation_ledger", ledger):
+            executor.execute_signal({"action": "buy", "qty": 2, "comment": "bind-reservation"})
+
+        snapshot = ledger.snapshot()
+        assert len(snapshot) == 1
+        reservation = next(iter(snapshot.values()))
+        assert reservation["order_id"] == "order_123"
+        assert reservation["stale"] is False
+
+    def test_ambiguous_submit_marks_reservation_stale(self):
+        callback = MagicMock()
+        executor, connector, pt, tr, rg = self._create_executor(
+            order_mode="market",
+            on_manual_intervention=callback,
+        )
+        ledger = ReservationLedger()
+        connector.place_order_result.side_effect = lambda **kwargs: OrderResult(
+            OrderOutcome.STALE_STATE,
+            message="connector_disconnected",
+        )
+
+        with patch("core.order_executor.reservation_ledger", ledger):
+            executor.execute_signal({"action": "buy", "qty": 2, "comment": "ambiguous"})
+
+        snapshot = ledger.snapshot()
+        assert len(snapshot) == 1
+        reservation = next(iter(snapshot.values()))
+        assert reservation["stale"] is True
+        assert reservation["stale_reason"] == "ambiguous_submit"
+        assert reservation["order_id"] == ""
+        callback.assert_called_once_with("ambiguous_submit")
+
+    def test_limit_price_cancel_timeout_escalates_manual_intervention(self):
+        callback = MagicMock()
+        executor, connector, pt, tr, rg = self._create_executor(
+            order_mode="limit_price",
+            on_manual_intervention=callback,
+        )
+        ledger = ReservationLedger()
+        ledger.reserve("res-1", executor._account_id, 100.0)
+        pt.set_order_in_flight(True)
+        executor._cancel_order_timeout_sec = 0.01
+        connector.get_order_status.side_effect = [
+            {"status": "working", "balance": 1, "quantity": 1, "price": 100.0},
+        ]
+
+        def _hanging_cancel(order_id, account_id):
+            threading.Event().wait(0.2)
+            return OrderResult(OrderOutcome.SUCCESS, transaction_id=str(order_id))
+
+        connector.cancel_order_result.side_effect = _hanging_cancel
+        lifecycle = OrderLifecycle(
+            tid="tid-1",
+            strategy_id=executor._strategy_id,
+            ticker=executor._ticker,
+            side="buy",
+            requested_qty=1,
+            order_type="limit",
+        )
+
+        with patch("core.order_executor.reservation_ledger", ledger), \
+             patch("core.order_executor.TRADING_END_TIME_MIN", 0), \
+             patch("core.order_executor.time.sleep", lambda _: None):
+            executor._monitor_limit_price_order(
+                "tid-1",
+                "buy",
+                1,
+                100.0,
+                "cancel-timeout",
+                False,
+                reservation_key="res-1",
+                lifecycle=lifecycle,
+            )
+
+        snapshot = ledger.snapshot()["res-1"]
+        assert snapshot["stale"] is True
+        assert snapshot["stale_reason"] == "cancel_uncertain"
+        assert pt.is_order_in_flight() is True
+        callback.assert_called_once_with("cancel_timeout")
+        assert tr.recorded_trades == []
 
 
 class TestCalcDynamicQty:
@@ -262,7 +549,7 @@ class TestCloseIdempotent:
     """Тесты идемпотентности close-path (TASK-002)."""
 
     def _create_executor(self, **kwargs):
-        connector = MagicMock()
+        connector = _bind_result_api(MagicMock())
         connector.close_position.return_value = "tid_close"
         connector.place_order.return_value = "tid_open"
         pt = PositionTracker()
@@ -280,7 +567,16 @@ class TestCloseIdempotent:
             board="TQBR",
             agent_name="agent",
             order_mode=kwargs.get("order_mode", "market"),
+            get_last_price=lambda: 100.0,
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time(),
+                "receive_ts": time.time(),
+                "age_ms": 0,
+                "source_id": "test",
+                "status": "fresh",
+            },
         )
+        executor._monitor_pool.submit = MagicMock()
         return executor, connector, pt, tr, rg
 
     def test_close_rejected_when_order_in_flight(self):
@@ -305,26 +601,72 @@ class TestCloseIdempotent:
         connector.close_position.assert_called_once()
 
     def test_close_clears_in_flight_on_both_paths_fail(self):
-        """Если и close_position и place_order вернули None — in_flight сброшен."""
+        """Если close_position вернул None — in_flight сброшен без fallback."""
         executor, connector, pt, tr, rg = self._create_executor()
         pt.update_position(1, 5, 100.0)
         connector.close_position.return_value = None
-        connector.place_order.return_value = None
 
         executor.execute_signal({"action": "close", "qty": 5})
 
         assert pt.is_order_in_flight() is False
+        connector.place_order.assert_not_called()
 
     def test_close_clears_in_flight_on_exception(self):
-        """Исключение при закрытии не оставляет зависший in-flight."""
+        """Исключение при close_position не оставляет зависший in-flight и не делает fallback."""
         executor, connector, pt, tr, rg = self._create_executor()
         pt.update_position(1, 5, 100.0)
         connector.close_position.side_effect = RuntimeError("broker down")
-        connector.place_order.return_value = None  # fallback тоже не удался
 
         executor.execute_signal({"action": "close", "qty": 5})
 
         assert pt.is_order_in_flight() is False
+        connector.place_order.assert_not_called()
+
+    def test_close_failed_marks_manual_intervention(self):
+        """Неуспешный close переводит стратегию в manual intervention path."""
+        executor, connector, pt, tr, rg = self._create_executor()
+        pt.update_position(1, 5, 100.0)
+        connector.close_position.return_value = None
+        on_manual_intervention = MagicMock()
+        executor._on_manual_intervention = on_manual_intervention
+
+        executor.execute_signal({"action": "close", "qty": 5, "comment": "manual check"})
+
+        on_manual_intervention.assert_called_once_with("close_failed")
+
+    def test_close_retries_transport_error_and_succeeds(self):
+        executor, connector, pt, tr, rg = self._create_executor()
+        pt.update_position(1, 5, 100.0)
+        executor._monitor_pool.submit = MagicMock()
+        connector.close_position_result.side_effect = [
+            OrderResult(OrderOutcome.TRANSPORT_ERROR, message="network"),
+            OrderResult(OrderOutcome.SUCCESS, transaction_id="close-123"),
+        ]
+
+        with patch("core.order_executor.time.sleep") as sleep_mock:
+            executor.execute_signal({"action": "close", "qty": 5, "comment": "retry-close"})
+
+        assert connector.close_position_result.call_count == 2
+        sleep_mock.assert_called_once()
+        executor._monitor_pool.submit.assert_called_once()
+
+    def test_close_transport_error_escalates_after_retry_budget(self):
+        executor, connector, pt, tr, rg = self._create_executor()
+        pt.update_position(1, 5, 100.0)
+        on_manual_intervention = MagicMock()
+        executor._on_manual_intervention = on_manual_intervention
+        connector.close_position_result.side_effect = [
+            OrderResult(OrderOutcome.TRANSPORT_ERROR, message="network-1"),
+            OrderResult(OrderOutcome.TRANSPORT_ERROR, message="network-2"),
+            OrderResult(OrderOutcome.TRANSPORT_ERROR, message="network-3"),
+        ]
+
+        with patch("core.order_executor.time.sleep") as sleep_mock:
+            executor.execute_signal({"action": "close", "qty": 5, "comment": "retry-fail"})
+
+        assert connector.close_position_result.call_count == executor._close_retry_attempts
+        assert sleep_mock.call_count == executor._close_retry_attempts - 1
+        on_manual_intervention.assert_called_once_with("close_failed")
 
     def test_no_close_when_no_position(self):
         """Close на пустой позиции — не отправляется."""
@@ -340,7 +682,7 @@ class TestPreTradeRiskGate:
     """Тесты pre-trade risk gate (TASK-031)."""
 
     def _create_executor(self, **kwargs):
-        connector = MagicMock()
+        connector = _bind_result_api(MagicMock())
         connector.place_order.return_value = "order_123"
         connector.close_position.return_value = "close_123"
         connector.get_free_money.return_value = 100000.0
@@ -359,6 +701,14 @@ class TestPreTradeRiskGate:
             board="TQBR",
             agent_name="agent",
             order_mode=kwargs.get("order_mode", "market"),
+            get_last_price=lambda: 100.0,
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time(),
+                "receive_ts": time.time(),
+                "age_ms": 0,
+                "source_id": "test",
+                "status": "fresh",
+            },
         )
         return executor, connector, pt, tr, rg
 
@@ -385,7 +735,7 @@ class TestAccountRiskLimits:
     """Тесты account-level risk limits (TASK-044)."""
 
     def _create_executor(self, **kwargs):
-        connector = MagicMock()
+        connector = _bind_result_api(MagicMock())
         connector.get_free_money.return_value = 100000.0
         connector.get_sec_info.return_value = {"lotsize": 1, "buy_deposit": 0, "sell_deposit": 0}
         pt = PositionTracker()
@@ -403,6 +753,13 @@ class TestAccountRiskLimits:
             board="TQBR",
             agent_name="test_agent",
             get_last_price=lambda: 300.0,
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time(),
+                "receive_ts": time.time(),
+                "age_ms": 0,
+                "source_id": "test",
+                "status": "fresh",
+            },
             **kwargs,
         )
         return executor, connector, pt, tr, rg
@@ -603,7 +960,7 @@ class TestCircuitBreakerCallback:
     """Тесты вызова on_circuit_break при срабатывании circuit breaker (TASK-032)."""
 
     def _create_executor(self, **kwargs):
-        connector = MagicMock()
+        connector = _bind_result_api(MagicMock())
         connector.place_order.return_value = None  # ошибка
         connector.close_position.return_value = None
         connector.get_free_money.return_value = 100000.0
@@ -623,6 +980,14 @@ class TestCircuitBreakerCallback:
             board="TQBR",
             agent_name="agent",
             on_circuit_break=cb,
+            get_last_price=lambda: 100.0,
+            get_last_price_envelope=lambda: {
+                "source_ts": time.time(),
+                "receive_ts": time.time(),
+                "age_ms": 0,
+                "source_id": "test",
+                "status": "fresh",
+            },
             **kwargs,
         )
         return executor, connector, pt, tr, rg, cb

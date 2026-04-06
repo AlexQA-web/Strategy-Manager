@@ -159,6 +159,28 @@ class TestUpdatePosition:
         assert tracker.get_position_qty() == 0
         assert tracker.get_entry_price() == 0.0
 
+    def test_update_position_clears_order_in_flight_on_sync(self):
+        """Authoritative sync-path не должен оставлять зависший order_in_flight."""
+        tracker = PositionTracker()
+        tracker.open_position("buy", 10, 150.5)
+        tracker.set_order_in_flight(True)
+
+        tracker.update_position(1, 10, 150.5)
+
+        assert tracker.is_order_in_flight() is False
+
+    def test_sync_position_clears_order_in_flight_when_flattened(self):
+        """Явный sync API очищает transient state при reconcile в flat."""
+        tracker = PositionTracker()
+        tracker.open_position("buy", 10, 150.5)
+        tracker.set_order_in_flight(True)
+
+        tracker.sync_position(0, 0, 0.0)
+
+        assert tracker.get_position() == 0
+        assert tracker.get_position_qty() == 0
+        assert tracker.is_order_in_flight() is False
+
 
 class TestOrderInFlight:
     """Тесты флага order_in_flight."""
